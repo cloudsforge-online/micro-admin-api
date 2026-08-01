@@ -672,7 +672,7 @@ function buildRoutes(): Route[] {
         }
       }
 
-      return withIdempotentRoute(ctx, deps, '/v1/approvals', operator, body, async () => {
+      return withIdempotentRoute(ctx, '/v1/approvals', async () => {
         const outcome = await withIdempotency(deps.sql, {
           principal: operator,
           route: '/v1/approvals',
@@ -715,7 +715,7 @@ function buildRoutes(): Route[] {
       if (typeof grant !== 'boolean') throw new BadRequestError('grant must be true or false')
       const id = itemIdOf(ctx)
 
-      return withIdempotentRoute(ctx, deps, '/v1/approvals/:id/decision', operator, body, async () => {
+      return withIdempotentRoute(ctx, '/v1/approvals/:id/decision', async () => {
         const outcome = await withIdempotency(deps.sql, {
           principal: operator,
           route: '/v1/approvals/:id/decision',
@@ -829,7 +829,7 @@ function buildRoutes(): Route[] {
       const operator = requireOperator(principal)
       const body = await readJson(ctx.req)
 
-      return withIdempotentRoute(ctx, deps, '/v1/broadcasts', operator, body, async () => {
+      return withIdempotentRoute(ctx, '/v1/broadcasts', async () => {
         const outcome = await withIdempotency(deps.sql, {
           principal: operator,
           route: '/v1/broadcasts',
@@ -987,10 +987,7 @@ async function execute(
  */
 async function withIdempotentRoute(
   ctx: RequestContext,
-  _deps: ServerDeps,
   route: string,
-  _principal: string,
-  _body: Record<string, unknown>,
   run: () => Promise<Reply>,
 ): Promise<Reply> {
   const key = headerOf(ctx.req, 'idempotency-key')
