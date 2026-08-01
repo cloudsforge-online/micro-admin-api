@@ -88,7 +88,7 @@ never happened.
 ```
 PUT /internal/users/:id/roles      body: { roles: string[], actor: string, reason: string }
 guard: a SERVICE token holding `identity:admin` — NOT `authenticateAdmin`, which refuses a
-       service token outright (identity/src/server.ts:539-541) and would therefore make the
+       service token outright (identity/src/server.ts:540) and would therefore make the
        route unreachable from here for the same reason the bootstrap is unreachable now
 audit: an `identity.role.changed` row in the same transaction, per SD-15's Identity row
 ```
