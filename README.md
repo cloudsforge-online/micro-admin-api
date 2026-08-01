@@ -230,8 +230,9 @@ than hidden because it is the one place in this service where an upstream knows 
 than we do.
 
 Every route above was read in the provider's source. `upstreams.test.ts` asserts the exact path,
-the exact body field names and the exact bearer for each, against a real HTTP socket — because six
-times in this estate a client was built against an imagined surface.
+the exact body field names and the exact bearer for each, against a real HTTP socket — because
+clients in this estate have repeatedly been built against imagined surfaces
+(`docs/ecosystem/18-build-status.md` §3.3i, §3.3m).
 
 ---
 

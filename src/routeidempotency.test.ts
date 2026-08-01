@@ -112,8 +112,8 @@ test('a blocked action states WHY, and the reason names what is missing', () => 
 })
 
 test('every executable action cites the route it calls, by path and line', () => {
-  // Six times in this estate a client was built against an imagined surface. A citation is what
-  // makes the next one checkable.
+  // Clients in this estate have repeatedly been built against imagined surfaces — 18-build-status
+  // §3.3i and §3.3m. A citation is what makes the next one checkable.
   for (const name of EXECUTABLE_ACTIONS) {
     const route = ACTIONS[name]!.route!
     assert.match(route, /^(GET|POST|PUT|DELETE) \//, `${name}'s route citation does not start with a method and a path`)
