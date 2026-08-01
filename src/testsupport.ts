@@ -151,6 +151,14 @@ export interface FakeLedger extends LedgerClient {
   readonly postedCount: number
   failWith(err: Error | null): void
   setTrialBalance(value: TrialBalance): void
+  /**
+   * Forget everything.
+   *
+   * A recorded call list that survived between test cases would make `reversals.length === 1`
+   * true only when the file happened to run that case first — which is how a suite ends up
+   * passing alone and failing together, and it did here before this existed.
+   */
+  reset(): void
 }
 
 /**
@@ -176,6 +184,12 @@ export function fakeLedger(): FakeLedger {
     },
     setTrialBalance(value) {
       trial = value
+    },
+    reset() {
+      reversals.length = 0
+      byKey.clear()
+      failure = null
+      trial = { balanced: true, totalAbsoluteDelta: '0' }
     },
     async reverseEntry(request) {
       reversals.push({
@@ -207,6 +221,7 @@ export interface FakeMarket extends MarketClient {
   readonly reads: string[]
   setOpenCases(cases: readonly ModerationCase[]): void
   failWith(err: Error | null): void
+  reset(): void
 }
 
 export function fakeMarket(): FakeMarket {
@@ -223,6 +238,12 @@ export function fakeMarket(): FakeMarket {
     },
     failWith(err) {
       failure = err
+    },
+    reset() {
+      resolved.length = 0
+      reads.length = 0
+      open = []
+      failure = null
     },
     async resolveCase(request) {
       if (failure) throw failure
@@ -241,6 +262,7 @@ export interface FakeBilling extends BillingClient {
   readonly revocations: Array<{ entitlementId: string; reason: string; refund: boolean; bearer: string }>
   failWith(err: Error | null): void
   setResult(value: RevokeResult): void
+  reset(): void
 }
 
 export function fakeBilling(): FakeBilling {
@@ -255,6 +277,11 @@ export function fakeBilling(): FakeBilling {
     },
     setResult(value) {
       result = value
+    },
+    reset() {
+      revocations.length = 0
+      failure = null
+      result = { alreadyRevoked: false, reversalEntryId: 'entry-refund-1' }
     },
     async revokeEntitlement(request) {
       if (failure) throw failure
@@ -378,7 +405,9 @@ export interface Harness {
     method: string,
     path: string,
     options?: { token?: string; body?: unknown; headers?: Record<string, string> },
-  ): Promise<{ status: number; body: any; headers: Record<string, string> }>
+  ): Promise<{ status: number; body: any; text: string; headers: Record<string, string> }>
+  /** Forget every fake upstream's recorded calls. Call from `beforeEach`, beside the truncate. */
+  reset(): void
   close(): Promise<void>
 }
 
@@ -435,26 +464,37 @@ export async function startHarness(
     async request(method, path, opts = {}) {
       const headers: Record<string, string> = { ...opts.headers }
       if (opts.token) headers['authorization'] = `Bearer ${opts.token}`
-      let body: string | undefined
+      let sent: string | undefined
       if (opts.body !== undefined) {
-        body = typeof opts.body === 'string' ? opts.body : JSON.stringify(opts.body)
+        sent = typeof opts.body === 'string' ? opts.body : JSON.stringify(opts.body)
         headers['content-type'] = 'application/json'
       }
       const response = await fetch(`${baseUrl}${path}`, {
         method,
         headers,
-        ...(body !== undefined ? { body } : {}),
+        ...(sent !== undefined ? { body: sent } : {}),
       })
       const text = await response.text()
       const out: Record<string, string> = {}
       response.headers.forEach((value, key) => {
         out[key] = value
       })
-      return {
-        status: response.status,
-        body: text.length > 0 ? JSON.parse(text) : null,
-        headers: out,
+      // `/metrics` answers Prometheus text, not JSON. Parsing unconditionally made that route's
+      // test fail on a SyntaxError rather than on anything about the route.
+      let body: unknown = null
+      if (text.length > 0) {
+        try {
+          body = JSON.parse(text)
+        } catch {
+          body = null
+        }
       }
+      return { status: response.status, body, text, headers: out }
+    },
+    reset() {
+      ledger.reset()
+      market.reset()
+      billing.reset()
     },
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   }
