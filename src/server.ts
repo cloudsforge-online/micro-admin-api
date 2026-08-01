@@ -1,0 +1,1154 @@
+/**
+ * The HTTP surface.
+ *
+ * Rule 4 of docs/ecosystem/03 §2: `/livez`, `/readyz` and `/metrics` on every service, or it does
+ * not pass CI.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **AN OPERATOR ACTS AS THEMSELVES. THERE IS NO ROUTE HERE THAT ACTS FOR SOMEBODY ELSE.**
+ *
+ * No route on this service takes a `userId` and performs an action as that user. The frozen
+ * estate's `/internal/*` routes did — they are an act-as-anyone primitive, and
+ * `deploy/gateway/dynamic/policy.yml` refuses them from outside for precisely that reason. Nothing
+ * here is an equivalent:
+ *
+ *   - Every mutating route derives its actor from the verified bearer token. `actor` is never a
+ *     body field, never a query parameter, and never a header.
+ *   - A user is only ever a SUBJECT (`subjectKind: 'user'`), never a costume. Where an approval
+ *     names a user, what is being authorised is an action on a thing that user owns — an
+ *     entitlement, a ledger entry — performed by the operator, recorded as the operator.
+ *   - A SERVICE token cannot request, approve or execute anything. It can read (`admin:read`) and
+ *     it can mirror an audit row (`admin:audit:write`). Approval is consent given by a person, and
+ *     a service is not a person; a service token that could approve would make the four-eyes
+ *     control satisfiable by two credentials on one machine.
+ *
+ * **`POST /v1/events` IS SIGNATURE-CHECKED BEFORE IT IS PARSED.** It is the intake for the whole
+ * estate's audit mirror (17 §2). An unsigned intake there is a forgery endpoint: anyone who can
+ * reach the port could write a row into the record a dispute is settled against, naming any
+ * operator for any action. The body is verified against `OUTBOX_SIGNING_SECRET` over the exact
+ * bytes received, with a timing-safe comparison, BEFORE `JSON.parse` is called on it — and the
+ * bearer must additionally hold `admin:audit:write`, because a signature proves the sender knows
+ * the estate secret and the scope proves which service it is.
+ *
+ * **EVERY MUTATING ROUTE IS IDEMPOTENT.** `routeidempotency.test.ts` enumerates them from this
+ * file's source and fails on one that neither wraps `withIdempotentRoute` nor states why it need
+ * not. `micro-market` gained that guard after two routes were found with none, and both of them
+ * created a durable artefact on every retry.
+ *
+ * **THE SCOPE MATCHER IS EXACT, DELIBERATELY** — the §3.3h decision, argued in `scopes.ts`.
+ * `admin:*` is refused here and accepted by a sibling that calls `hasScope`; that difference is a
+ * recorded choice, pinned in both directions by `scopes.test.ts`, and neither auth package is
+ * changed by this repository.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+import {
+  createServer as createHttpServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from 'node:http'
+import {
+  ForbiddenError,
+  TokenError,
+  bearerFrom,
+  isAdmin,
+  statusFor,
+  type Principal,
+} from '@cloudsforge/auth'
+import type { Lifecycle } from '@cloudsforge/lifecycle'
+import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
+import { MIRROR_SCOPE, READ_SCOPE, requireExactScope } from './scopes.ts'
+import {
+  ACTIONS,
+  EXECUTORS,
+  isKnownAction,
+  type ExecutionContext,
+} from './actions.ts'
+import {
+  ApprovalError,
+  ApprovalNotFoundError,
+  ApprovalStateError,
+  REASON_CODES,
+  SelfApprovalError,
+  decide,
+  findApproval,
+  listApprovals,
+  recordExecution,
+  requestApproval,
+  type Approval,
+  type ApprovalState,
+} from './approvals.ts'
+import {
+  DuplicateMirrorError,
+  appendAudit,
+  auditToJson,
+  readAudit,
+  verifyChain,
+} from './audit.ts'
+import { BroadcastError, BroadcastNotFoundError, listBroadcasts, publishBroadcast, retractBroadcast, type Severity } from './broadcasts.ts'
+import { FlagError, listFlags, setFlag } from './flags.ts'
+import { composeEstate, type EstateDeps } from './estate.ts'
+import {
+  IdempotencyInFlightError,
+  IdempotencyKeyReuseError,
+  requestFingerprint,
+  withIdempotency,
+} from './idempotency.ts'
+import { withInbox, verifyEventSignature, SIGNATURE_HEADER, type Db } from './outbox.ts'
+import { UpstreamError, type BillingClient, type LedgerClient, type MarketClient } from './upstreams.ts'
+
+/** The verifier as this file needs it. An interface, so a test does not need a JWKS. */
+export interface PrincipalVerifier {
+  principal(token: string): Promise<Principal>
+}
+
+const MAX_BODY_BYTES = 256 * 1024
+const SAFE_REQUEST_ID = /^[A-Za-z0-9._-]{1,128}$/
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** The topic every service mirrors its audit rows on. */
+export const AUDIT_MIRROR_TOPIC_SUFFIX = '.audit.recorded'
+
+export interface ServerDeps {
+  readonly lifecycle: Lifecycle
+  readonly logger: Logger
+  readonly metrics: Metrics
+  readonly verifier: PrincipalVerifier
+  readonly sql: Db
+  readonly producer: string
+  readonly ledger: LedgerClient
+  readonly market: MarketClient
+  readonly billing: BillingClient
+  readonly readiness: EstateDeps['readiness']
+  readonly eventSigningSecret: string
+  readonly approvalTtlMinutes: number
+  readonly now?: () => Date
+  readonly beforeScrape?: () => Promise<void>
+}
+
+/** Domain metrics, declared rather than inferred from a log line — AD-20. */
+export function registerServiceMetrics(metrics: Metrics): Metrics {
+  return metrics
+    .register({
+      name: 'admin_operator_actions_total',
+      help: 'Operator actions, by action and outcome. 13 §283 alerts on this per operator.',
+      kind: 'counter',
+      labels: ['action', 'outcome'],
+    })
+    .register({
+      name: 'admin_approvals_total',
+      help: 'Approval requests, by action and terminal state.',
+      kind: 'counter',
+      labels: ['action', 'state'],
+    })
+    .register({
+      name: 'admin_approvals_expired_total',
+      help: 'Approval requests that no second operator answered before the deadline.',
+      kind: 'counter',
+      labels: [],
+    })
+    .register({
+      name: 'admin_self_approvals_refused_total',
+      help: 'Attempts by a requester to decide their own request. Never expected to be non-zero.',
+      kind: 'counter',
+      labels: [],
+    })
+    .register({
+      name: 'admin_audit_events_total',
+      help: 'Audit rows appended, by source and outcome.',
+      kind: 'counter',
+      labels: ['source', 'outcome'],
+    })
+    .register({
+      name: 'admin_audit_mirror_rejected_total',
+      help: 'Inbound audit mirror rows refused, by reason.',
+      kind: 'counter',
+      labels: ['reason'],
+    })
+    .register({
+      name: 'admin_audit_chain_length',
+      help: 'Rows in the audit chain.',
+      kind: 'gauge',
+      labels: [],
+    })
+    .register({
+      name: 'admin_audit_chain_breaks',
+      help: 'Breaks found by the last verification pass. SD-16: non-zero is a P0.',
+      kind: 'gauge',
+      labels: [],
+    })
+    .register({
+      name: 'admin_audit_chain_verified_seq',
+      help: 'The highest sequence a clean verification has reached.',
+      kind: 'gauge',
+      labels: [],
+    })
+    .register({
+      name: 'admin_estate_tile_status_total',
+      help: 'Estate view tiles by status. Alert here, not on the HTTP error rate.',
+      kind: 'counter',
+      labels: ['tile', 'status'],
+    })
+}
+
+interface Reply {
+  readonly status: number
+  readonly body?: unknown
+  readonly text?: string
+  readonly contentType?: string
+  readonly headers?: Record<string, string>
+}
+
+interface RequestContext {
+  readonly req: IncomingMessage
+  readonly url: URL
+  readonly requestId: string
+  readonly log: Logger
+  readonly params: Readonly<Record<string, string>>
+}
+
+interface Route {
+  readonly method: string
+  /** Used verbatim as the metric label, so cardinality is bounded by the number of routes. */
+  readonly path: string
+  readonly pattern: RegExp
+  readonly handle: (ctx: RequestContext, deps: ServerDeps) => Promise<Reply>
+}
+
+/**
+ * Compile `/v1/approvals/:id` into a matcher. The segment pattern excludes `/` so a parameter
+ * cannot swallow the rest of the path and make one route answer for another.
+ */
+function compile(path: string): RegExp {
+  const source = path
+    .split('/')
+    .map((segment) =>
+      segment.startsWith(':')
+        ? `(?<${segment.slice(1)}>[^/]+)`
+        : segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+    )
+    .join('/')
+  return new RegExp(`^${source}$`)
+}
+
+class BadRequestError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'BadRequestError'
+  }
+}
+
+class NotFoundError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'NotFoundError'
+  }
+}
+
+/** The action has no upstream route. See the §3.3g decision in `actions.ts`. */
+class ActionUnavailableError extends Error {
+  readonly action: string
+  readonly reason: string
+  constructor(action: string, reason: string) {
+    super(`${action} cannot be executed: ${reason}`)
+    this.name = 'ActionUnavailableError'
+    this.action = action
+    this.reason = reason
+  }
+}
+
+export function createServer(deps: ServerDeps): Server {
+  const routes = buildRoutes()
+  let inFlight = 0
+
+  return createHttpServer((req, res) => {
+    const startedAt = process.hrtime.bigint()
+    const presented = headerOf(req, 'x-request-id')
+    const requestId = presented && SAFE_REQUEST_ID.test(presented) ? presented : newRequestId()
+
+    res.setHeader('x-request-id', requestId)
+
+    const url = new URL(req.url ?? '/', `http://${headerOf(req, 'host') ?? 'localhost'}`)
+    const method = req.method ?? 'GET'
+
+    let matched: Route | undefined
+    let params: Record<string, string> = {}
+    for (const route of routes) {
+      if (route.method !== method) continue
+      const match = route.pattern.exec(url.pathname)
+      if (match) {
+        matched = route
+        params = { ...match.groups }
+        break
+      }
+    }
+
+    const routeLabel = matched ? matched.path : 'unmatched'
+    const log = deps.logger.child({ requestId, method, route: routeLabel })
+
+    inFlight += 1
+    deps.metrics.set('http_requests_in_flight', inFlight)
+
+    const finish = (status: number) => {
+      inFlight -= 1
+      deps.metrics.set('http_requests_in_flight', inFlight)
+      const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6
+      deps.metrics.increment('http_requests_total', {
+        method,
+        route: routeLabel,
+        status: String(status),
+      })
+      deps.metrics.observe('http_request_duration_ms', durationMs, { method, route: routeLabel })
+    }
+
+    void handle(matched, { req, url, requestId, log, params }, deps)
+      .then((reply) => {
+        send(res, reply, requestId)
+        finish(reply.status)
+      })
+      .catch((err: unknown) => {
+        log.error('request handler threw after mapping', { err })
+        send(res, errorReply(500, 'internal', 'the request could not be completed', requestId), requestId)
+        finish(500)
+      })
+  })
+}
+
+/**
+ * Map every failure onto a status, grouped by what the caller should do about it.
+ *
+ *   * **400** — the request could not be legal. Fix it; retrying will not help.
+ *   * **403** — a scope, a role, or **the four-eyes refusal**, which gets its own code so a
+ *     console can say "you raised this one" rather than "forbidden".
+ *   * **404** — something named does not exist.
+ *   * **409** — well formed, but the state refuses it: an already-decided approval, an
+ *     idempotency key reused with a different body.
+ *   * **501** — the action is real, this service knows what it means, and the upstream route it
+ *     needs does not exist. Distinguished from 400 on purpose: the operator did nothing wrong,
+ *     and the response names the route the estate is missing.
+ *   * **502** — an upstream refused an execution the operators had authorised.
+ *   * **503** — an upstream is unreachable, or an idempotent request is still in flight.
+ */
+async function handle(route: Route | undefined, ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
+  if (!route) {
+    return errorReply(404, 'not_found', `no route for ${ctx.req.method} ${ctx.url.pathname}`, ctx.requestId)
+  }
+  try {
+    return await route.handle(ctx, deps)
+  } catch (err) {
+    const authStatus = statusFor(err)
+    if (authStatus === 401) {
+      // The reason is logged, never returned — "signature verification failed" versus "expired"
+      // tells an attacker which half of a forged token to fix.
+      ctx.log.info('unauthenticated request', { err })
+      return errorReply(401, 'unauthenticated', 'a valid bearer token is required', ctx.requestId)
+    }
+    if (authStatus === 403) {
+      const required = err instanceof ForbiddenError ? err.required : 'unknown'
+      ctx.log.info('forbidden request', { required })
+      return errorReply(403, 'forbidden', `missing required authority: ${required}`, ctx.requestId)
+    }
+    if (authStatus === 503) {
+      ctx.log.error('token verifier unavailable', { err })
+      return errorReply(503, 'verifier_unavailable', 'authentication is temporarily unavailable', ctx.requestId)
+    }
+    if (err instanceof SelfApprovalError) {
+      deps.metrics.increment('admin_self_approvals_refused_total')
+      // Logged at warn, because it is either a UI that offered a button it should not have or an
+      // operator trying to route around the control. Both are worth seeing.
+      ctx.log.warn('self-approval refused')
+      return errorReply(403, 'self_approval_refused', err.message, ctx.requestId)
+    }
+    if (err instanceof ActionUnavailableError) {
+      return {
+        status: 501,
+        body: {
+          error: {
+            code: 'action_has_no_upstream',
+            message: err.message,
+            action: err.action,
+            requestId: ctx.requestId,
+          },
+        },
+      }
+    }
+    if (err instanceof DuplicateMirrorError) {
+      // 200, not 409. At-least-once delivery guarantees this; answering an error would make a
+      // correctly-behaving producer retry for ever.
+      return { status: 200, body: { status: 'duplicate', sourceEventId: err.sourceEventId } }
+    }
+    if (err instanceof IdempotencyKeyReuseError) {
+      return errorReply(409, 'idempotency_key_reused', err.message, ctx.requestId)
+    }
+    if (err instanceof IdempotencyInFlightError) {
+      // 503 with a retry hint, not 409. The first attempt may still succeed.
+      return {
+        status: 503,
+        headers: { 'retry-after': '1' },
+        body: { error: { code: 'in_flight', message: err.message, requestId: ctx.requestId } },
+      }
+    }
+    if (err instanceof ApprovalNotFoundError || err instanceof BroadcastNotFoundError) {
+      return errorReply(404, 'not_found', err.message, ctx.requestId)
+    }
+    if (err instanceof ApprovalStateError) {
+      return errorReply(409, 'state_conflict', err.message, ctx.requestId)
+    }
+    if (err instanceof UpstreamError) {
+      // 502 when the peer decided, 503 when we could not reach it. The operator's next move is
+      // different: one is "the upstream said no", the other is "try again".
+      ctx.log.error('an upstream failed an authorised execution', { upstream: err.upstream, status: err.status })
+      return errorReply(
+        err.peerDecided ? 502 : 503,
+        err.peerDecided ? 'upstream_refused' : 'upstream_unavailable',
+        err.message,
+        ctx.requestId,
+      )
+    }
+    if (
+      err instanceof BadRequestError ||
+      err instanceof ApprovalError ||
+      err instanceof BroadcastError ||
+      err instanceof FlagError ||
+      err instanceof RangeError
+    ) {
+      return errorReply(400, 'bad_request', err.message, ctx.requestId)
+    }
+    if (err instanceof NotFoundError) {
+      return errorReply(404, 'not_found', err.message, ctx.requestId)
+    }
+    ctx.log.error('unhandled request failure', { err })
+    return errorReply(500, 'internal', 'the request could not be completed', ctx.requestId)
+  }
+}
+
+/* ------------------------------------------------------------------------ authentication */
+
+async function authenticate(ctx: RequestContext, deps: ServerDeps): Promise<Principal> {
+  const token = bearerFrom(headerOf(ctx.req, 'authorization'))
+  // A missing token is a token fault, so it takes the same 401 path as a bad one rather than being
+  // a separate branch that can drift away from it.
+  if (!token) throw new TokenError('no bearer token presented', 'missing')
+  return deps.verifier.principal(token)
+}
+
+/**
+ * An OPERATOR. A human, holding `role:admin`, acting as themselves.
+ *
+ * A service token is refused outright and there is no scope that changes that. Approval is consent
+ * given by a person; a service that could approve would make the four-eyes control satisfiable by
+ * two credentials sitting on one machine, which is not two pairs of eyes.
+ */
+function requireOperator(principal: Principal): string {
+  if (principal.kind !== 'user') {
+    throw new ForbiddenError('role:admin (a service token cannot act as an operator)')
+  }
+  if (!isAdmin(principal)) throw new ForbiddenError('role:admin')
+  return `user:${principal.userId}`
+}
+
+/** A reader: an operator, or a service holding the exact `admin:read` scope. */
+function requireReader(principal: Principal): string {
+  if (principal.kind === 'user') return requireOperator(principal)
+  requireExactScope(principal, READ_SCOPE)
+  return `service:${principal.service}`
+}
+
+/** The operator's raw bearer, forwarded to upstreams that record which administrator acted. */
+function operatorBearer(ctx: RequestContext): string {
+  const token = bearerFrom(headerOf(ctx.req, 'authorization'))
+  if (!token) throw new TokenError('no bearer token presented', 'missing')
+  return token
+}
+
+/* ------------------------------------------------------------------------ routes */
+
+function buildRoutes(): Route[] {
+  const define = (
+    method: string,
+    path: string,
+    handler: (ctx: RequestContext, deps: ServerDeps) => Promise<Reply>,
+  ): Route => ({ method, path, pattern: compile(path), handle: handler })
+
+  return [
+    define('GET', '/livez', async (_ctx, deps) => ({ status: 200, body: deps.lifecycle.livez() })),
+
+    define('GET', '/readyz', async (_ctx, deps) => {
+      const report = await deps.lifecycle.readyz()
+      return { status: report.ready ? 200 : 503, body: report }
+    }),
+
+    define('GET', '/metrics', async (ctx, deps) => {
+      try {
+        await deps.beforeScrape?.()
+      } catch (err) {
+        ctx.log.warn('gauge refresh failed; serving the previous values', { err })
+      }
+      return {
+        status: 200,
+        text: deps.metrics.render(),
+        contentType: 'text/plain; version=0.0.4; charset=utf-8',
+      }
+    }),
+
+    /* ---------------------------------------------------------------- the audit mirror */
+
+    define('POST', '/v1/events', async (ctx, deps) => {
+      // ── SIGNATURE FIRST, BEFORE THE PARSE. See the file header.
+      const raw = await readRaw(ctx.req)
+      const presented = headerOf(ctx.req, SIGNATURE_HEADER)
+      if (!presented || !verifyEventSignature(raw, deps.eventSigningSecret, presented)) {
+        deps.metrics.increment('admin_audit_mirror_rejected_total', { reason: 'bad_signature' })
+        ctx.log.warn('an inbound event failed its signature check')
+        return errorReply(401, 'bad_signature', 'the event signature did not verify', ctx.requestId)
+      }
+
+      // And the scope. A signature proves the sender holds the estate secret; the scope proves
+      // which service it is, which is what lands in `audit_events.source`.
+      const principal = await authenticate(ctx, deps)
+      requireExactScope(principal, MIRROR_SCOPE)
+      const sender = principal.kind === 'service' ? principal.service : 'unknown'
+
+      let envelope: Record<string, unknown>
+      try {
+        const parsed: unknown = JSON.parse(raw.toString('utf8'))
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+          throw new BadRequestError('an event envelope must be a JSON object')
+        }
+        envelope = parsed as Record<string, unknown>
+      } catch {
+        deps.metrics.increment('admin_audit_mirror_rejected_total', { reason: 'malformed' })
+        throw new BadRequestError('the event body is not valid JSON')
+      }
+
+      const topic = typeof envelope['topic'] === 'string' ? envelope['topic'] : ''
+      const eventId = typeof envelope['id'] === 'string' ? envelope['id'] : ''
+      if (!UUID.test(eventId)) {
+        deps.metrics.increment('admin_audit_mirror_rejected_total', { reason: 'malformed' })
+        throw new BadRequestError('an event envelope must carry a uuid id')
+      }
+      if (!topic.endsWith(AUDIT_MIRROR_TOPIC_SUFFIX)) {
+        // Accepted and ignored rather than refused: a producer subscribing this service to a topic
+        // it does not consume is a configuration mistake, and answering 4xx would make its relay
+        // retry for ever over something harmless.
+        deps.metrics.increment('admin_audit_mirror_rejected_total', { reason: 'unhandled_topic' })
+        return { status: 202, body: { status: 'ignored', topic } }
+      }
+
+      const payload = (envelope['payload'] ?? {}) as Record<string, unknown>
+      const mirrored = readMirror(payload, sender, envelope)
+
+      const outcome = await withInbox(deps.sql, topic, eventId, async (tx) =>
+        appendAudit(tx, { ...mirrored, sourceEventId: eventId }, deps.now),
+      )
+      if (outcome.status === 'duplicate') {
+        return { status: 200, body: { status: 'duplicate', eventId } }
+      }
+      deps.metrics.increment('admin_audit_events_total', {
+        source: mirrored.source ?? sender,
+        outcome: mirrored.outcome,
+      })
+      return { status: 201, body: { status: 'recorded', seq: outcome.value.seq.toString(), hash: outcome.value.hash } }
+    }),
+
+    /* ---------------------------------------------------------------- audit reads */
+
+    define('GET', '/v1/audit', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      const reader = requireReader(principal)
+      const params = ctx.url.searchParams
+      const before = params.get('before')
+      const page = await readAudit(deps.sql, {
+        ...(params.get('actor') ? { actor: params.get('actor')! } : {}),
+        ...(params.get('action') ? { action: params.get('action')! } : {}),
+        ...(params.get('subjectKind') ? { subjectKind: params.get('subjectKind')! } : {}),
+        ...(params.get('subjectId') ? { subjectId: params.get('subjectId')! } : {}),
+        ...(params.get('correlationId') ? { correlationId: params.get('correlationId')! } : {}),
+        ...(params.get('source') ? { source: params.get('source')! } : {}),
+        ...(before ? { before: parseCursor(before) } : {}),
+        limit: parseLimit(params.get('limit')),
+      })
+      ctx.log.info('audit read', { reader, count: page.events.length })
+      return {
+        status: 200,
+        body: { events: page.events.map(auditToJson), nextCursor: page.nextCursor },
+      }
+    }),
+
+    define('GET', '/v1/audit/verify', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      requireReader(principal)
+      // `from=0` re-walks the whole chain rather than resuming from the checkpoint. That is the
+      // thing an operator investigating a suspected tamper needs, and the reason it is a parameter
+      // rather than the default is cost: the nightly job resumes, a human asks for everything.
+      const from = ctx.url.searchParams.get('from')
+      const result = await verifyChain(deps.sql, {
+        ...(from !== null ? { from: parseCursor(from) } : {}),
+        limit: parseLimit(ctx.url.searchParams.get('limit'), 10_000, 200_000),
+      })
+      deps.metrics.set('admin_audit_chain_breaks', result.breaks.length)
+      // 200 either way. The caller asked whether the chain verifies and this is the answer; a 500
+      // would deny a monitoring system the fact it exists to read. The `ok` field is the signal.
+      return {
+        status: 200,
+        body: {
+          ok: result.ok,
+          checked: result.checked,
+          from: result.from.toString(),
+          to: result.to.toString(),
+          totalEvents: result.totalEvents,
+          headHash: result.headHash,
+          breaks: result.breaks.map((b) => ({ kind: b.kind, seq: b.seq.toString(), detail: b.detail })),
+        },
+      }
+    }),
+
+    /* ---------------------------------------------------------------- the approval queue */
+
+    define('GET', '/v1/actions', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      requireReader(principal)
+      // The catalogue, including the blocked entry and the reason. An operator console renders the
+      // 501 before the operator hits it, and the reason is the same string the 501 carries.
+      return {
+        status: 200,
+        body: {
+          actions: Object.entries(ACTIONS).map(([name, spec]) => ({ name, ...spec })),
+          reasonCodes: REASON_CODES,
+        },
+      }
+    }),
+
+    define('GET', '/v1/approvals', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      requireReader(principal)
+      const params = ctx.url.searchParams
+      const state = params.get('state')
+      const approvals = await listApprovals(deps.sql, {
+        ...(state ? { state: parseState(state) } : {}),
+        ...(params.get('action') ? { action: params.get('action')! } : {}),
+        ...(params.get('requestedBy') ? { requestedBy: params.get('requestedBy')! } : {}),
+        limit: parseLimit(params.get('limit')),
+      })
+      return { status: 200, body: { approvals } }
+    }),
+
+    define('GET', '/v1/approvals/:id', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      requireReader(principal)
+      const approval = await findApproval(deps.sql, itemIdOf(ctx))
+      if (!approval) throw new NotFoundError(`no approval request ${ctx.params['id']}`)
+      return { status: 200, body: { approval } }
+    }),
+
+    define('POST', '/v1/approvals', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      const operator = requireOperator(principal)
+      const body = await readJson(ctx.req)
+
+      const action = requireString(body, 'action')
+      if (!isKnownAction(action)) {
+        throw new BadRequestError(
+          `action must be one of ${Object.keys(ACTIONS).join(', ')} (got ${action})`,
+        )
+      }
+      const spec = ACTIONS[action]!
+      // ── THE §3.3g REFUSAL. A queue that accepts work it cannot execute lies to the operator
+      // waiting on it, and leaves an approved row that reads as two operators having authorised
+      // something that never happened. See the header of `actions.ts`.
+      if (spec.route === null) {
+        throw new ActionUnavailableError(action, spec.blockedReason ?? 'no upstream route exists')
+      }
+
+      const subjectId = requireString(body, 'subjectId')
+      const params = (body['params'] ?? {}) as Record<string, unknown>
+      if (typeof params !== 'object' || params === null || Array.isArray(params)) {
+        throw new BadRequestError('params must be a JSON object')
+      }
+      for (const name of spec.requiredParams) {
+        if (typeof params[name] !== 'string' && typeof params[name] !== 'boolean') {
+          throw new BadRequestError(`params.${name} is required for ${action}`)
+        }
+      }
+
+      return withIdempotentRoute(ctx, deps, '/v1/approvals', operator, body, async () => {
+        const outcome = await withIdempotency(deps.sql, {
+          principal: operator,
+          route: '/v1/approvals',
+          clientKey: idempotencyKeyOf(ctx),
+          requestHash: requestFingerprint(body),
+          run: async (tx) => {
+            const { approval } = await requestApproval(
+              tx,
+              {
+                action,
+                subjectKind: spec.subjectKind,
+                subjectId,
+                params,
+                reasonCode: requireString(body, 'reasonCode'),
+                reason: requireString(body, 'reason'),
+                requestedBy: operator,
+                ttlMinutes: deps.approvalTtlMinutes,
+                correlationId: ctx.requestId,
+              },
+              deps.now,
+            )
+            return { response: { approval }, artefactId: approval.id }
+          },
+        })
+        deps.metrics.increment('admin_approvals_total', { action, state: 'pending' })
+        deps.metrics.increment('admin_operator_actions_total', {
+          action: 'approval.requested',
+          outcome: 'allowed',
+        })
+        return { status: outcome.replayed ? 200 : 201, body: outcome.result }
+      })
+    }),
+
+    define('POST', '/v1/approvals/:id/decision', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      const operator = requireOperator(principal)
+      const bearer = operatorBearer(ctx)
+      const body = await readJson(ctx.req)
+      const grant = body['grant']
+      if (typeof grant !== 'boolean') throw new BadRequestError('grant must be true or false')
+      const id = itemIdOf(ctx)
+
+      return withIdempotentRoute(ctx, deps, '/v1/approvals/:id/decision', operator, body, async () => {
+        const outcome = await withIdempotency(deps.sql, {
+          principal: operator,
+          route: '/v1/approvals/:id/decision',
+          clientKey: idempotencyKeyOf(ctx),
+          requestHash: requestFingerprint({ id, ...body }),
+          run: async (tx) => {
+            const { approval } = await decide(
+              tx,
+              {
+                id,
+                operator,
+                grant,
+                note: typeof body['note'] === 'string' ? body['note'] : null,
+                correlationId: ctx.requestId,
+              },
+              deps.now,
+            )
+            return { response: { approval }, artefactId: approval.id }
+          },
+        })
+        const approval = outcome.result.approval
+        deps.metrics.increment('admin_approvals_total', {
+          action: approval.action,
+          state: approval.state,
+        })
+        deps.metrics.increment('admin_operator_actions_total', {
+          action: grant ? 'approval.granted' : 'approval.rejected',
+          outcome: 'allowed',
+        })
+
+        if (!grant || outcome.replayed) {
+          return { status: outcome.replayed ? 200 : 201, body: { approval, execution: null } }
+        }
+
+        // ══════════════════════════════════════════════════════════════════════════════════
+        // EXECUTION IS A SEPARATE TRANSACTION, DELIBERATELY, AND IT IS NOT ROLLED BACK ON
+        // FAILURE.
+        //
+        // The upstream call cannot be inside the decision's transaction: an HTTP request is not
+        // transactional, and holding a database transaction open across one is how a slow peer
+        // exhausts a connection pool. So the decision commits, and then the action runs.
+        //
+        // A failed execution therefore leaves an APPROVED, UNEXECUTED row — which is the honest
+        // state and the one an operator can act on. Rolling the approval back would erase the
+        // record that two operators agreed, and retrying would then need a third signature for
+        // something already authorised twice. `recordExecution` is at-most-once, and every
+        // executor is idempotent at its upstream, so a retry is safe.
+        // ══════════════════════════════════════════════════════════════════════════════════
+        const execution = await execute(deps, approval, operator, bearer, ctx)
+        return { status: 201, body: { approval: execution.approval, execution: execution.detail } }
+      })
+    }),
+
+    /* ---------------------------------------------------------------- flags */
+
+    define('GET', '/v1/flags', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      requireReader(principal)
+      return { status: 200, body: { flags: await listFlags(deps.sql) } }
+    }),
+
+    define('PUT', '/v1/flags/:key', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      const operator = requireOperator(principal)
+      const body = await readJson(ctx.req)
+      const enabled = body['enabled']
+      if (typeof enabled !== 'boolean') throw new BadRequestError('enabled must be true or false')
+
+      const result = await deps.sql.begin(async (tx) => ({
+        value: await setFlag(
+          tx,
+          {
+            key: ctx.params['key'] ?? '',
+            enabled,
+            description: requireString(body, 'description'),
+            owner: requireString(body, 'owner'),
+            operator,
+            correlationId: ctx.requestId,
+          },
+          deps.producer,
+          deps.now,
+        ),
+      }))
+      deps.metrics.increment('admin_operator_actions_total', {
+        action: 'flag.changed',
+        outcome: 'allowed',
+      })
+      return { status: 200, body: { flag: result.value.flag, changed: result.value.changed } }
+    }),
+
+    /* ---------------------------------------------------------------- broadcasts */
+
+    define('GET', '/v1/broadcasts', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      requireReader(principal)
+      const live = ctx.url.searchParams.get('live') === 'true'
+      const now = (deps.now ?? (() => new Date()))()
+      return {
+        status: 200,
+        body: {
+          broadcasts: await listBroadcasts(deps.sql, {
+            ...(live ? { liveAt: now } : {}),
+            limit: parseLimit(ctx.url.searchParams.get('limit')),
+          }),
+        },
+      }
+    }),
+
+    define('POST', '/v1/broadcasts', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      const operator = requireOperator(principal)
+      const body = await readJson(ctx.req)
+
+      return withIdempotentRoute(ctx, deps, '/v1/broadcasts', operator, body, async () => {
+        const outcome = await withIdempotency(deps.sql, {
+          principal: operator,
+          route: '/v1/broadcasts',
+          clientKey: idempotencyKeyOf(ctx),
+          requestHash: requestFingerprint(body),
+          run: async (tx) => {
+            const { broadcast } = await publishBroadcast(
+              tx,
+              {
+                severity: requireString(body, 'severity') as Severity,
+                title: requireString(body, 'title'),
+                body: requireString(body, 'body'),
+                ...(typeof body['startsAt'] === 'string' ? { startsAt: parseDate(body['startsAt'], 'startsAt') } : {}),
+                ...(typeof body['endsAt'] === 'string' ? { endsAt: parseDate(body['endsAt'], 'endsAt') } : {}),
+                operator,
+                correlationId: ctx.requestId,
+              },
+              deps.producer,
+              deps.now,
+            )
+            return { response: { broadcast }, artefactId: broadcast.id }
+          },
+        })
+        deps.metrics.increment('admin_operator_actions_total', {
+          action: 'broadcast.published',
+          outcome: 'allowed',
+        })
+        return { status: outcome.replayed ? 200 : 201, body: outcome.result }
+      })
+    }),
+
+    define('DELETE', '/v1/broadcasts/:id', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      const operator = requireOperator(principal)
+      const result = await deps.sql.begin(async (tx) => ({
+        value: await retractBroadcast(tx, itemIdOf(ctx), operator, ctx.requestId, deps.producer, deps.now),
+      }))
+      deps.metrics.increment('admin_operator_actions_total', {
+        action: 'broadcast.retracted',
+        outcome: 'allowed',
+      })
+      return { status: 200, body: { broadcast: result.value.broadcast } }
+    }),
+
+    /* ---------------------------------------------------------------- the estate view */
+
+    define('GET', '/v1/estate', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      const operator = requireOperator(principal)
+      const view = await composeEstate({
+        sql: deps.sql,
+        ledger: deps.ledger,
+        market: deps.market,
+        readiness: deps.readiness,
+        // Forwarded, so market records which administrator read the moderation queue.
+        operatorBearer: operatorBearer(ctx),
+        ...(deps.now ? { now: deps.now } : {}),
+      })
+      for (const [tile, value] of Object.entries(view)) {
+        deps.metrics.increment('admin_estate_tile_status_total', { tile, status: value.status })
+      }
+      ctx.log.info('estate composed', { operator })
+      // ── ALWAYS 200. A dead upstream marks one tile; it does not blank the console. See the
+      // header of `estate.ts` for why that matters more here than on a user dashboard.
+      return { status: 200, body: view }
+    }),
+  ]
+}
+
+/* ------------------------------------------------------------------------ execution */
+
+interface ExecutionSummary {
+  readonly approval: Approval
+  readonly detail: Record<string, unknown>
+}
+
+/**
+ * Run an approved action and record the outcome.
+ *
+ * Both paths write: a success records `succeeded` with the upstream's answer, a failure records
+ * `failed` with the reason. A failure that recorded nothing would leave an approved row that looks
+ * as though nobody had tried, and the next operator would authorise it again.
+ */
+async function execute(
+  deps: ServerDeps,
+  approval: Approval,
+  operator: string,
+  bearer: string,
+  ctx: RequestContext,
+): Promise<ExecutionSummary> {
+  const executor = EXECUTORS[approval.action]
+  if (!executor) {
+    // Unreachable through the route — `POST /v1/approvals` refuses a blocked action — and left
+    // here because a catalogue entry added without an executor must not silently succeed.
+    const spec = ACTIONS[approval.action]
+    throw new ActionUnavailableError(approval.action, spec?.blockedReason ?? 'no executor registered')
+  }
+
+  const context: ExecutionContext = {
+    approval,
+    operatorBearer: bearer,
+    operator,
+    correlationId: ctx.requestId,
+    ledger: deps.ledger,
+    market: deps.market,
+    billing: deps.billing,
+  }
+
+  let detail: Record<string, unknown>
+  let outcome: 'succeeded' | 'failed'
+  try {
+    detail = await executor(context)
+    outcome = 'succeeded'
+  } catch (err) {
+    outcome = 'failed'
+    detail = {
+      error: err instanceof UpstreamError ? err.message : 'the action could not be completed',
+      upstream: err instanceof UpstreamError ? err.upstream : null,
+      status: err instanceof UpstreamError ? err.status : null,
+    }
+    ctx.log.error('an authorised action failed to execute', { approvalId: approval.id, err })
+  }
+
+  const recorded = await deps.sql.begin(async (tx) => ({
+    value: await recordExecution(
+      tx,
+      { id: approval.id, outcome, detail, actor: operator, correlationId: ctx.requestId },
+      deps.now,
+    ),
+  }))
+  deps.metrics.increment('admin_operator_actions_total', { action: approval.action, outcome })
+
+  if (outcome === 'failed') {
+    // Rethrown AFTER the record commits, so the operator's console shows the failure and the row
+    // shows that it was attempted. Recording and then swallowing would be worse than not recording.
+    throw new UpstreamError(
+      String(detail['upstream'] ?? 'upstream'),
+      String(detail['error'] ?? 'the action could not be completed'),
+      typeof detail['status'] === 'number' ? detail['status'] : null,
+      typeof detail['status'] === 'number' && detail['status'] < 500,
+    )
+  }
+
+  return { approval: recorded.value?.approval ?? approval, detail }
+}
+
+/* ------------------------------------------------------------------------ helpers */
+
+/**
+ * Require an `Idempotency-Key` on a mutating route, and answer 400 without one.
+ *
+ * Named so `routeidempotency.test.ts` can find it by reading this file's source. The guard is a
+ * source-level test on purpose: the defect it catches is an OMISSION, and an omission has no
+ * behaviour to test.
+ */
+async function withIdempotentRoute(
+  ctx: RequestContext,
+  _deps: ServerDeps,
+  route: string,
+  _principal: string,
+  _body: Record<string, unknown>,
+  run: () => Promise<Reply>,
+): Promise<Reply> {
+  const key = headerOf(ctx.req, 'idempotency-key')
+  if (!key || key.length < 8 || key.length > 200) {
+    throw new BadRequestError(
+      `${route} requires an Idempotency-Key header of 8 to 200 characters — a retried request must not create a second artefact`,
+    )
+  }
+  return run()
+}
+
+function idempotencyKeyOf(ctx: RequestContext): string {
+  return headerOf(ctx.req, 'idempotency-key') ?? ''
+}
+
+/**
+ * Read the mirrored audit claim out of an inbound envelope.
+ *
+ * **The `source` is taken from the authenticated sender, not from the payload.** A service that
+ * holds `admin:audit:write` can mirror its own rows; it may not mirror somebody else's. Trusting a
+ * payload field there would let any one compromised service write audit rows attributed to every
+ * other, which is the same act-as-anyone defect as a `userId` parameter, one layer up.
+ */
+function readMirror(
+  payload: Record<string, unknown>,
+  sender: string,
+  envelope: Record<string, unknown>,
+): {
+  actor: string
+  action: string
+  subjectKind: string
+  subjectId: string
+  outcome: 'allowed' | 'refused' | 'failed'
+  reasonCode: string | null
+  correlationId: string | null
+  payload: Record<string, unknown>
+  source: string
+  occurredAt: Date
+} {
+  const actor = typeof payload['actor'] === 'string' ? payload['actor'] : null
+  if (!actor || !/^(user|service):/.test(actor)) {
+    throw new BadRequestError('a mirrored audit row must name a principal actor')
+  }
+  const action = typeof payload['action'] === 'string' ? payload['action'] : ''
+  if (action.length === 0) throw new BadRequestError('a mirrored audit row must name an action')
+  const outcome = payload['outcome']
+  const known = outcome === 'allowed' || outcome === 'refused' || outcome === 'failed'
+  const occurred = typeof envelope['occurredAt'] === 'string' ? new Date(envelope['occurredAt']) : new Date()
+
+  return {
+    actor,
+    action,
+    subjectKind: typeof payload['subjectKind'] === 'string' ? payload['subjectKind'] : 'unknown',
+    subjectId: typeof payload['subjectId'] === 'string' ? payload['subjectId'] : '',
+    outcome: known ? outcome : 'allowed',
+    reasonCode: typeof payload['reasonCode'] === 'string' ? payload['reasonCode'] : null,
+    correlationId: typeof envelope['correlationId'] === 'string' ? envelope['correlationId'] : null,
+    payload: (payload['detail'] ?? {}) as Record<string, unknown>,
+    source: sender,
+    occurredAt: Number.isNaN(occurred.getTime()) ? new Date() : occurred,
+  }
+}
+
+function parseState(value: string): ApprovalState {
+  if (value !== 'pending' && value !== 'approved' && value !== 'rejected' && value !== 'expired') {
+    throw new BadRequestError('state must be pending, approved, rejected or expired')
+  }
+  return value
+}
+
+function parseCursor(value: string): bigint {
+  if (!/^\d{1,19}$/.test(value)) throw new BadRequestError('a cursor is a decimal sequence number')
+  return BigInt(value)
+}
+
+function parseLimit(value: string | null, fallback = 50, max = 200): number {
+  if (value === null) return fallback
+  if (!/^\d{1,7}$/.test(value)) throw new BadRequestError('limit must be a whole number')
+  return Math.min(Math.max(Number(value), 1), max)
+}
+
+function parseDate(value: string, field: string): Date {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) throw new BadRequestError(`${field} must be an ISO 8601 timestamp`)
+  return date
+}
+
+/**
+ * A path parameter compared against a `uuid` column.
+ *
+ * Checked in the application rather than left to Postgres, because Postgres answers a malformed
+ * uuid with error 22P02 — which reaches the error handler as an unrecognised fault and becomes a
+ * 500. A caller typing a wrong id would then get "something went wrong on our side" for a request
+ * that was simply about a thing that does not exist.
+ */
+function itemIdOf(ctx: RequestContext): string {
+  const id = ctx.params['id'] ?? ''
+  if (!UUID.test(id)) throw new NotFoundError('no such item')
+  return id
+}
+
+function requireString(body: Record<string, unknown>, field: string): string {
+  const value = body[field]
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new BadRequestError(`${field} is required and must be a non-empty string`)
+  }
+  return value
+}
+
+function headerOf(req: IncomingMessage, name: string): string | undefined {
+  const value = req.headers[name]
+  return Array.isArray(value) ? value[0] : value
+}
+
+async function readRaw(req: IncomingMessage): Promise<Buffer> {
+  const chunks: Buffer[] = []
+  let size = 0
+  for await (const chunk of req) {
+    const buffer = chunk as Buffer
+    size += buffer.length
+    // Capped before buffering, not after: an unbounded body is a memory exhaustion primitive that
+    // any authenticated caller could otherwise reach.
+    if (size > MAX_BODY_BYTES) throw new BadRequestError('request body too large')
+    chunks.push(buffer)
+  }
+  return Buffer.concat(chunks)
+}
+
+async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const raw = await readRaw(req)
+  if (raw.length === 0) return {}
+  try {
+    const parsed: unknown = JSON.parse(raw.toString('utf8'))
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new BadRequestError('the request body must be a JSON object')
+    }
+    return parsed as Record<string, unknown>
+  } catch (err) {
+    if (err instanceof BadRequestError) throw err
+    throw new BadRequestError('the request body is not valid JSON')
+  }
+}
+
+function errorReply(status: number, code: string, message: string, requestId: string): Reply {
+  return { status, body: { error: { code, message, requestId } } }
+}
+
+function send(res: ServerResponse, reply: Reply, requestId: string): void {
+  const headers: Record<string, string> = {
+    'content-type': reply.contentType ?? 'application/json; charset=utf-8',
+    'x-request-id': requestId,
+    // An operator console is the one surface where a cached answer during an incident is actively
+    // dangerous: acting on a ninety-second-old "ledger: ok" is acting on a fact that has changed.
+    'cache-control': 'no-store',
+  }
+  const payload = reply.text ?? (reply.body === undefined ? '' : `${JSON.stringify(reply.body)}\n`)
+  for (const [key, value] of Object.entries(reply.headers ?? {})) headers[key.toLowerCase()] = value
+  headers['content-length'] = String(Buffer.byteLength(payload))
+  res.writeHead(reply.status, headers)
+  res.end(payload)
+}
