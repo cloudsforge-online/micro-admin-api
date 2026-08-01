@@ -181,6 +181,22 @@ export function createRelay(deps: RelayDeps): Handler {
         await deliver(deps, clientFor, subscription, envelope, signature, deadlineMs)
       }
 
+      // ══════════════════════════════════════════════════════════════════════════════════════
+      // Published only when NOTHING IS OUTSTANDING, so an undelivered subscriber keeps the event
+      // in the unpublished set and the next pass retries it.
+      //
+      // **AND THE LIMIT OF THAT, STATED PRECISELY.** The delivery rows are computed from the LIVE
+      // subscription set on every pass, so a subscriber added while an event is still outstanding
+      // DOES receive it. A subscriber added after the event already published does NOT — with zero
+      // active subscriptions the outstanding count is zero, the event publishes on the first pass,
+      // and it is never reconsidered.
+      //
+      // That is the right behaviour (a subscription is not a replay request) but it is NOT what
+      // the comment inherited from `market/src/outbox.ts:239-241` claims, which says flatly that
+      // "a subscriber added after the event was written still receives it". Both directions are
+      // pinned in `outbox.test.ts` so this repository's comment matches this repository's code.
+      // Reported for market rather than fixed there: this repository does not edit siblings.
+      // ══════════════════════════════════════════════════════════════════════════════════════
       const outstanding = await deps.sql<{ n: number }[]>`
         select count(*)::int as n
           from event_subscriptions s
