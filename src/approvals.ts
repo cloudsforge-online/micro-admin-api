@@ -403,7 +403,17 @@ export async function findApproval(sql: Db | Tx, id: string): Promise<Approval |
  */
 export async function expirePending(
   tx: Tx,
+  /**
+   * The principal, not the process. `service:admin-api` — never `service:admin-api@<replica>`.
+   *
+   * `audit_events_actor_is_a_principal` refuses the second form, and it is right to: an actor is
+   * an IDENTITY, and a replica name is not one. Two replicas are the same principal doing the same
+   * thing, and an audit that treated them as different actors would make "how many distinct
+   * parties touched this" unanswerable by counting. The replica lands in the payload, where it is
+   * forensic detail rather than attribution.
+   */
   actor: string,
+  instanceId: string,
   limit = 200,
   now: () => Date = () => new Date(),
 ): Promise<readonly string[]> {
@@ -430,7 +440,11 @@ export async function expirePending(
         outcome: 'refused',
         reasonCode: row.reason_code,
         correlationId: row.correlation_id,
-        payload: { requestedAction: row.action, reason: 'no second operator answered before the deadline' },
+        payload: {
+          requestedAction: row.action,
+          reason: 'no second operator answered before the deadline',
+          instanceId,
+        },
       },
       now,
     )

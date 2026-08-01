@@ -34,6 +34,17 @@ import { expirePending } from './approvals.ts'
 import { reapIdempotencyKeys } from './idempotency.ts'
 import { createRelay, type Db } from './outbox.ts'
 
+/**
+ * This service's own principal, for the audit rows its background work writes.
+ *
+ * The replica is NOT part of it: `audit_events_actor_is_a_principal` refuses `service:x@replica`,
+ * and correctly — an actor is an identity, and two replicas are the same identity. The replica
+ * name goes in the payload. (`audit_chain_checkpoints.verified_by` is not an actor and does carry
+ * it, because "which replica last verified" is exactly what an operator chasing a stalled
+ * verification wants.)
+ */
+export const SERVICE_PRINCIPAL = 'service:admin-api'
+
 export const AUDIT_VERIFY = 'audit.verify'
 export const OUTBOX_RELAY = 'outbox.relay'
 export const APPROVALS_EXPIRE = 'approvals.expire'
@@ -89,7 +100,7 @@ export function createAuditVerifier(deps: JobDeps): Handler {
       throw new Error(`audit chain verification found ${result.breaks.length} break(s)`)
     }
 
-    const checkpoint = await writeCheckpoint(deps.sql, `service:admin-api@${deps.instanceId}`)
+    const checkpoint = await writeCheckpoint(deps.sql, `${SERVICE_PRINCIPAL}@${deps.instanceId}`)
     deps.metrics.set('admin_audit_chain_verified_seq', Number(checkpoint?.seq ?? 0n))
     deps.logger.info('audit chain verified', {
       checked: result.checked,
@@ -103,7 +114,7 @@ export function createApprovalExpirer(deps: JobDeps): Handler {
   const now = deps.now ?? (() => new Date())
   return async () => {
     const expired = await deps.sql.begin(async (tx) => ({
-      value: await expirePending(tx, `service:admin-api@${deps.instanceId}`, 200, now),
+      value: await expirePending(tx, SERVICE_PRINCIPAL, deps.instanceId, 200, now),
     }))
     if (expired.value.length > 0) {
       deps.metrics.increment('admin_approvals_expired_total', {}, expired.value.length)
