@@ -192,10 +192,12 @@ export function createRelay(deps: RelayDeps): Handler {
       // and it is never reconsidered.
       //
       // That is the right behaviour (a subscription is not a replay request) but it is NOT what
-      // the comment inherited from `market/src/outbox.ts:239-241` claims, which says flatly that
-      // "a subscriber added after the event was written still receives it". Both directions are
-      // pinned in `outbox.test.ts` so this repository's comment matches this repository's code.
-      // Reported for market rather than fixed there: this repository does not edit siblings.
+      // the comment inherited from `service-template/src/outbox.ts:205` claims, which says flatly
+      // that "a subscriber added after the event was written still receives it" — and which is
+      // carried verbatim by eighteen repositories, `market/src/outbox.ts:239-241` among them.
+      // Both directions are pinned in `outbox.test.ts` so this repository's comment matches this
+      // repository's code. Reported rather than fixed in the siblings: this repository does not
+      // edit them, and the correction belongs in the template first or it keeps propagating.
       // ══════════════════════════════════════════════════════════════════════════════════════
       const outstanding = await deps.sql<{ n: number }[]>`
         select count(*)::int as n

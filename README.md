@@ -320,9 +320,28 @@ state.
 3. **`@cloudsforge/contracts-admin` is uncut**, so the scope vocabulary and the action catalogue
    live in this service rather than in a published, schema-diff-enforced package.
 4. **No emergency freeze**, because its asymmetry spans ledger and policy. See §6.
-5. **Found while reading, not fixed here** (this repository does not edit siblings):
-   `market/src/outbox.ts:239-241` claims "a subscriber added after the event was written still
-   receives it". With zero active subscriptions the outstanding count is zero, the event publishes
-   on the first pass and is never reconsidered — so a subscriber added after publication does not
-   receive it. The behaviour is right; the comment is not. This repository's copy states the limit
-   precisely and pins both directions in `outbox.test.ts`.
+5. **Found while reading, reported not fixed** (this repository does not edit siblings):
+   **the outbox relay's comment overstates what it does, in eighteen repositories.**
+
+   `service-template/src/outbox.ts:205` — and therefore `billing`, `custody`, `devplatform`,
+   `emberkin`, `foresight`, `identity`, `indexer`, `ledger`, `market`, `mint`, `nda`, `pricing`,
+   `settlement`, `studio`, `trade`, `wallet` and `worlds`, all carrying it verbatim — says:
+
+   > A subscriber added after the event was written still receives it, because the delivery rows
+   > are computed from the live subscription set on every pass rather than fixed when the event was
+   > produced.
+
+   The second clause is true and the first does not follow from it. With **zero active
+   subscriptions** the outstanding count is zero, so the event is marked `published_at` on the very
+   first pass and is never reconsidered — a subscriber added after that receives nothing. The claim
+   holds only while an event is still *outstanding*, i.e. while some other subscriber has yet to be
+   delivered.
+
+   The behaviour is right — a subscription is not a replay request — so this is a documentation
+   defect rather than a code one, and it should be corrected in `service-template` first or it will
+   keep propagating to every new service. It matters because the sentence reads as a guarantee an
+   integrator could plan around: "just add the subscription, you will not miss anything."
+
+   This repository's copy states the limit precisely and pins both directions in `outbox.test.ts`
+   (`a subscriber added while an event is OUTSTANDING does receive it` and `THE LIMIT: a subscriber
+   added after the event PUBLISHED does not receive it`).
