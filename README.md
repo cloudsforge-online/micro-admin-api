@@ -32,6 +32,9 @@ against this repository's own source.
 | `POST /v1/approvals/:id/decision` | Approve or reject — **and execute**, if approved. |
 | `GET /v1/flags` `PUT /v1/flags/:key` | Feature flags. Owner and description are mandatory. |
 | `GET /v1/broadcasts` `POST /v1/broadcasts` `DELETE /v1/broadcasts/:id` | Operator broadcasts. Retracted, never deleted. |
+| `GET /v1/engagement/policies` | The engagement caps and their schema ceilings, plus the fee-recycle percentage. |
+| `PUT /v1/engagement/policies/:service` | **Lower** a cap, one operator. A raise is refused here with 403 and the name of the action that does it. |
+| `GET /v1/engagement/report` | Treasury and per-service balances read off the ledger, spend, and the transfer records. |
 | `GET /v1/estate` | One call, one 200, six tiles, per-tile degradation. |
 | `GET /livez` `GET /readyz` `GET /metrics` | Rule 4. |
 
@@ -264,6 +267,54 @@ Also not built, deliberately:
 
 ---
 
+## 7. The engagement treasury: the caps, before a single Shard moves
+
+`docs/ecosystem/21` decides the platform may fund empty rooms — bounded, disclosed, denominated in
+Shards — and its §8 build order is law: **nothing may move a Shard before the caps exist.** This
+service holds the caps because it already owns cross-service operator state (21 §4). The money it
+caps lives elsewhere, and that refusal is the design: `platform:engagement-treasury` and
+`engagement:<service>` are ordinary `micro-ledger` accounts (grammar:
+`contracts/packages/money/src/index.ts:109`; the ledger's own schema is untouched — its `subject`
+column is unconstrained text at `ledger/src/migrations.ts:119`), and an auditor reconstructs the
+whole programme from the ledger alone.
+
+What migration 8 (`src/migrations.ts`, version 8) makes unrepresentable rather than merely checked:
+
+| Claim (21 §7) | The line that enforces it |
+| --- | --- |
+| A transfer above the policy cap is refused **even for a caller holding a connection** | trigger `engagement_transfers_within_cap` — raises on `amount_shards > transfer_cap_shards`, and on a service with **no policy row at all** |
+| A transfer not backed by an approved `engagement.transfer` approval cannot be recorded | same trigger — the approval row must exist, be `approved`, and name that action |
+| Every transfer resolves to a ledger entry; a `posted` row with no entry cannot exist | CHECK `engagement_transfers_posted_names_entry` — `posted` ⇔ `ledger_entry_id` ⇔ `posted_at` |
+| One approval is one transfer, for ever | `engagement_transfers_one_per_approval` unique on `approval_id` — the same key the ledger idempotency key is derived from |
+| The fee-recycle percentage cannot exceed its ceiling | CHECK `engagement_fee_recycle_within_ceiling` (0–2500 bps) |
+| Raising any cap without an approval is refused; lowering succeeds | trigger `engagement_raise_needs_approval` — a raise must name a **fresh** approved `engagement.policy.set` approval; a lower needs nothing |
+| Every ceiling is finite | CHECKs `engagement_policies_cap_within_ceiling` (10⁹ Shards), `engagement_policies_seed_within_ceiling` (10²¹/10²² wei) — the same numbers `micro-foresight` pins in its own schema |
+
+Every row of that table is fire-tested with raw SQL in `src/engagement.test.ts`, connection in
+hand, routes bypassed.
+
+The three actions (21 §6), in the catalogue at `src/actions.ts:161`:
+
+- **`engagement.transfer`** — two operators. The executor claims the cap-checked transfer row,
+  posts **one** balanced entry to `POST /entries` (`ledger/src/server.ts:346`) with both accounts
+  inline so the ledger creates them idempotently on first use (`ledger/src/accounts.ts:100`), then
+  records the pairing. Idempotent end to end on the approval id.
+- **`engagement.policy.set`** — two operators, **required only to raise**. The lowering lane is
+  `PUT /v1/engagement/policies/:service`, one operator — `micro-devplatform`'s quota asymmetry
+  (`devplatform/src/server.ts:981`: *the direction is the authority*), with the trigger holding the
+  line against any writer that skips the route. `:service` may be `platform`, which addresses the
+  fee-recycle percentage; it starts at 0 (21's recorded open decision — pure mined funding until
+  revenue exists).
+- **`engagement.report`** — no approval; 21 §6's column reads "none (read)". The queue **refuses**
+  it and names `GET /v1/engagement/report`, the way the blocked action's 501 names its missing
+  route: a read that spent two signatures would train operators to sign reflexively.
+
+Not in this phase, recorded not hidden: the transfers only *fill* the per-service accounts. The
+grants that spend them (market subsidies, worlds/title budgets, trade credits — 21 §5) and the
+`admin-web` screen are later waves of the same programme, behind foresight's house seed.
+
+---
+
 ## Degradation
 
 `GET /v1/estate` always answers 200. Every tile carries its own status, `data` is never null, and
@@ -298,7 +349,7 @@ job exactly once, and two expirers on one overdue request write exactly one audi
 
 ## Tests
 
-`pnpm test` — **257 tests, 0 skipped**, against a real Postgres whose name must contain `test`.
+`pnpm test` — **275 tests, 0 skipped**, against a real Postgres whose name must contain `test`.
 
 The exit criteria are the two files that carry them: `audit.test.ts` performs four tampers and
 asserts each is caught by the specific break kind at the specific sequence, and `approvals.test.ts`

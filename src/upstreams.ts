@@ -16,6 +16,9 @@
  *            SERVICE TOKEN ONLY               ledger/src/server.ts:~250 `authorise` refuses a
  *                                             user principal outright
  *   ledger   GET  /trial-balance              ledger/src/server.ts:513, scope 'ledger:read'
+ *   ledger   POST /entries                    ledger/src/server.ts:346, scope 'ledger:post' —
+ *                                             body shape from parsePostEntry at :646-707
+ *   ledger   GET  /accounts/:subject/balances ledger/src/server.ts:499, scope 'ledger:read'
  *   market   POST /v1/moderation/cases/:id/resolve   market/src/server.ts:1086
  *            guard: requireOperator           market/src/server.ts:~1155 — a SERVICE token needs
  *                                             'market:admin', a USER token needs role:admin
@@ -185,11 +188,63 @@ export interface TrialBalance {
   readonly totalAbsoluteDelta: string
 }
 
+/**
+ * One side of an entry this service posts. Field names are the ledger's, read from
+ * `parsePostEntry` at ledger/src/server.ts:646-707: `direction`, `amount` (a DECIMAL STRING —
+ * a JSON number near an 18-decimal amount comes back subtly wrong, not visibly broken),
+ * `assetCode`, `sequence`, and an inline `account` block, which is what makes the engagement
+ * accounts' creation idempotent on first use: the ledger's `ensureAccount`
+ * (ledger/src/accounts.ts:100) is `on conflict do nothing` on the account key.
+ */
+export interface EntryPosting {
+  readonly direction: 'debit' | 'credit'
+  readonly amount: string
+  readonly assetCode: string
+  readonly sequence: number
+  readonly account: {
+    readonly subject: string
+    readonly assetCode: string
+    readonly purpose: string
+    readonly type: string
+  }
+}
+
+export interface PostEntryRequest {
+  /** One of the ledger's closed `journal_entries_kind_chk` list — ledger/src/migrations.ts:180. */
+  readonly kind: string
+  readonly idempotencyKey: string
+  readonly description: string
+  readonly correlationId: string
+  readonly postings: readonly EntryPosting[]
+  /** The operator whose approval authorised this. Carried in metadata; see the file header. */
+  readonly operator: string
+  readonly approvalId: string
+}
+
+export interface PostedEntry {
+  readonly id: string
+  readonly replayed: boolean
+}
+
+export interface AccountBalance {
+  readonly subject: string
+  readonly assetCode: string
+  readonly purpose: string
+  readonly type: string
+  readonly status: string
+  /** A decimal string in the account's normal direction — ledger/src/accounts.ts:160-172. */
+  readonly amount: string
+}
+
 export interface LedgerClient {
   /** `POST /entries/:id/reverse` — ledger/src/server.ts:394, scope `ledger:post`. */
   reverseEntry(request: ReverseEntryRequest): Promise<ReversedEntry>
+  /** `POST /entries` — ledger/src/server.ts:346, scope `ledger:post`. SERVICE TOKEN ONLY. */
+  postEntry(request: PostEntryRequest): Promise<PostedEntry>
   /** `GET /trial-balance` — ledger/src/server.ts:513, scope `ledger:read`. */
   trialBalance(): Promise<TrialBalance>
+  /** `GET /accounts/:subject/balances` — ledger/src/server.ts:499, scope `ledger:read`. */
+  balancesForSubject(subject: string): Promise<readonly AccountBalance[]>
 }
 
 export function httpLedgerClient(config: ClientConfig): LedgerClient {
@@ -223,11 +278,58 @@ export function httpLedgerClient(config: ClientConfig): LedgerClient {
         throw wrap('ledger', err)
       }
     },
+    async postEntry(request) {
+      try {
+        // Body fields from `parsePostEntry`, ledger/src/server.ts:646-707. `actor` is typed
+        // `service:${string}` there, so — exactly as in reverseEntry above — the human operator
+        // travels in metadata and in this service's hash-chained audit row, joined by the
+        // correlation id.
+        const answer = await client.post<{ entry: { id: string }; replayed: boolean }>(
+          '/entries',
+          {
+            kind: request.kind,
+            originatingService: 'admin-api',
+            actor: 'service:admin-api',
+            correlationId: request.correlationId,
+            idempotencyKey: request.idempotencyKey,
+            description: request.description,
+            postings: request.postings,
+            metadata: {
+              operator: request.operator,
+              approvalId: request.approvalId,
+              operatorRecordedIn: 'admin-api audit_events',
+            },
+          },
+          {
+            idempotencyKey: request.idempotencyKey,
+            requestId: request.correlationId,
+            headers: authHeader(config, { kind: 'service' }),
+          },
+        )
+        return { id: answer.entry.id, replayed: answer.replayed }
+      } catch (err) {
+        throw wrap('ledger', err)
+      }
+    },
     async trialBalance() {
       try {
         return await client.get<TrialBalance>('/trial-balance', {
           headers: authHeader(config, { kind: 'service' }),
         })
+      } catch (err) {
+        throw wrap('ledger', err)
+      }
+    },
+    async balancesForSubject(subject) {
+      try {
+        // The subject is `platform:engagement-treasury` or `engagement:<service>` — both carry a
+        // colon, and the route decodes (`decodeURIComponent`, ledger/src/server.ts:503), so the
+        // encoding here is what a well-behaved client owes it.
+        const answer = await client.get<{ balances: readonly AccountBalance[] }>(
+          `/accounts/${encodeURIComponent(subject)}/balances`,
+          { headers: authHeader(config, { kind: 'service' }) },
+        )
+        return answer.balances ?? []
       } catch (err) {
         throw wrap('ledger', err)
       }

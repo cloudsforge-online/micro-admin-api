@@ -21,7 +21,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { ACTIONS, BLOCKED_ACTIONS, EXECUTABLE_ACTIONS, EXECUTORS } from './actions.ts'
+import { ACTIONS, BLOCKED_ACTIONS, EXECUTABLE_ACTIONS, EXECUTORS, READ_ACTIONS } from './actions.ts'
 
 const SERVER = readFileSync(fileURLToPath(new URL('./server.ts', import.meta.url)), 'utf8')
 
@@ -36,6 +36,8 @@ const EXEMPT: Readonly<Record<string, string>> = {
     'an upsert keyed on the flag key. A retry writes the same row; the audit records what the value was before, so a replayed no-op is visible as one rather than as a second change',
   'DELETE /v1/broadcasts/:id':
     'a state transition claimed with `where retracted_at is null`; the second attempt matches no row and is refused rather than audited twice',
+  'PUT /v1/engagement/policies/:service':
+    'an upsert keyed on the service, exactly like PUT /v1/flags/:key: a retry writes the same row, the audit payload carries before and after, and the lowering it performs is idempotent by value — the raise path travels through POST /v1/approvals, which IS wrapped',
 }
 
 function mutatingRoutes(): Array<{ key: string; wrapped: boolean }> {
@@ -101,6 +103,27 @@ test('every executable action has an executor, and every blocked one does not', 
   for (const name of BLOCKED_ACTIONS) {
     assert.equal(EXECUTORS[name], undefined, `${name} has no route but has an executor`)
   }
+  // And a READ has no executor either: the queue refuses it at creation, so an executor for one
+  // would be dead code waiting for a route change to make it reachable.
+  for (const name of READ_ACTIONS) {
+    assert.equal(EXECUTORS[name], undefined, `${name} is a read but has an executor`)
+  }
+})
+
+test('a read action is refused by the queue and served by a GET it names', () => {
+  // 21 §6: engagement.report's approval column is "none (read)". The catalogue carries it so the
+  // console renders all three engagement actions; the queue refuses it; and its route citation
+  // must name the GET an operator calls instead.
+  assert.deepEqual([...READ_ACTIONS], ['engagement.report'])
+  for (const name of READ_ACTIONS) {
+    const spec = ACTIONS[name]!
+    assert.equal(spec.approval, 'read')
+    assert.match(spec.route ?? '', /^GET \//, `${name}'s route must name the GET that serves it`)
+    assert.ok(
+      SERVER.includes(`'${(spec.route ?? '').split(' — ')[0]!.replace(/^GET /, '')}'`),
+      `${name}'s GET route is not defined on this server`,
+    )
+  }
 })
 
 test('a blocked action states WHY, and the reason names what is missing', () => {
@@ -128,9 +151,31 @@ test('the blocked list is exactly the role grant — the §3.3g answer', () => {
 test('every action names a subject kind, and none of them is a user costume', () => {
   for (const [name, spec] of Object.entries(ACTIONS)) {
     assert.ok(spec.subjectKind.length > 0, `${name} names no subject kind`)
-    assert.ok(spec.requiredParams.length > 0, `${name} requires no parameters, which is unlikely to be right`)
+    // A two-operator action with no parameters is a mutation described by nothing but its
+    // subject id, which is almost always a decision someone forgot to require. A READ takes its
+    // parameters as query strings on the GET it names, so the rule does not apply to it.
+    if (spec.approval === 'two-operator') {
+      assert.ok(spec.requiredParams.length > 0, `${name} requires no parameters, which is unlikely to be right`)
+    }
   }
   // The one action whose subject IS a user is the blocked one, and it is a SUBJECT — the thing
   // acted upon — never an identity the operator borrows.
   assert.equal(ACTIONS['identity.role.grant']!.subjectKind, 'user')
+})
+
+test('the engagement catalogue is exactly 21 §6, with the schema behind each promise', () => {
+  // The three actions the document's table names, in the catalogue's shape. Pinned as a closed
+  // set the way BLOCKED_ACTIONS is: an engagement action added or renamed without this test
+  // changing is an action nobody decided.
+  const engagement = Object.keys(ACTIONS).filter((name) => name.startsWith('engagement.'))
+  assert.deepEqual(engagement.sort(), ['engagement.policy.set', 'engagement.report', 'engagement.transfer'])
+  assert.equal(ACTIONS['engagement.transfer']!.approval, 'two-operator')
+  assert.equal(ACTIONS['engagement.policy.set']!.approval, 'two-operator')
+  assert.equal(ACTIONS['engagement.report']!.approval, 'read')
+  // The transfer's summary must say where the cap binds, because that is the claim 21 §7.3
+  // audits: the schema, not the route.
+  assert.match(ACTIONS['engagement.transfer']!.summary, /schema/i)
+  // And the policy action must name the asymmetry, so the console shows an operator WHY their
+  // lower went through without the queue.
+  assert.match(ACTIONS['engagement.policy.set']!.summary, /lower/i)
 })

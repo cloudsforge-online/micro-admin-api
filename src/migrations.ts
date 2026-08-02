@@ -359,6 +359,234 @@ export const MIGRATIONS: readonly Migration[] = [
         where retracted_at is null;
     `,
   },
+  {
+    version: 8,
+    name: 'engagement',
+    up: `
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      -- THE ENGAGEMENT TREASURY'S CAPS — docs/ecosystem/21 §4 and §8.
+      --
+      -- §8's build order is law: "nothing may move before the caps exist." So the caps are rows
+      -- with CHECK constraints, the transfers that spend against them are rows a trigger refuses
+      -- above the cap, and both hold against a caller with a database connection — which is the
+      -- caller every route-level check is helpless against.
+      --
+      -- WHAT THIS IS NOT: a balance. The Shards live in micro-ledger accounts
+      -- ('platform:engagement-treasury' and 'engagement:<service>' — the grammar is
+      -- contracts/packages/money/src/index.ts, the accounts ordinary rows in the ledger's chart).
+      -- This service holds the OPERATOR STATE about them: what an operator may move, and the
+      -- record that each approved movement produced exactly one ledger entry. An auditor
+      -- reconstructs the programme from the ledger alone (21 §4); these tables are how the
+      -- operator surface refuses to let that reconstruction ever show more than the caps allowed.
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      create table if not exists engagement_policies (
+        -- The six rooms 21 §1 names. A closed list, because a policy row for a service nobody
+        -- decided to seed is a cap nobody decided to grant.
+        service                 text        primary key,
+        -- The most one APPROVED transfer may move into this service's engagement account.
+        -- bigint Shards: at 100 Shards/USD (contracts-chain SHARDS_PER_USD) the ceiling below is
+        -- USD 10,000,000 per transfer — deliberately far above any sane early-programme value and
+        -- deliberately finite, because "no ceiling" is how devplatform's quota defect happened.
+        transfer_cap_shards     bigint      not null default 0,
+        -- Foresight's house-seed sizes (21 §5), EMBER wei per outcome side and per UTC day —
+        -- wei because the seed is an on-chain stake and the pool it discloses into is wei.
+        -- numeric(78,0): any uint256, exact. micro-foresight pins the SAME ceilings in its own
+        -- schema (foresight/src/migrations.ts version 8) so the bound holds in both databases.
+        seed_per_market_wei     numeric(78,0),
+        seed_per_day_wei        numeric(78,0),
+        -- The approval that last RAISED anything here. The trigger below refuses a raise that
+        -- does not name a fresh approved 'engagement.policy.set' approval; lowering needs none —
+        -- the devplatform asymmetry (devplatform/src/server.ts:981 'THE DIRECTION IS THE
+        -- AUTHORITY'), enforced in the schema rather than restated in a route.
+        last_change_approval_id uuid        references approvals (id),
+        updated_at              timestamptz not null default now(),
+        updated_by              text        not null,
+
+        constraint engagement_policies_service_known check (
+          service in ('foresight','market','worlds','aetherholm','emberkin','trade')
+        ),
+        -- 1,000,000,000 Shards = USD 10M/transfer. The ceiling on the CAP, not the cap: an
+        -- operator sets any value at or below this; nothing sets one above it.
+        constraint engagement_policies_cap_within_ceiling check (
+          transfer_cap_shards >= 0 and transfer_cap_shards <= 1000000000
+        ),
+        -- Seed sizes are foresight's alone (21 §5 gives the house seed to foresight; every other
+        -- service spends through grants, never stakes).
+        constraint engagement_policies_seeds_are_foresights check (
+          (seed_per_market_wei is null and seed_per_day_wei is null) or service = 'foresight'
+        ),
+        -- Half a seed policy is not a policy: a per-market size with no per-day bound is exactly
+        -- the unbounded spend 21 §7.3 exists to refuse.
+        constraint engagement_policies_seed_pair check (
+          (seed_per_market_wei is null) = (seed_per_day_wei is null)
+        ),
+        -- Ceilings: 1e21 wei = 1,000 EMBER per market side; 1e22 wei = 10,000 EMBER per day.
+        -- A per-day value below the per-market value would make every seeded market refuse, so
+        -- the nonsense is refused at the write instead.
+        constraint engagement_policies_seed_within_ceiling check (
+          seed_per_market_wei is null or (
+            seed_per_market_wei > 0
+            and seed_per_market_wei <= 1000000000000000000000
+            and seed_per_day_wei >= seed_per_market_wei
+            and seed_per_day_wei <= 10000000000000000000000
+          )
+        )
+      );
+
+      -- The fee recycle (21 §3): a configured share of platform fee revenue posts to the
+      -- treasury each period. One row, because it is one platform-wide number. Seeded at 0 —
+      -- 21's closing 'open decision' recommends starting at pure mined funding, and raising it
+      -- later already requires the approval-gated action.
+      create table if not exists engagement_fee_recycle (
+        singleton               boolean     primary key default true,
+        recycle_bps             integer     not null default 0,
+        last_change_approval_id uuid        references approvals (id),
+        updated_at              timestamptz not null default now(),
+        updated_by              text        not null,
+
+        constraint engagement_fee_recycle_one_row check (singleton),
+        -- 2500 bps = 25%. A recycle above a quarter of fee revenue is an engagement programme
+        -- eating the business that funds it; 21 §7.5 requires the ceiling to be schema, and this
+        -- is it.
+        constraint engagement_fee_recycle_within_ceiling check (
+          recycle_bps >= 0 and recycle_bps <= 2500
+        )
+      );
+      insert into engagement_fee_recycle (singleton, recycle_bps, updated_by)
+      values (true, 0, 'migration:8')
+      on conflict (singleton) do nothing;
+
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      -- RAISING NEEDS TWO OPERATORS; LOWERING NEEDS NONE. 21 §7.7, as a trigger.
+      --
+      -- A raise must name a FRESH approval row that two operators drove to 'approved' for
+      -- exactly this action. The route enforces the same thing first with a readable sentence;
+      -- this is what holds when the write arrives by any other door. Freshness (the approval id
+      -- must CHANGE on a raise) is what stops one approval authorising unlimited later raises.
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      create or replace function engagement_raise_needs_approval() returns trigger
+        language plpgsql
+      as $$
+      declare
+        raised boolean;
+        approved boolean;
+      begin
+        if tg_table_name = 'engagement_policies' then
+          if tg_op = 'INSERT' then
+            raised := new.transfer_cap_shards > 0 or new.seed_per_market_wei is not null;
+          else
+            raised := new.transfer_cap_shards > old.transfer_cap_shards
+              or (new.seed_per_market_wei is not null and (old.seed_per_market_wei is null or new.seed_per_market_wei > old.seed_per_market_wei))
+              or (new.seed_per_day_wei is not null and (old.seed_per_day_wei is null or new.seed_per_day_wei > old.seed_per_day_wei));
+          end if;
+        else
+          if tg_op = 'INSERT' then
+            raised := new.recycle_bps > 0;
+          else
+            raised := new.recycle_bps > old.recycle_bps;
+          end if;
+        end if;
+
+        if not raised then
+          return new;
+        end if;
+
+        if new.last_change_approval_id is null
+           or (tg_op = 'UPDATE' and new.last_change_approval_id is not distinct from old.last_change_approval_id) then
+          raise exception 'raising an engagement cap requires a fresh approved engagement.policy.set approval; lowering does not (21 §7.7)'
+            using errcode = 'check_violation';
+        end if;
+
+        select (state = 'approved' and action = 'engagement.policy.set')
+          into approved
+          from approvals where id = new.last_change_approval_id;
+        if approved is distinct from true then
+          raise exception 'approval % is not an approved engagement.policy.set approval', new.last_change_approval_id
+            using errcode = 'check_violation';
+        end if;
+        return new;
+      end;
+      $$;
+
+      drop trigger if exists engagement_policies_raise_needs_approval on engagement_policies;
+      create trigger engagement_policies_raise_needs_approval
+        before insert or update on engagement_policies
+        for each row execute function engagement_raise_needs_approval();
+
+      drop trigger if exists engagement_fee_recycle_raise_needs_approval on engagement_fee_recycle;
+      create trigger engagement_fee_recycle_raise_needs_approval
+        before insert or update on engagement_fee_recycle
+        for each row execute function engagement_raise_needs_approval();
+
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      -- THE TRANSFER RECORD. One row per approved treasury → service movement, and the row IS
+      -- where the cap binds (21 §7.3): the trigger refuses an amount above the service's policy
+      -- cap, refuses a service with no policy row at all ("the caps must exist before a Shard
+      -- moves"), and refuses an approval that is not an approved engagement.transfer.
+      --
+      -- 21 §7.4, the pairing: 'posted' and a ledger entry id are one fact
+      -- (engagement_transfers_posted_names_entry), and one approval is one transfer for ever
+      -- (engagement_transfers_one_per_approval) — the same key the ledger idempotency key is
+      -- derived from, so a retry replays rather than moving twice.
+      -- ══════════════════════════════════════════════════════════════════════════════════════
+      create table if not exists engagement_transfers (
+        id              uuid        primary key default gen_random_uuid(),
+        service         text        not null references engagement_policies (service),
+        amount_shards   bigint      not null,
+        approval_id     uuid        not null references approvals (id),
+        -- The ledger's entry id, once posted. text, like audit_events.subject_id: it is a
+        -- REFERENCE to a row another service owns.
+        ledger_entry_id text,
+        state           text        not null default 'posting',
+        created_at      timestamptz not null default now(),
+        posted_at       timestamptz,
+
+        constraint engagement_transfers_amount_positive check (amount_shards > 0),
+        constraint engagement_transfers_one_per_approval unique (approval_id),
+        constraint engagement_transfers_state_known check (state in ('posting','posted')),
+        constraint engagement_transfers_posted_names_entry check (
+          ((state = 'posted') = (ledger_entry_id is not null))
+          and ((state = 'posted') = (posted_at is not null))
+        )
+      );
+
+      create index if not exists engagement_transfers_service_idx
+        on engagement_transfers (service, created_at desc);
+
+      create or replace function engagement_transfer_within_cap() returns trigger
+        language plpgsql
+      as $$
+      declare
+        cap bigint;
+        ok boolean;
+      begin
+        select transfer_cap_shards into cap from engagement_policies where service = new.service;
+        if cap is null then
+          raise exception 'no engagement policy exists for %; the caps must exist before a Shard moves (21 §8)', new.service
+            using errcode = 'check_violation';
+        end if;
+        if new.amount_shards > cap then
+          raise exception 'transfer of % Shards to engagement:% exceeds the policy cap of % (21 §7.3)',
+            new.amount_shards, new.service, cap
+            using errcode = 'check_violation';
+        end if;
+        select (state = 'approved' and action = 'engagement.transfer')
+          into ok
+          from approvals where id = new.approval_id;
+        if ok is distinct from true then
+          raise exception 'approval % is not an approved engagement.transfer approval', new.approval_id
+            using errcode = 'check_violation';
+        end if;
+        return new;
+      end;
+      $$;
+
+      drop trigger if exists engagement_transfers_within_cap on engagement_transfers;
+      create trigger engagement_transfers_within_cap
+        before insert on engagement_transfers
+        for each row execute function engagement_transfer_within_cap();
+    `,
+  },
 ]
 
 /**
@@ -384,6 +612,9 @@ export const BASELINE_VERSION = 0
 
 /** Every table this service owns, for the test harness's truncate. Order is child-first. */
 export const TABLES: readonly string[] = Object.freeze([
+  'engagement_transfers',
+  'engagement_policies',
+  'engagement_fee_recycle',
   'audit_chain_checkpoints',
   'audit_events',
   'approvals',

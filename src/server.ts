@@ -66,6 +66,27 @@ import {
   type ExecutionContext,
 } from './actions.ts'
 import {
+  EngagementError,
+  ENGAGEMENT_SERVICES,
+  ENGAGEMENT_TREASURY_SUBJECT,
+  engagementSubjectOf,
+  findPolicy,
+  listPolicies,
+  listTransfers,
+  parseCapShards,
+  parseShards,
+  parseWei,
+  RaiseNeedsApprovalError,
+  readFeeRecycle,
+  setFeeRecycle,
+  setPolicy,
+  transferTotals,
+  FEE_RECYCLE_CEILING_BPS,
+  SEED_PER_DAY_CEILING_WEI,
+  SEED_PER_MARKET_CEILING_WEI,
+  TRANSFER_CAP_CEILING_SHARDS,
+} from './engagement.ts'
+import {
   ApprovalError,
   ApprovalNotFoundError,
   ApprovalStateError,
@@ -353,6 +374,13 @@ async function handle(route: Route | undefined, ctx: RequestContext, deps: Serve
       ctx.log.error('token verifier unavailable', { err })
       return errorReply(503, 'verifier_unavailable', 'authentication is temporarily unavailable', ctx.requestId)
     }
+    if (err instanceof RaiseNeedsApprovalError) {
+      // 403 like the self-approval refusal, and for the same reason: the operator's authority,
+      // not the request's shape, is what fell short — the console should say "raise it through
+      // the queue", not "bad request".
+      ctx.log.warn('an engagement raise was attempted without an approval')
+      return errorReply(403, 'raise_needs_approval', err.message, ctx.requestId)
+    }
     if (err instanceof SelfApprovalError) {
       deps.metrics.increment('admin_self_approvals_refused_total')
       // Logged at warn, because it is either a UI that offered a button it should not have or an
@@ -411,6 +439,7 @@ async function handle(route: Route | undefined, ctx: RequestContext, deps: Serve
       err instanceof ApprovalError ||
       err instanceof BroadcastError ||
       err instanceof FlagError ||
+      err instanceof EngagementError ||
       err instanceof RangeError
     ) {
       return errorReply(400, 'bad_request', err.message, ctx.requestId)
@@ -660,6 +689,14 @@ function buildRoutes(): Route[] {
       if (spec.route === null) {
         throw new ActionUnavailableError(action, spec.blockedReason ?? 'no upstream route exists')
       }
+      // ── A READ DOES NOT SPEND SIGNATURES. 21 §6's approval column reads "none (read)" for
+      // engagement.report; the queue refuses it and names the GET, the same shape as the 501
+      // naming the missing route.
+      if (spec.approval === 'read') {
+        throw new BadRequestError(
+          `${action} is a read and needs no approval — call ${spec.route.split(' — ')[0]} instead`,
+        )
+      }
 
       const subjectId = requireString(body, 'subjectId')
       const params = (body['params'] ?? {}) as Record<string, unknown>
@@ -669,6 +706,46 @@ function buildRoutes(): Route[] {
       for (const name of spec.requiredParams) {
         if (typeof params[name] !== 'string' && typeof params[name] !== 'boolean') {
           throw new BadRequestError(`params.${name} is required for ${action}`)
+        }
+      }
+      // ── The engagement actions are validated at REQUEST time as well as at execution: a cap
+      // breach discovered after two operators have signed wastes both signatures, and 21 §8 says
+      // nothing may move before the caps exist — so a transfer naming a service with no policy
+      // row is refused before it ever becomes a pending row someone could approve. The schema
+      // trigger (engagement_transfers_within_cap) remains the enforcement of record.
+      if (action === 'engagement.transfer') {
+        const service = String(params['service'])
+        if (!ENGAGEMENT_SERVICES.includes(service)) {
+          throw new BadRequestError(`params.service must be one of ${ENGAGEMENT_SERVICES.join(', ')}`)
+        }
+        const amount = parseShards(String(params['amountShards']))
+        const policy = await findPolicy(deps.sql, service)
+        if (!policy) {
+          throw new BadRequestError(
+            `no engagement policy exists for ${service} — the caps must exist before a Shard moves (21 §8); ` +
+              'raise one through engagement.policy.set first',
+          )
+        }
+        if (amount > BigInt(policy.transferCapShards)) {
+          throw new BadRequestError(
+            `a transfer of ${amount} Shards exceeds engagement:${service}'s policy cap of ${policy.transferCapShards}`,
+          )
+        }
+      }
+      if (action === 'engagement.policy.set') {
+        const service = String(params['service'])
+        if (service !== 'platform' && !ENGAGEMENT_SERVICES.includes(service)) {
+          throw new BadRequestError(
+            `params.service must be 'platform' (the fee recycle) or one of ${ENGAGEMENT_SERVICES.join(', ')}`,
+          )
+        }
+        // Shape checks only — the ceilings and the raise/lower asymmetry live in engagement.ts
+        // and the schema, and the executor goes through both.
+        if (typeof params['transferCapShards'] === 'string') parseCapShards(params['transferCapShards'])
+        if (typeof params['seedPerMarketWei'] === 'string') parseWei(params['seedPerMarketWei'])
+        if (typeof params['seedPerDayWei'] === 'string') parseWei(params['seedPerDayWei'])
+        if (service === 'platform' && typeof params['recycleBps'] !== 'string') {
+          throw new BadRequestError('params.recycleBps is required to set the fee recycle')
         }
       }
 
@@ -874,6 +951,125 @@ function buildRoutes(): Route[] {
       return { status: 200, body: { broadcast: result.value.broadcast } }
     }),
 
+    /* ---------------------------------------------------------------- the engagement treasury */
+
+    define('GET', '/v1/engagement/policies', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      requireReader(principal)
+      return {
+        status: 200,
+        body: {
+          policies: await listPolicies(deps.sql),
+          feeRecycle: await readFeeRecycle(deps.sql),
+          // The schema ceilings, served so a console can render the bounds an operator is
+          // choosing inside — the same numbers migrations.ts version 8 CHECKs.
+          ceilings: {
+            transferCapShards: TRANSFER_CAP_CEILING_SHARDS.toString(),
+            seedPerMarketWei: SEED_PER_MARKET_CEILING_WEI.toString(),
+            seedPerDayWei: SEED_PER_DAY_CEILING_WEI.toString(),
+            feeRecycleBps: FEE_RECYCLE_CEILING_BPS,
+          },
+        },
+      }
+    }),
+
+    /**
+     * The LOWERING lane — one operator, no queue. The devplatform asymmetry
+     * (devplatform/src/server.ts:981): lowering a cap narrows what can move and is the operator
+     * doing the platform's work for it; raising is the abuse, goes through `engagement.policy.set`
+     * with two operators, and is refused here AND by the `engagement_raise_needs_approval`
+     * trigger for any writer that skips this route. `:service` may be 'platform', which addresses
+     * the fee-recycle percentage.
+     */
+    define('PUT', '/v1/engagement/policies/:service', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      const operator = requireOperator(principal)
+      const body = await readJson(ctx.req)
+      const service = ctx.params['service'] ?? ''
+
+      if (service === 'platform') {
+        const bps = requireString(body, 'recycleBps')
+        if (!/^\d{1,4}$/.test(bps)) throw new BadRequestError('recycleBps must be a decimal string of basis points')
+        const result = await deps.sql.begin(async (tx) => ({
+          value: await setFeeRecycle(
+            tx,
+            { recycleBps: Number(bps), operator, approvalId: null, correlationId: ctx.requestId },
+            deps.now,
+          ),
+        }))
+        deps.metrics.increment('admin_operator_actions_total', {
+          action: 'engagement.policy.lowered',
+          outcome: 'allowed',
+        })
+        return { status: 200, body: { feeRecycle: result.value } }
+      }
+
+      const change = {
+        ...(typeof body['transferCapShards'] === 'string'
+          ? { transferCapShards: parseCapShards(body['transferCapShards']) }
+          : {}),
+        ...(typeof body['seedPerMarketWei'] === 'string'
+          ? { seedPerMarketWei: parseWei(body['seedPerMarketWei']) }
+          : {}),
+        ...(typeof body['seedPerDayWei'] === 'string'
+          ? { seedPerDayWei: parseWei(body['seedPerDayWei']) }
+          : {}),
+        ...(body['seedPerMarketWei'] === null ? { seedPerMarketWei: null } : {}),
+        ...(body['seedPerDayWei'] === null ? { seedPerDayWei: null } : {}),
+      }
+      if (Object.keys(change).length === 0) {
+        throw new BadRequestError(
+          'nothing to change — send transferCapShards, or seedPerMarketWei and seedPerDayWei (null clears the pair)',
+        )
+      }
+      const result = await deps.sql.begin(async (tx) => ({
+        value: await setPolicy(
+          tx,
+          { service, change, operator, approvalId: null, correlationId: ctx.requestId },
+          deps.now,
+        ),
+      }))
+      deps.metrics.increment('admin_operator_actions_total', {
+        action: 'engagement.policy.lowered',
+        outcome: 'allowed',
+      })
+      return { status: 200, body: { policy: result.value } }
+    }),
+
+    /**
+     * 21 §6's third action: balances and spend, read straight off the ledger — the executor-less
+     * shape the queue refuses, served here to anyone `requireReader` admits. The balances come
+     * from the ledger because the ledger is the truth (21 §4: "an auditor reconstructs the entire
+     * programme from the ledger alone"); the transfer rows are this service's record of WHO was
+     * authorised to cause them.
+     */
+    define('GET', '/v1/engagement/report', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      const reader = requireReader(principal)
+      const policies = await listPolicies(deps.sql)
+      const treasury = await deps.ledger.balancesForSubject(ENGAGEMENT_TREASURY_SUBJECT)
+      const services = []
+      for (const policy of policies) {
+        services.push({
+          service: policy.service,
+          subject: engagementSubjectOf(policy.service),
+          balances: await deps.ledger.balancesForSubject(engagementSubjectOf(policy.service)),
+        })
+      }
+      ctx.log.info('engagement report read', { reader, services: services.length })
+      return {
+        status: 200,
+        body: {
+          treasury: { subject: ENGAGEMENT_TREASURY_SUBJECT, balances: treasury },
+          services,
+          spendShardsByService: await transferTotals(deps.sql),
+          transfers: await listTransfers(deps.sql),
+          policies,
+          feeRecycle: await readFeeRecycle(deps.sql),
+        },
+      }
+    }),
+
     /* ---------------------------------------------------------------- the estate view */
 
     define('GET', '/v1/estate', async (ctx, deps) => {
@@ -936,6 +1132,7 @@ async function execute(
     ledger: deps.ledger,
     market: deps.market,
     billing: deps.billing,
+    sql: deps.sql,
   }
 
   let detail: Record<string, unknown>

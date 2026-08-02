@@ -66,6 +66,19 @@
 
 import type { Approval } from './approvals.ts'
 import type { BillingClient, LedgerClient, MarketClient } from './upstreams.ts'
+import {
+  claimTransfer,
+  engagementSubjectOf,
+  ENGAGEMENT_SERVICES,
+  ENGAGEMENT_TREASURY_SUBJECT,
+  markTransferPosted,
+  parseCapShards,
+  parseShards,
+  parseWei,
+  setFeeRecycle,
+  setPolicy,
+  type Db,
+} from './engagement.ts'
 
 export interface ExecutionContext {
   readonly approval: Approval
@@ -77,6 +90,13 @@ export interface ExecutionContext {
   readonly ledger: LedgerClient
   readonly market: MarketClient
   readonly billing: BillingClient
+  /**
+   * This service's own database, for the executors whose upstream IS this service — the
+   * engagement policy write lands in `engagement_policies`, and the engagement transfer's
+   * cap-checked record lands in `engagement_transfers` before the ledger is asked to move
+   * anything. Added with the engagement actions; every earlier executor ignores it.
+   */
+  readonly sql: Db
 }
 
 export type Executor = (ctx: ExecutionContext) => Promise<Record<string, unknown>>
@@ -84,8 +104,17 @@ export type Executor = (ctx: ExecutionContext) => Promise<Record<string, unknown
 export interface ActionSpec {
   /** What kind of thing the action names. Becomes `audit_events.subject_kind`. */
   readonly subjectKind: string
-  /** Which upstream performs it. `null` when nothing can. */
-  readonly upstream: 'ledger' | 'market' | 'billing' | null
+  /** Which upstream performs it. `'admin-api'` when this service's own tables are the upstream;
+   *  `null` when nothing can perform it at all. */
+  readonly upstream: 'ledger' | 'market' | 'billing' | 'admin-api' | null
+  /**
+   * What authorises the action. `'two-operator'` is the queue: request, second operator, execute.
+   * `'read'` is doc 21 §6's third row — an action the catalogue lists so the console renders it,
+   * whose approval column reads "none (read)", and which the queue therefore REFUSES with the GET
+   * route to call instead: a read that consumed two operators' signatures would train operators
+   * to sign reflexively, which is the end of the four-eyes control by other means.
+   */
+  readonly approval: 'two-operator' | 'read'
   /** One line an operator console shows beside the action. */
   readonly summary: string
   /**
@@ -102,6 +131,7 @@ export const ACTIONS: Readonly<Record<string, ActionSpec>> = Object.freeze({
   'ledger.entry.reverse': {
     subjectKind: 'ledger_entry',
     upstream: 'ledger',
+    approval: 'two-operator',
     summary: 'Reverse a ledger entry with a new balanced journal entry. Never an UPDATE (AD-06).',
     route: 'POST /entries/:id/reverse — ledger/src/server.ts:394, scope ledger:post',
     blockedReason: null,
@@ -110,6 +140,7 @@ export const ACTIONS: Readonly<Record<string, ActionSpec>> = Object.freeze({
   'market.moderation.case.resolve': {
     subjectKind: 'moderation_case',
     upstream: 'market',
+    approval: 'two-operator',
     summary: 'Uphold or dismiss a marketplace moderation case.',
     route: 'POST /v1/moderation/cases/:id/resolve — market/src/server.ts:1086, market:admin or role:admin',
     blockedReason: null,
@@ -118,14 +149,55 @@ export const ACTIONS: Readonly<Record<string, ActionSpec>> = Object.freeze({
   'billing.entitlement.revoke': {
     subjectKind: 'entitlement',
     upstream: 'billing',
+    approval: 'two-operator',
     summary: 'Revoke an entitlement, optionally refunding it.',
     route: 'POST /entitlements/:id/revoke — billing/src/server.ts:544, billing:grant or role:admin',
     blockedReason: null,
     requiredParams: ['reason'],
   },
+  // ── The engagement treasury, docs/ecosystem/21 §6. Three actions, one table there, one table
+  //    row here. §8's build order is why these exist before any grant machinery does: nothing may
+  //    move a Shard before the caps exist, and the caps are migrations.ts version 8.
+  'engagement.transfer': {
+    subjectKind: 'engagement_account',
+    upstream: 'ledger',
+    approval: 'two-operator',
+    summary:
+      'Fund a service’s engagement account from platform:engagement-treasury. Refused above the ' +
+      'policy cap BY THE SCHEMA (engagement_transfers_within_cap), executed as one balanced ' +
+      'micro-ledger entry whose accounts are created idempotently on first use.',
+    route: 'POST /entries — ledger/src/server.ts:346, scope ledger:post',
+    blockedReason: null,
+    requiredParams: ['service', 'amountShards'],
+  },
+  'engagement.policy.set': {
+    subjectKind: 'engagement_policy',
+    upstream: 'admin-api',
+    approval: 'two-operator',
+    summary:
+      'RAISE an engagement cap: a per-service transfer ceiling, foresight’s seed sizes, or the ' +
+      'fee-recycle percentage. Raising needs two operators; LOWERING needs one and does not pass ' +
+      'through this queue — PUT /v1/engagement/policies/:service, the devplatform quota asymmetry ' +
+      '(devplatform/src/server.ts:981: the direction is the authority).',
+    route: 'PUT /v1/engagement/policies/:service — admin-api/src/engagement.ts:227 setPolicy, the same write this executor performs with the approval id attached',
+    blockedReason: null,
+    requiredParams: ['service'],
+  },
+  'engagement.report': {
+    subjectKind: 'engagement_account',
+    upstream: 'ledger',
+    approval: 'read',
+    summary:
+      'Balances and spend per service, read straight off the ledger. No approval — 21 §6’s ' +
+      '"none (read)" — so the queue refuses this and the console calls the GET instead.',
+    route: 'GET /v1/engagement/report — this service; balances via GET /accounts/:subject/balances — ledger/src/server.ts:499, scope ledger:read',
+    blockedReason: null,
+    requiredParams: [],
+  },
   'identity.role.grant': {
     subjectKind: 'user',
     upstream: null,
+    approval: 'two-operator',
     summary: 'Grant a platform role. THE MOST AUDIT-WORTHY ACTION IN THE ESTATE — see the header.',
     route: null,
     blockedReason:
@@ -145,16 +217,28 @@ export function isKnownAction(name: string): name is ActionName {
   return Object.prototype.hasOwnProperty.call(ACTIONS, name)
 }
 
-/** Actions that can actually run. The complement is the gap list, and it is one entry long. */
+/** Actions the queue can actually run: a route exists AND two operators are what authorises it. */
 export const EXECUTABLE_ACTIONS: readonly string[] = Object.freeze(
   Object.entries(ACTIONS)
-    .filter(([, spec]) => spec.route !== null)
+    .filter(([, spec]) => spec.route !== null && spec.approval === 'two-operator')
     .map(([name]) => name),
 )
 
 export const BLOCKED_ACTIONS: readonly string[] = Object.freeze(
   Object.entries(ACTIONS)
     .filter(([, spec]) => spec.route === null)
+    .map(([name]) => name),
+)
+
+/**
+ * Actions the catalogue lists for the console that the QUEUE refuses: reads. The refusal at
+ * `POST /v1/approvals` names the GET to call, the same way a blocked action's 501 names the
+ * missing upstream route — a queue that accepted a read would spend two operators' signatures
+ * on something that changes nothing, which devalues every signature it collects.
+ */
+export const READ_ACTIONS: readonly string[] = Object.freeze(
+  Object.entries(ACTIONS)
+    .filter(([, spec]) => spec.approval === 'read')
     .map(([name]) => name),
 )
 
@@ -214,5 +298,142 @@ export const EXECUTORS: Readonly<Record<string, Executor>> = Object.freeze({
       operatorBearer: ctx.operatorBearer,
     })
     return { alreadyRevoked: result.alreadyRevoked, reversalEntryId: result.reversalEntryId ?? null }
+  },
+
+  /**
+   * Treasury → engagement:<service>, in three steps whose order is the safety argument:
+   *
+   *   1. CLAIM the transfer row. The insert runs under `engagement_transfers_within_cap`, so the
+   *      cap binds BEFORE any money is asked to move — 21 §7.3 — and `unique (approval_id)`
+   *      makes one approval one transfer for ever.
+   *   2. POST the ledger entry, idempotent on the approval id: a crash between 1 and 2 retries
+   *      into a replay, never a second entry. The inline account blocks are what create both
+   *      engagement accounts idempotently on first use (ledger ensureAccount, accounts.ts:100).
+   *   3. MARK the row posted with the entry id — from here `posted` and the entry id are one
+   *      fact (`engagement_transfers_posted_names_entry`), which is 21 §7.4's pairing.
+   *
+   * Both accounts are `equity` under purpose `treasury`: the programme is the platform's own
+   * money earmarked, not revenue and not a user liability, and an empty treasury refuses the
+   * debit at the ledger's overdraft trigger rather than going negative — funding must have
+   * arrived through the front door (mined-EMBER conversions, 21 §3) first.
+   */
+  'engagement.transfer': async (ctx) => {
+    const service = requireString(ctx.approval.params, 'service')
+    if (!ENGAGEMENT_SERVICES.includes(service)) {
+      throw new Error(`params.service must be one of ${ENGAGEMENT_SERVICES.join(', ')}`)
+    }
+    const amount = parseShards(requireString(ctx.approval.params, 'amountShards'))
+
+    const claimed = await ctx.sql.begin(async (tx) => ({
+      value: await claimTransfer(tx, { service, amountShards: amount, approvalId: ctx.approval.id }),
+    }))
+    if (claimed.value.state === 'posted') {
+      return {
+        transferId: claimed.value.id,
+        service,
+        amountShards: claimed.value.amountShards,
+        ledgerEntryId: claimed.value.ledgerEntryId,
+        replayed: true,
+      }
+    }
+
+    const entry = await ctx.ledger.postEntry({
+      kind: 'transfer',
+      idempotencyKey: `admin-api:approval:${ctx.approval.id}`,
+      description: `engagement transfer: treasury → engagement:${service} (${ctx.approval.reasonCode})`,
+      correlationId: ctx.correlationId,
+      operator: ctx.operator,
+      approvalId: ctx.approval.id,
+      postings: [
+        {
+          direction: 'debit',
+          amount: amount.toString(),
+          assetCode: 'SHARD',
+          sequence: 0,
+          account: {
+            subject: ENGAGEMENT_TREASURY_SUBJECT,
+            assetCode: 'SHARD',
+            purpose: 'treasury',
+            type: 'equity',
+          },
+        },
+        {
+          direction: 'credit',
+          amount: amount.toString(),
+          assetCode: 'SHARD',
+          sequence: 1,
+          account: {
+            subject: engagementSubjectOf(service),
+            assetCode: 'SHARD',
+            purpose: 'treasury',
+            type: 'equity',
+          },
+        },
+      ],
+    })
+
+    const posted = await ctx.sql.begin(async (tx) => ({
+      value: await markTransferPosted(tx, ctx.approval.id, entry.id),
+    }))
+    return {
+      transferId: posted.value?.id ?? claimed.value.id,
+      service,
+      amountShards: amount.toString(),
+      ledgerEntryId: entry.id,
+      replayed: entry.replayed,
+    }
+  },
+
+  /**
+   * The RAISE path. `setPolicy`/`setFeeRecycle` are the same functions the single-operator
+   * lowering route calls — one write path, with the approval id attached here so the
+   * `engagement_raise_needs_approval` trigger finds a fresh approved approval to satisfy it.
+   * `service: 'platform'` addresses the fee recycle, since the recycle is platform-wide and the
+   * six service names are taken (and pinned by the schema's closed list).
+   */
+  'engagement.policy.set': async (ctx) => {
+    const service = requireString(ctx.approval.params, 'service')
+    const params = ctx.approval.params
+
+    if (service === 'platform') {
+      const bps = requireString(params, 'recycleBps')
+      if (!/^\d{1,4}$/.test(bps)) throw new Error('params.recycleBps must be a decimal string of basis points')
+      const result = await ctx.sql.begin(async (tx) => ({
+        value: await setFeeRecycle(tx, {
+          recycleBps: Number(bps),
+          operator: ctx.operator,
+          approvalId: ctx.approval.id,
+          correlationId: ctx.correlationId,
+        }),
+      }))
+      return { feeRecycle: { ...result.value } }
+    }
+
+    const change = {
+      ...(typeof params['transferCapShards'] === 'string'
+        ? { transferCapShards: parseCapShards(params['transferCapShards']) }
+        : {}),
+      ...(typeof params['seedPerMarketWei'] === 'string'
+        ? { seedPerMarketWei: parseWei(params['seedPerMarketWei']) }
+        : {}),
+      ...(typeof params['seedPerDayWei'] === 'string'
+        ? { seedPerDayWei: parseWei(params['seedPerDayWei']) }
+        : {}),
+    }
+    if (Object.keys(change).length === 0) {
+      throw new Error(
+        'engagement.policy.set needs at least one of transferCapShards, seedPerMarketWei+seedPerDayWei',
+      )
+    }
+    const result = await ctx.sql.begin(async (tx) => ({
+      value: await setPolicy(tx, {
+        service,
+        change,
+        operator: ctx.operator,
+        approvalId: ctx.approval.id,
+        correlationId: ctx.correlationId,
+      }),
+    }))
+    return { policy: { ...result.value } }
   },
 })

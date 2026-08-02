@@ -31,10 +31,13 @@ import { MIGRATIONS, SEQUENCES, TABLES } from './migrations.ts'
 import { registerServiceMetrics } from './server.ts'
 import type { Db } from './outbox.ts'
 import type {
+  AccountBalance,
   BillingClient,
+  EntryPosting,
   LedgerClient,
   MarketClient,
   ModerationCase,
+  PostedEntry,
   ReversedEntry,
   RevokeResult,
   TrialBalance,
@@ -147,10 +150,14 @@ export function fakeVerifier(entries: Record<string, Principal> = {}): FakeVerif
 
 export interface FakeLedger extends LedgerClient {
   readonly reversals: Array<{ entryId: string; idempotencyKey: string; operator: string; approvalId: string }>
+  /** Entries posted through `postEntry`, in order, with the postings the caller built. */
+  readonly entries: Array<{ kind: string; idempotencyKey: string; approvalId: string; postings: readonly EntryPosting[] }>
   /** Replays on a repeated key, exactly as the real ledger does. */
   readonly postedCount: number
   failWith(err: Error | null): void
   setTrialBalance(value: TrialBalance): void
+  /** Stub the balances one subject reports. */
+  setBalances(subject: string, balances: readonly AccountBalance[]): void
   /**
    * Forget everything.
    *
@@ -170,14 +177,18 @@ export interface FakeLedger extends LedgerClient {
  */
 export function fakeLedger(): FakeLedger {
   const reversals: FakeLedger['reversals'] = []
+  const entries: FakeLedger['entries'] = []
   const byKey = new Map<string, ReversedEntry>()
+  const postedByKey = new Map<string, PostedEntry>()
+  const balancesBySubject = new Map<string, readonly AccountBalance[]>()
   let failure: Error | null = null
   let trial: TrialBalance = { balanced: true, totalAbsoluteDelta: '0' }
 
   return {
     reversals,
+    entries,
     get postedCount() {
-      return byKey.size
+      return byKey.size + postedByKey.size
     },
     failWith(err) {
       failure = err
@@ -185,9 +196,15 @@ export function fakeLedger(): FakeLedger {
     setTrialBalance(value) {
       trial = value
     },
+    setBalances(subject, balances) {
+      balancesBySubject.set(subject, balances)
+    },
     reset() {
       reversals.length = 0
+      entries.length = 0
       byKey.clear()
+      postedByKey.clear()
+      balancesBySubject.clear()
       failure = null
       trial = { balanced: true, totalAbsoluteDelta: '0' }
     },
@@ -209,9 +226,30 @@ export function fakeLedger(): FakeLedger {
       byKey.set(request.idempotencyKey, entry)
       return entry
     },
+    async postEntry(request) {
+      entries.push({
+        kind: request.kind,
+        idempotencyKey: request.idempotencyKey,
+        approvalId: request.approvalId,
+        postings: request.postings,
+      })
+      if (failure) throw failure
+      // Replays on a repeated key, exactly as the real ledger does — the engagement transfer
+      // executor derives its key from the approval id so a retry moves nothing twice, and a fake
+      // that posted twice would let that bug pass here and fail against the real thing.
+      const replay = postedByKey.get(request.idempotencyKey)
+      if (replay) return { ...replay, replayed: true }
+      const entry: PostedEntry = { id: `posted-${postedByKey.size + 1}`, replayed: false }
+      postedByKey.set(request.idempotencyKey, entry)
+      return entry
+    },
     async trialBalance() {
       if (failure) throw failure
       return trial
+    },
+    async balancesForSubject(subject) {
+      if (failure) throw failure
+      return balancesBySubject.get(subject) ?? []
     },
   }
 }
