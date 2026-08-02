@@ -36,9 +36,58 @@
  * approval queue cannot authorise the first grant, because approving requires an operator who
  * already holds the role. Bootstrap therefore stays outside every service: one
  * `update users set roles = array['admin']` under the database owner's credentials, which is what
- * `scripts/slice-verify.sh` already does and asserts. That is the correct home for a step that
+ * `deploy/scripts/estate-bootstrap.sh:102` already does. That is the correct home for a step that
  * should require physical access to the database and should appear in a runbook rather than an
  * API.
+ *
+ * **BUT THE STATEMENT IS THE WRONG SHAPE, AND THAT IS A SEPARATE DEFECT.** Where it runs is right;
+ * what it is is not. It is **repeatable** — nothing makes the second run differ from the first, so
+ * it is not a bootstrap but a permanent superuser lever available for ever to anyone who reaches
+ * the database. It is **unaudited** — `identity/src/migrations.ts:119` is `roles text[] not null
+ * default '{}'` and nothing else, so the most consequential write in the estate is the only one
+ * with no trail. And it is **unproven** — nothing goes red if identity, or this service, grows a
+ * route that does the same thing.
+ *
+ * The fix is one-shot enforcement in the SCHEMA, where a bug, a migration or an operator holding a
+ * connection cannot route around it — the discipline `engagement_policies_raise_needs_approval`
+ * below and `ledger`'s deferred balance constraint already follow. Two halves, both in identity,
+ * because `users.roles` is identity's column:
+ *
+ *     create table platform_role_grants (
+ *       id uuid primary key default gen_random_uuid(),
+ *       user_id uuid not null references users (id),
+ *       role text not null,
+ *       source text not null,            -- 'bootstrap' | 'approval'
+ *       approval_id uuid,                -- THIS service's approval id, for source='approval'
+ *       actor text not null,
+ *       reason text not null,
+ *       granted_at timestamptz not null default now(),
+ *       constraint platform_role_grants_source_known check (source in ('bootstrap','approval')),
+ *       constraint platform_role_grants_approval_pairing
+ *         check ((source = 'approval') = (approval_id is not null))
+ *     );
+ *
+ *     -- ONE bootstrap grant per database, for ever. The second insert fails at the index, in any
+ *     -- transaction, from any client, including psql. This is the whole security property.
+ *     create unique index platform_role_grants_one_bootstrap
+ *       on platform_role_grants (source) where source = 'bootstrap';
+ *
+ *     -- ...and a role cannot be gained without a grant row that authorises it. DEFERRED, so the
+ *     -- grant and the role may be written in either order inside one transaction; a bare
+ *     -- `update users set roles = array['admin']` from psql therefore fails at COMMIT.
+ *     create constraint trigger users_roles_need_a_grant
+ *       after insert or update of roles on users
+ *       deferrable initially deferred for each row
+ *       execute function users_roles_need_a_grant();
+ *
+ * The property that buys: **an environment gets exactly one bootstrapped administrator, and every
+ * administrator after the first carries an approval id** — which is to say, two operators'
+ * signatures out of this service's queue. Four eyes still needs two operators, so capping admins
+ * at one would be wrong; capping *unapproved* admins at one is the invariant that was wanted.
+ *
+ * `bootstrap.test.ts` proves the half of this that lives here: that this service is not, and
+ * cannot silently become, the escalation route. The identity half and the runbook half are
+ * reported to the repositories that own them.
  *
  * **So `POST /v1/approvals` with `action: 'identity.role.grant'` answers 501**, naming the route
  * identity must grow, rather than accepting a request the queue can never execute. A queue that
@@ -48,11 +97,20 @@
  *
  * The route identity needs, specified so that the day it lands this file changes in one place:
  *
- *     PUT /internal/users/:id/roles      body: { roles: string[], actor: string, reason: string }
+ *     PUT /internal/users/:id/roles      body: { roles: string[], actor: string, reason: string,
+ *                                                approvalId: string }
  *     guard: a SERVICE token holding `identity:admin` — not `authenticateAdmin`, which refuses a
  *            service token outright (`identity/src/server.ts:540`) and would therefore make
  *            the route unreachable from here for the same reason the bootstrap is unreachable now
+ *     write: a `platform_role_grants` row with `source = 'approval'` and that `approvalId`, in the
+ *            SAME transaction as the `users.roles` update — the deferred trigger above refuses the
+ *            update otherwise, so the audit trail cannot be skipped by a handler that forgets it
  *     audit: an `identity.role.changed` row in the same transaction, per SD-15's Identity row
+ *
+ * `identity:admin` is **not in `contracts-auth`'s registry** — the whole `identity:*` prefix is
+ * absent from `SCOPE_NAMES`. That is correct today: a scope no gate demands is a credential that
+ * can be granted and audited while opening nothing, which is the defect the registry's two
+ * deprecated entries record. It is registered in the same commit as the gate, not before.
  *
  * With that route in place, `EXECUTORS['identity.role.grant']` becomes ten lines and the 501 test
  * below fails — which is the point of writing the test that way.
@@ -206,7 +264,10 @@ export const ACTIONS: Readonly<Record<string, ActionSpec>> = Object.freeze({
       'POST /organisations/:id/memberships grants an organisation role, which SD-03 states is not ' +
       'a platform role. This service will not write to identity\'s database to work around it — ' +
       'rule 1, one database per service, checked in CI. It needs ' +
-      'PUT /internal/users/:id/roles behind a service token holding identity:admin.',
+      'PUT /internal/users/:id/roles behind a service token holding identity:admin, writing a ' +
+      'platform_role_grants row with source=\'approval\' and this approval id in the same ' +
+      'transaction. Until then the first operator of an environment is bootstrapped by one ' +
+      'schema-enforced grant against identity\'s database; see the header of this file.',
     requiredParams: ['role'],
   },
 })
