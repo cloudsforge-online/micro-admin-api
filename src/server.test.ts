@@ -54,6 +54,8 @@ const THREE = 'operator-three-bearer'
 const PLAYER = 'ordinary-player-bearer'
 const READER = 'reader-service-bearer'
 const MIRROR = 'mirror-service-bearer'
+/** A second mirroring service, so "may not mirror somebody else's rows" has two sides to it. */
+const MIRROR_EMBERKIN = 'mirror-emberkin-bearer'
 const NOSCOPE = 'unscoped-service-bearer'
 
 const sql = enabled ? openDb() : null
@@ -70,6 +72,7 @@ before(async () => {
     [PLAYER]: playerPrincipal(ALICE),
     [READER]: servicePrincipal('lantern', [READ_SCOPE]),
     [MIRROR]: servicePrincipal('ledger', [MIRROR_SCOPE]),
+    [MIRROR_EMBERKIN]: servicePrincipal('emberkin', [MIRROR_SCOPE]),
     [NOSCOPE]: servicePrincipal('site', []),
   })
   harness = await startHarness(sql, verifier, {
@@ -621,25 +624,29 @@ function sign(body: unknown): { raw: string; signature: string } {
   return { raw, signature: `sha256=${createHmac('sha256', SIGNING_SECRET).update(raw).digest('hex')}` }
 }
 
+/**
+ * A REAL domain envelope, not a bespoke audit document.
+ *
+ * The fixture used to be a `ledger.audit.recorded` event carrying an `action`, a `subjectKind` and
+ * an `actor` in its payload — a shape nothing in the estate has ever emitted. That is the defect:
+ * the mirror was a consumer with no producer, so this suite was green against an imaginary
+ * counterparty. This is `ledger.entry.posted` as `contracts-events`' own `makeEvent` builds it,
+ * and `validateEnvelope` accepts it, which is what makes the intake tested against reality.
+ */
 function mirrorEnvelope(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     id: '77777777-7777-4777-8777-777777777777',
-    topic: 'ledger.audit.recorded',
+    topic: 'ledger.entry.posted',
+    // The subject id. `TopicSpec.keyedBy` already says what it holds for every topic.
     key: 'entry-1',
     occurredAt: '2026-08-01T00:00:00.000Z',
     producer: 'ledger',
-    version: 1,
-    actor: 'service:settlement',
+    version: '1.0',
+    // The actor is the ENVELOPE's, required by `validateEnvelope`. It was a payload field before,
+    // which is how an unsigned producer could have named any operator it liked.
+    actor: OPERATOR_ONE,
     correlationId: 'req-mirror',
-    payload: {
-      actor: OPERATOR_ONE,
-      action: 'ledger.entry.reversed',
-      subjectKind: 'ledger_entry',
-      subjectId: 'entry-1',
-      outcome: 'allowed',
-      reasonCode: 'incident_remediation',
-      detail: { amount: '1000' },
-    },
+    payload: { amount: '1000' },
     ...overrides,
   }
 }
@@ -699,7 +706,9 @@ test('a signed, scoped mirror row is recorded and chained', { skip }, async () =
   `
   assert.equal(rows.length, 1)
   assert.equal(rows[0]?.actor, OPERATOR_ONE)
-  assert.equal(rows[0]?.action, 'ledger.entry.reversed')
+  // The action IS the topic name. `<service>.<aggregate>.<past-tense-verb>` was already both the
+  // topic naming rule and this service's documented `action` format; nothing invents a string.
+  assert.equal(rows[0]?.action, 'ledger.entry.posted')
   // ── THE SOURCE IS THE AUTHENTICATED SENDER, NOT A PAYLOAD FIELD. A service that holds the
   // mirror scope may mirror its own rows; it may not mirror somebody else's.
   assert.equal(rows[0]?.source, 'ledger')
@@ -724,7 +733,9 @@ test('a redelivered mirror row lands ONCE', { skip }, async () => {
 })
 
 test('a mirror row with no principal actor is 400', { skip }, async () => {
-  const envelope = mirrorEnvelope({ payload: { action: 'x', actor: ALICE, outcome: 'allowed' } })
+  // The actor is now an ENVELOPE field, and `validateEnvelope` refuses one that is not
+  // `system` or `<kind>:<id>`. Before, it was a payload field a producer supplied freely.
+  const envelope = mirrorEnvelope({ actor: 'nobody' })
   const signed = sign(envelope)
   const res = await h().request('POST', '/v1/events', {
     token: MIRROR,
@@ -732,13 +743,42 @@ test('a mirror row with no principal actor is 400', { skip }, async () => {
     body: signed.raw,
   })
   assert.equal(res.status, 400)
-  assert.match(res.body.error.message, /principal actor/)
+  assert.match(res.body.error.message, /actor/)
+  assert.equal((await sql!`select seq from audit_events`).length, 0)
 })
 
-test('an unhandled topic is accepted and ignored rather than refused', { skip }, async () => {
+test('a mirror row with no correlation id is 400 — an investigation stops there', { skip }, async () => {
+  const signed = sign(mirrorEnvelope({ correlationId: '' }))
+  const res = await h().request('POST', '/v1/events', {
+    token: MIRROR,
+    headers: { [SIGNATURE_HEADER]: signed.signature, 'content-type': 'application/json' },
+    body: signed.raw,
+  })
+  assert.equal(res.status, 400)
+  assert.match(res.body.error.message, /correlationId/)
+})
+
+test('A SERVICE MAY NOT MIRROR ANOTHER SERVICE ROWS', { skip }, async () => {
+  // emberkin holds the mirror scope and a valid signature, and posts a ledger topic. Both halves
+  // check out on their own: the envelope is well formed and ledger really does own the topic. It
+  // is the disagreement between the SIGNED producer and the AUTHENTICATED sender that catches it,
+  // which is why the source column is taken from the token and never from the body.
+  const signed = sign(mirrorEnvelope())
+  const res = await h().request('POST', '/v1/events', {
+    token: MIRROR_EMBERKIN,
+    headers: { [SIGNATURE_HEADER]: signed.signature, 'content-type': 'application/json' },
+    body: signed.raw,
+  })
+  assert.equal(res.status, 403)
+  assert.equal((await sql!`select seq from audit_events`).length, 0)
+})
+
+test('an UNREGISTERED topic is accepted and ignored rather than refused', { skip }, async () => {
   // A producer subscribing this service to a topic it does not consume is a configuration mistake;
-  // answering 4xx would make its relay retry for ever over something harmless.
-  const signed = sign(mirrorEnvelope({ topic: 'ledger.entry.posted' }))
+  // answering 4xx would make its relay retry for ever over something harmless. And the honest
+  // reading of a topic this build does not know is that THIS service is behind, not that the
+  // producer is wrong — contracts-events is additive-only.
+  const signed = sign(mirrorEnvelope({ topic: 'ledger.widget.frobnicated' }))
   const res = await h().request('POST', '/v1/events', {
     token: MIRROR,
     headers: { [SIGNATURE_HEADER]: signed.signature, 'content-type': 'application/json' },
@@ -746,6 +786,47 @@ test('an unhandled topic is accepted and ignored rather than refused', { skip },
   })
   assert.equal(res.status, 202)
   assert.equal((await sql!`select seq from audit_events`).length, 0)
+})
+
+test('a REGISTERED topic the audit log does not carry is also ignored', { skip }, async () => {
+  // A battle resolving is a real, registered, correctly-signed event that the operator log
+  // deliberately excludes — `TOPIC_AUDIT` records why for every one of the fifteen. The two
+  // ignore paths are distinct and both must be 202: one is "this service is behind", the other is
+  // "this was decided", and a future reader must be able to tell them apart from the metric label.
+  const signed = sign(
+    mirrorEnvelope({ topic: 'emberkin.battle.resolved', producer: 'emberkin', key: 'battle-1' }),
+  )
+  const res = await h().request('POST', '/v1/events', {
+    token: MIRROR_EMBERKIN,
+    headers: { [SIGNATURE_HEADER]: signed.signature, 'content-type': 'application/json' },
+    body: signed.raw,
+  })
+  assert.equal(res.status, 202)
+  assert.equal((await sql!`select seq from audit_events`).length, 0)
+})
+
+test('A MONEY EVENT IS FINDABLE BY THE CORRELATION ID THE USER QUOTED', { skip }, async () => {
+  // 17 §7 claim 9, end to end and through HTTP: ledger posts an entry, the mirror records it, and
+  // an operator finds it by the id the user pasted. This could not pass at all before — the topic
+  // the intake keyed on had no producer anywhere in the estate.
+  const signed = sign(mirrorEnvelope({ correlationId: 'req-user-quoted' }))
+  assert.equal(
+    (
+      await h().request('POST', '/v1/events', {
+        token: MIRROR,
+        headers: { [SIGNATURE_HEADER]: signed.signature, 'content-type': 'application/json' },
+        body: signed.raw,
+      })
+    ).status,
+    201,
+  )
+  const page = await h().request('GET', '/v1/audit?correlationId=req-user-quoted', { token: READER })
+  assert.equal(page.status, 200)
+  assert.equal(page.body.events.length, 1)
+  assert.equal(page.body.events[0].action, 'ledger.entry.posted')
+  assert.equal(page.body.events[0].subjectKind, 'ledger_entry')
+  assert.equal(page.body.events[0].subjectId, 'entry-1')
+  assert.equal(page.body.events[0].source, 'ledger')
 })
 
 test('a mirror row with a non-uuid id is 400', { skip }, async () => {

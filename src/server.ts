@@ -117,6 +117,9 @@ import {
   withIdempotency,
 } from './idempotency.ts'
 import { withInbox, verifyEventSignature, SIGNATURE_HEADER, type Db } from './outbox.ts'
+// The registry, and the one place that decides which topics the operator audit log carries.
+// Read rather than restated: a decision copied into a consumer is a decision that drifts.
+import { auditRowFor, isRegisteredTopic, validateEnvelope } from '@cloudsforge/contracts-events'
 import { UpstreamError, type BillingClient, type LedgerClient, type MarketClient } from './upstreams.ts'
 
 /** The verifier as this file needs it. An interface, so a test does not need a JWKS. */
@@ -128,8 +131,22 @@ const MAX_BODY_BYTES = 256 * 1024
 const SAFE_REQUEST_ID = /^[A-Za-z0-9._-]{1,128}$/
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
-/** The topic every service mirrors its audit rows on. */
-export const AUDIT_MIRROR_TOPIC_SUFFIX = '.audit.recorded'
+/**
+ * There is no audit topic, and this constant is gone.
+ *
+ * It used to be `'.audit.recorded'`, and the intake keyed on that suffix. Nothing in the estate
+ * ever published such a topic — the string appeared in exactly one non-test place, this
+ * declaration — so **the mirror was a consumer with no producer** and this log held only this
+ * service's own rows. 17 §7 claim 9 ("an operator answers where did this user's money go from
+ * `admin-web` alone, by correlation id") could not pass, and an empty timeline read as an answer.
+ *
+ * The mirror now consumes the domain topics that already exist. `contracts-events`'s
+ * `TOPIC_AUDIT` decides, per topic, whether the operator log carries it and what its key names;
+ * every other column was already a required field of the envelope. The argument for reading the
+ * bus rather than adding a parallel stream — that a second stream written by a second call site
+ * can disagree with the domain event it accompanies, and an audit log that can disagree with the
+ * system it audits is worse than none — is in that package's `audit.ts` header.
+ */
 
 export interface ServerDeps {
   readonly lifecycle: Lifecycle
@@ -557,25 +574,70 @@ function buildRoutes(): Route[] {
         deps.metrics.increment('admin_audit_mirror_rejected_total', { reason: 'malformed' })
         throw new BadRequestError('an event envelope must carry a uuid id')
       }
-      if (!topic.endsWith(AUDIT_MIRROR_TOPIC_SUFFIX)) {
-        // Accepted and ignored rather than refused: a producer subscribing this service to a topic
-        // it does not consume is a configuration mistake, and answering 4xx would make its relay
-        // retry for ever over something harmless.
+
+      // A topic this build's copy of the registry does not know. Accepted and ignored, because the
+      // honest reading is that THIS service is behind its producer — `contracts-events` is
+      // additive-only, so a topic it lacks is one added after this build. Answering 4xx would make
+      // a correctly-behaving relay retry for ever over something harmless.
+      if (!isRegisteredTopic(topic)) {
         deps.metrics.increment('admin_audit_mirror_rejected_total', { reason: 'unhandled_topic' })
         return { status: 202, body: { status: 'ignored', topic } }
       }
 
-      const payload = (envelope['payload'] ?? {}) as Record<string, unknown>
-      const mirrored = readMirror(payload, sender, envelope)
+      // Everything the audit row needs is a field of the envelope, and every one of them is
+      // REQUIRED here — actor, correlationId, occurredAt, the producer owning its own topic
+      // namespace. That is why there is no `*.audit.recorded` stream: see the header of
+      // `contracts/packages/events/src/audit.ts` for the argument, which is that a second stream
+      // written by a second call site can disagree with the domain event it accompanies.
+      const validated = validateEnvelope(envelope)
+      if (!validated.ok) {
+        deps.metrics.increment('admin_audit_mirror_rejected_total', { reason: 'malformed' })
+        throw new BadRequestError(validated.errors.join('; '))
+      }
+      const event = validated.value
+
+      // ── THE SOURCE IS THE AUTHENTICATED SENDER, NOT A PAYLOAD FIELD.
+      // `validateEnvelope` proves the producer owns the topic namespace; the scope-checked
+      // principal proves who is actually on the connection. A service holding the mirror scope may
+      // mirror its own rows; it may not mirror somebody else's, and the two facts disagreeing is
+      // the only way to tell the difference.
+      if (event.producer !== sender) {
+        deps.metrics.increment('admin_audit_mirror_rejected_total', { reason: 'wrong_sender' })
+        ctx.log.warn('a service tried to mirror another service rows', { sender, producer: event.producer })
+        throw new ForbiddenError(`${MIRROR_SCOPE} for ${event.producer}`)
+      }
+
+      const mirrored = auditRowFor(event)
+      if (!mirrored) {
+        // A registered topic the operator audit log deliberately does not carry — a battle
+        // resolving, a vote being cast. `TOPIC_AUDIT` records why for every one of them.
+        deps.metrics.increment('admin_audit_mirror_rejected_total', { reason: 'unaudited_topic' })
+        return { status: 202, body: { status: 'ignored', topic } }
+      }
 
       const outcome = await withInbox(deps.sql, topic, eventId, async (tx) =>
-        appendAudit(tx, { ...mirrored, sourceEventId: eventId }, deps.now),
+        appendAudit(
+          tx,
+          {
+            actor: mirrored.actor,
+            action: mirrored.action,
+            subjectKind: mirrored.subjectKind,
+            subjectId: mirrored.subjectId,
+            outcome: mirrored.outcome,
+            correlationId: mirrored.correlationId,
+            payload: mirrored.payload,
+            source: sender,
+            sourceEventId: mirrored.sourceEventId,
+            occurredAt: new Date(mirrored.occurredAt),
+          },
+          deps.now,
+        ),
       )
       if (outcome.status === 'duplicate') {
         return { status: 200, body: { status: 'duplicate', eventId } }
       }
       deps.metrics.increment('admin_audit_events_total', {
-        source: mirrored.source ?? sender,
+        source: sender,
         outcome: mirrored.outcome,
       })
       return { status: 201, body: { status: 'recorded', seq: outcome.value.seq.toString(), hash: outcome.value.hash } }
@@ -1208,46 +1270,6 @@ function idempotencyKeyOf(ctx: RequestContext): string {
  * payload field there would let any one compromised service write audit rows attributed to every
  * other, which is the same act-as-anyone defect as a `userId` parameter, one layer up.
  */
-function readMirror(
-  payload: Record<string, unknown>,
-  sender: string,
-  envelope: Record<string, unknown>,
-): {
-  actor: string
-  action: string
-  subjectKind: string
-  subjectId: string
-  outcome: 'allowed' | 'refused' | 'failed'
-  reasonCode: string | null
-  correlationId: string | null
-  payload: Record<string, unknown>
-  source: string
-  occurredAt: Date
-} {
-  const actor = typeof payload['actor'] === 'string' ? payload['actor'] : null
-  if (!actor || !/^(user|service):/.test(actor)) {
-    throw new BadRequestError('a mirrored audit row must name a principal actor')
-  }
-  const action = typeof payload['action'] === 'string' ? payload['action'] : ''
-  if (action.length === 0) throw new BadRequestError('a mirrored audit row must name an action')
-  const outcome = payload['outcome']
-  const known = outcome === 'allowed' || outcome === 'refused' || outcome === 'failed'
-  const occurred = typeof envelope['occurredAt'] === 'string' ? new Date(envelope['occurredAt']) : new Date()
-
-  return {
-    actor,
-    action,
-    subjectKind: typeof payload['subjectKind'] === 'string' ? payload['subjectKind'] : 'unknown',
-    subjectId: typeof payload['subjectId'] === 'string' ? payload['subjectId'] : '',
-    outcome: known ? outcome : 'allowed',
-    reasonCode: typeof payload['reasonCode'] === 'string' ? payload['reasonCode'] : null,
-    correlationId: typeof envelope['correlationId'] === 'string' ? envelope['correlationId'] : null,
-    payload: (payload['detail'] ?? {}) as Record<string, unknown>,
-    source: sender,
-    occurredAt: Number.isNaN(occurred.getTime()) ? new Date() : occurred,
-  }
-}
-
 function parseState(value: string): ApprovalState {
   if (value !== 'pending' && value !== 'approved' && value !== 'rejected' && value !== 'expired') {
     throw new BadRequestError('state must be pending, approved, rejected or expired')
