@@ -68,9 +68,9 @@ would fail its own build, and correctly.
 in the estate — an operator who can grant it can grant it to anyone, including to an account they
 control — so it is a two-operator action with a mandatory reason code and a hash-chained audit
 row, exactly like a manual ledger reversal. That machinery is in this repository, is exercised end
-to end by the three actions that *do* have an upstream route, and `identity.role.grant` is a
-first-class entry in the catalogue. What it does not have is an executor, because there is nothing
-to call.
+to end by the actions that *do* have an upstream route, and `identity.role.grant` is a first-class
+entry in the catalogue. **It now has an executor**, because identity has built the route this
+repository specified — see below.
 
 **The bootstrap belongs to neither, deliberately.** A service that can mint its own first `admin`
 is a service whose compromise grants the estate — and this service's own queue cannot authorise
@@ -80,24 +80,39 @@ database owner's credentials, which is what `scripts/slice-verify.sh` already do
 That is the correct home for a step that should require access to the database and should live in
 a runbook rather than in an API.
 
-**So `POST /v1/approvals` with `action: 'identity.role.grant'` answers 501**, naming the route
-identity must grow, rather than accepting a request the queue can never execute. A queue that
+**`POST /v1/approvals` with `action: 'identity.role.grant'` used to answer 501**, naming the route
+identity had to grow rather than accepting a request the queue could never execute. A queue that
 accepts work it cannot do lies to the operator waiting on it, and would leave a row sitting at
 `approved` for ever — which reads in the audit as two operators having authorised something that
 never happened.
 
-**The route identity needs**, specified so the day it lands this changes in one file:
+**The route landed, so the action executes.** `micro-identity` built it in the shape specified:
 
 ```
-PUT /internal/users/:id/roles      body: { roles: string[], actor: string, reason: string }
+PUT /internal/users/:id/roles      body: { roles, actor, reason, approvalId }
 guard: a SERVICE token holding `identity:admin` — NOT `authenticateAdmin`, which refuses a
-       service token outright (identity/src/server.ts:540) and would therefore make the
-       route unreachable from here for the same reason the bootstrap is unreachable now
-audit: an `identity.role.changed` row in the same transaction, per SD-15's Identity row
+       service token outright and would make the route unreachable from here
+write: a platform_role_grants row, source='approval', in the SAME transaction as the
+       users.roles update, behind a deferred trigger that refuses the update without it
 ```
 
-With that in place, `EXECUTORS['identity.role.grant']` is about ten lines and the 501 test fails —
-which is why the test is written the way it is.
+It was **not** the "about ten lines" this file predicted, and the difference matters.
+`setPlatformRoles` **replaces** the role set rather than adding to it, and every registered user
+holds `player` — so a naive `roles: [role]` would have revoked `player` from every operator it
+promoted, a privilege removal disguised as a grant. The executor sends the union instead. Two tests
+break on the two silent failure modes: the revocation, and a missing `approvalId` (which identity's
+CHECK refuses, since it pairs `source='approval'` to it as an equality rather than an implication).
+
+**What has not changed is the thing that matters.** This service is still not the escalation route.
+Executing requires an approval two *distinct* operators signed, which requires an administrator to
+already exist; the first still comes from identity's one-shot deploy-time bootstrap, refused on
+re-run by a partial unique index no client can route around. `bootstrap.test.ts` holds that line
+from this side, and its pin was changed deliberately and in the open rather than deleted.
+
+**Still owed by `micro-deploy`:** this service's token does not yet carry `identity:admin`
+(`deploy/compose/docker-compose.estate.yml:301`). Until it does the executor is correct and will
+`403` at identity in a real deployment. It is therefore proven against a fake upstream, as every
+other executor here is, and **not** yet end-to-end against the running estate.
 
 ---
 

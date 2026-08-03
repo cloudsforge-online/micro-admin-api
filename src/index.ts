@@ -29,7 +29,7 @@ import { SERVICE, env } from './env.ts'
 import { SCHEMA_VERSION } from './migrations.ts'
 import { createServer, registerServiceMetrics } from './server.ts'
 import { registerHandlers, rescheduleRecurring, seedRecurring } from './jobs.ts'
-import { httpBillingClient, httpLedgerClient, httpMarketClient, probeReadiness } from './upstreams.ts'
+import { httpBillingClient, httpIdentityClient, httpLedgerClient, httpMarketClient, probeReadiness } from './upstreams.ts'
 import type { Db } from './outbox.ts'
 
 // 1. Environment. Importing `./env.ts` validated it; a missing or placeholder secret has already
@@ -78,6 +78,9 @@ const clientConfig = { deadlineMs: env.upstreamDeadlineMs, serviceToken }
 const ledger = httpLedgerClient({ baseUrl: env.ledgerUrl, ...clientConfig })
 const market = httpMarketClient({ baseUrl: env.marketUrl, ...clientConfig })
 const billing = httpBillingClient({ baseUrl: env.billingUrl, ...clientConfig })
+// The role-grant upstream. Presents this service's own token, never an operator's — identity's
+// `identity:admin` gate refuses a user principal outright (identity/src/server.ts:626).
+const identity = httpIdentityClient({ baseUrl: env.identityUrl, ...clientConfig })
 
 /** Every upstream the estate view reports on, with its `/readyz` probe. */
 const readiness = [
@@ -158,6 +161,7 @@ const server = createServer({
   ledger,
   market,
   billing,
+  identity,
   readiness,
   // The same secret signs what this service emits and VERIFIES the audit rows every other service
   // mirrors here. See the header of `server.ts`: an unsigned audit intake is a forgery endpoint.

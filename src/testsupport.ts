@@ -33,6 +33,7 @@ import type { Db } from './outbox.ts'
 import type {
   AccountBalance,
   BillingClient,
+  IdentityClient,
   EntryPosting,
   LedgerClient,
   MarketClient,
@@ -296,6 +297,58 @@ export function fakeMarket(): FakeMarket {
   }
 }
 
+/**
+ * The role-grant upstream.
+ *
+ * `grants` records the EXACT body sent, because the two things most easily got wrong on this call
+ * are silent and both are caught by inspecting it: sending `[role]` (which revokes `player`) and
+ * omitting `approvalId` (which identity's CHECK refuses, creating an unattributed administrator
+ * only if that CHECK were ever relaxed). `actions.test.ts` asserts on both.
+ */
+export interface FakeIdentity extends IdentityClient {
+  readonly grants: Array<{
+    userId: string
+    roles: readonly string[]
+    actor: string
+    reason: string
+    approvalId: string
+  }>
+  failWith(err: Error | null): void
+  reset(): void
+}
+
+export function fakeIdentity(): FakeIdentity {
+  const grants: FakeIdentity['grants'] = []
+  let failure: Error | null = null
+  return {
+    grants,
+    failWith(err) {
+      failure = err
+    },
+    reset() {
+      grants.length = 0
+      failure = null
+    },
+    async setRoles(request) {
+      if (failure) throw failure
+      grants.push({
+        userId: request.userId,
+        roles: [...request.roles],
+        actor: request.actor,
+        reason: request.reason,
+        approvalId: request.approvalId,
+      })
+      // Identity diffs against what the user holds; every registered user holds `player`.
+      const previous = ['player']
+      return {
+        roles: [...request.roles],
+        granted: request.roles.filter((r) => !previous.includes(r)),
+        revoked: previous.filter((r) => !request.roles.includes(r)),
+      }
+    },
+  }
+}
+
 export interface FakeBilling extends BillingClient {
   readonly revocations: Array<{ entitlementId: string; reason: string; refund: boolean; bearer: string }>
   failWith(err: Error | null): void
@@ -438,6 +491,7 @@ export interface Harness {
   readonly ledger: FakeLedger
   readonly market: FakeMarket
   readonly billing: FakeBilling
+  readonly identity: FakeIdentity
   readonly verifier: FakeVerifier
   request(
     method: string,
@@ -469,6 +523,7 @@ export async function startHarness(
   const ledger = fakeLedger()
   const market = fakeMarket()
   const billing = fakeBilling()
+  const identity = fakeIdentity()
   const lifecycle = new Lifecycle({ drainDelayMs: 0, drainTimeoutMs: 100 })
   lifecycle.markReady()
 
@@ -482,6 +537,7 @@ export async function startHarness(
     ledger,
     market,
     billing,
+    identity,
     readiness: options.readiness ?? fakeReadiness({ ledger: { ready: true, state: 'ready' } }),
     eventSigningSecret: options.signingSecret ?? 'a-test-signing-secret-of-sufficient-length',
     approvalTtlMinutes: options.approvalTtlMinutes ?? 240,
@@ -498,6 +554,7 @@ export async function startHarness(
     ledger,
     market,
     billing,
+    identity,
     verifier,
     async request(method, path, opts = {}) {
       const headers: Record<string, string> = { ...opts.headers }
@@ -533,6 +590,7 @@ export async function startHarness(
       ledger.reset()
       market.reset()
       billing.reset()
+      identity.reset()
     },
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   }

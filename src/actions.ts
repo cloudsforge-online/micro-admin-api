@@ -28,8 +28,8 @@
  * account they control — so it is a two-operator action with a mandatory reason code and a
  * hash-chained audit row, exactly like a manual ledger reversal. That machinery exists in this
  * repository, is exercised by the actions that DO have an upstream route, and `identity.role.grant`
- * is a first-class entry in the catalogue below. What it does not have is an executor, because
- * there is nothing to call.
+ * is a first-class entry in the catalogue below. **It now has an executor**, because identity has
+ * built the route specified at the bottom of this comment. See §"THE ROUTE LANDED" below.
  *
  * **The BOOTSTRAP belongs to neither, and that is deliberate.** A service that can mint its own
  * first `admin` is a service whose compromise grants the estate — and this service's own
@@ -89,13 +89,37 @@
  * cannot silently become, the escalation route. The identity half and the runbook half are
  * reported to the repositories that own them.
  *
- * **So `POST /v1/approvals` with `action: 'identity.role.grant'` answers 501**, naming the route
- * identity must grow, rather than accepting a request the queue can never execute. A queue that
- * accepts work it cannot do is a queue that lies to the operator who is waiting on it — and it
- * would produce an approval sitting at `approved` for ever, which reads in the audit as two
- * operators having authorised something that never happened.
+ * **`POST /v1/approvals` with `action: 'identity.role.grant'` USED TO ANSWER 501**, naming the
+ * route identity had to grow rather than accepting a request the queue could never execute. A
+ * queue that accepts work it cannot do lies to the operator waiting on it, and would leave an
+ * approval sitting at `approved` for ever — which reads in the audit as two operators having
+ * authorised something that never happened.
  *
- * The route identity needs, specified so that the day it lands this file changes in one place:
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE ROUTE LANDED, SO THE 501 IS GONE AND THE ACTION EXECUTES.**
+ *
+ * `micro-identity` built it in the shape specified below: `PUT /internal/users/:id/roles`
+ * (`identity/src/server.ts:1584`), gated on a SERVICE token holding `identity:admin` (`:626`),
+ * writing a `platform_role_grants` row with `source='approval'` in the same transaction as the
+ * `users.roles` update, behind a deferred constraint trigger that refuses the update without one
+ * and a partial unique index that spends the single `bootstrap` slot for ever.
+ *
+ * **It was not the "ten lines" the last paragraph of this comment predicted.** `setPlatformRoles`
+ * REPLACES the role set rather than adding to it, so `roles: [role]` would have revoked `player`
+ * from every operator it promoted. The executor unions instead; `BASE_PLATFORM_ROLE` and the
+ * executor's own header carry that argument, and two tests break on the two silent failure modes.
+ *
+ * **What did NOT change: this service is still not the escalation route.** Executing requires an
+ * approval two DISTINCT operators signed, which requires an administrator to already exist. The
+ * first still comes from the deploy-time bootstrap. `bootstrap.test.ts` holds that line.
+ *
+ * **STILL OWED BY `micro-deploy`:** admin-api's service token does not carry `identity:admin`
+ * (`deploy/compose/docker-compose.estate.yml:301` grants it `ledger:read`, `market:read`,
+ * `market:admin`, `billing:read`). Until it does, this executor is correct and will 403 at
+ * identity in the estate. Reported there rather than worked around here.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * The route as it was specified, kept because the shape it names is the shape that was built:
  *
  *     PUT /internal/users/:id/roles      body: { roles: string[], actor: string, reason: string,
  *                                                approvalId: string }
@@ -107,13 +131,14 @@
  *            update otherwise, so the audit trail cannot be skipped by a handler that forgets it
  *     audit: an `identity.role.changed` row in the same transaction, per SD-15's Identity row
  *
- * `identity:admin` is **not in `contracts-auth`'s registry** — the whole `identity:*` prefix is
- * absent from `SCOPE_NAMES`. That is correct today: a scope no gate demands is a credential that
- * can be granted and audited while opening nothing, which is the defect the registry's two
- * deprecated entries record. It is registered in the same commit as the gate, not before.
+ * `identity:admin` **is now in `contracts-auth`'s registry** (`contracts` commit 95952c4,
+ * "register identity:admin — the scope micro-identity's role gate demands"), registered in step
+ * with the gate that demands it rather than ahead of it — which is the discipline the registry's
+ * two deprecated entries exist to record.
  *
- * With that route in place, `EXECUTORS['identity.role.grant']` becomes ten lines and the 501 test
- * below fails — which is the point of writing the test that way.
+ * The 501 test below did fail on the day this landed, which is the point of having written it that
+ * way. It was changed to assert the new behaviour, deliberately and in the open, rather than
+ * deleted.
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  *
  * **WHY THE CATALOGUE IS DATA AND NOT A SWITCH.** `server.ts` reads `ACTIONS` to validate a
@@ -123,7 +148,7 @@
  */
 
 import type { Approval } from './approvals.ts'
-import type { BillingClient, LedgerClient, MarketClient } from './upstreams.ts'
+import type { BillingClient, IdentityClient, LedgerClient, MarketClient } from './upstreams.ts'
 import {
   claimTransfer,
   engagementSubjectOf,
@@ -138,6 +163,16 @@ import {
   type Db,
 } from './engagement.ts'
 
+/**
+ * The role every registered user holds, preserved across a grant.
+ *
+ * `identity/src/platformRoles.ts:52` is `PLATFORM_ROLES = ['player', 'admin']`, and
+ * `POST /auth/register` hard-codes `['player']`. Identity's role write REPLACES the set rather
+ * than adding to it, so this is unioned into every grant — see `EXECUTORS['identity.role.grant']`
+ * for the full argument and for why it is a named constant rather than a literal buried in a call.
+ */
+export const BASE_PLATFORM_ROLE = 'player'
+
 export interface ExecutionContext {
   readonly approval: Approval
   /** The approver's own bearer, forwarded where the upstream accepts one. See `upstreams.ts`. */
@@ -148,6 +183,7 @@ export interface ExecutionContext {
   readonly ledger: LedgerClient
   readonly market: MarketClient
   readonly billing: BillingClient
+  readonly identity: IdentityClient
   /**
    * This service's own database, for the executors whose upstream IS this service — the
    * engagement policy write lands in `engagement_policies`, and the engagement transfer's
@@ -164,7 +200,7 @@ export interface ActionSpec {
   readonly subjectKind: string
   /** Which upstream performs it. `'admin-api'` when this service's own tables are the upstream;
    *  `null` when nothing can perform it at all. */
-  readonly upstream: 'ledger' | 'market' | 'billing' | 'admin-api' | null
+  readonly upstream: 'ledger' | 'market' | 'billing' | 'identity' | 'admin-api' | null
   /**
    * What authorises the action. `'two-operator'` is the queue: request, second operator, execute.
    * `'read'` is doc 21 §6's third row — an action the catalogue lists so the console renders it,
@@ -252,22 +288,34 @@ export const ACTIONS: Readonly<Record<string, ActionSpec>> = Object.freeze({
     blockedReason: null,
     requiredParams: [],
   },
+  /**
+   * **THE ROUTE THIS ENTRY SPECIFIED NOW EXISTS, SO THE BLOCK IS LIFTED.**
+   *
+   * `blockedReason` used to describe a route identity did not have. `micro-identity` has since
+   * built exactly it — `PUT /internal/users/:id/roles`, gated on a SERVICE token holding
+   * `identity:admin` (`identity/src/server.ts:1584,626`), writing a `platform_role_grants` row
+   * with `source = 'approval'` in the same transaction as the `users.roles` update, behind a
+   * deferred constraint trigger that refuses the update if that row is missing.
+   *
+   * So this becomes an executable action. **What does NOT change is where the first administrator
+   * comes from.** That is still the deploy-time bootstrap, one-shot, refused on re-run by a
+   * partial unique index on `source='bootstrap'` and an immutability trigger that stops a `DELETE`
+   * re-arming it. This service is not the escalation route and must not become one: executing here
+   * requires an approval that two DISTINCT operators signed, which requires an operator to exist
+   * already. `bootstrap.test.ts` holds that line.
+   *
+   * Every administrator after the first therefore carries an `approvalId`, and identity's CHECK
+   * pairs `source='approval'` to it as an EQUALITY rather than an implication — so an executor
+   * that omitted it would be refused by identity's database rather than quietly creating an
+   * unattributed admin. The executor below passes it, and a test asserts it is passed.
+   */
   'identity.role.grant': {
     subjectKind: 'user',
-    upstream: null,
+    upstream: 'identity',
     approval: 'two-operator',
     summary: 'Grant a platform role. THE MOST AUDIT-WORTHY ACTION IN THE ESTATE — see the header.',
-    route: null,
-    blockedReason:
-      'identity has no route that assigns users.roles. All 36 of its route definitions were ' +
-      'enumerated: POST /auth/register hard-codes [\'player\'] (identity/src/users.ts:104-106) and ' +
-      'POST /organisations/:id/memberships grants an organisation role, which SD-03 states is not ' +
-      'a platform role. This service will not write to identity\'s database to work around it — ' +
-      'rule 1, one database per service, checked in CI. It needs ' +
-      'PUT /internal/users/:id/roles behind a service token holding identity:admin, writing a ' +
-      'platform_role_grants row with source=\'approval\' and this approval id in the same ' +
-      'transaction. Until then the first operator of an environment is bootstrapped by one ' +
-      'schema-enforced grant against identity\'s database; see the header of this file.',
+    route: 'PUT /internal/users/:id/roles — identity/src/server.ts:1584, scope identity:admin (SERVICE token only)',
+    blockedReason: null,
     requiredParams: ['role'],
   },
 })
@@ -496,5 +544,70 @@ export const EXECUTORS: Readonly<Record<string, Executor>> = Object.freeze({
       }),
     }))
     return { policy: { ...result.value } }
+  },
+
+  /**
+   * Grant a platform role. The most consequential call this service makes.
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * **THE ROUTE REPLACES THE ROLE SET; THIS ACTION ADDS ONE ROLE. THE MISMATCH IS HANDLED HERE
+   * AND IT IS THE REASON THIS IS NOT THE "TEN LINES" THIS FILE'S HEADER PREDICTED.**
+   *
+   * `setPlatformRoles` (`identity/src/platformRoles.ts:116`) takes the COMPLETE set the user is to
+   * end up with and computes `granted` and `revoked` by diffing against what they hold. So a naive
+   * `roles: [role]` would REVOKE every other role the user has. That is not hypothetical:
+   * `PLATFORM_ROLES` is `['player', 'admin']` (`:52`) and `POST /auth/register` hard-codes
+   * `['player']`, so **every** user has `player` — and promoting an operator to `admin` by sending
+   * `['admin']` would demote them out of the ordinary user role in the same call. A privilege
+   * REMOVAL disguised as a grant, on the estate's most audit-worthy path.
+   *
+   * The union is therefore built explicitly, and `player` is preserved by name.
+   *
+   * **THE HONEST COST OF DOING IT THIS WAY.** It encodes identity's role vocabulary in this
+   * repository, which is exactly the kind of drift this estate keeps producing. It is done anyway
+   * because the alternative is worse — silently revoking roles — and because identity exposes no
+   * route that reads another user's current roles: `GET /internal/users/:id/role-grants` returns
+   * the grant HISTORY, not the live set, and a history cannot be replayed into a set because the
+   * bootstrap grant and any direct write are not in it.
+   *
+   * **REPORTED TO `micro-identity`, not worked around further:** the write wants to be a delta
+   * (`grant`/`revoke`) or to be accompanied by a read of the current set. Until one of those
+   * exists, this union is the safe reading, and `actions.test.ts` pins the exact body sent so the
+   * day the vocabulary gains a third role, the pin is what a reader is sent to.
+   *
+   * **THE APPROVAL ID IS NOT OPTIONAL AND IS NOT DECORATION.** Identity pairs `source='approval'`
+   * to `approval_id` with a CHECK written as an EQUALITY, so a grant sent without one is refused
+   * by identity's database rather than creating an unattributed administrator. It is passed here,
+   * and `actions.test.ts` asserts it is passed — because the failure mode of forgetting it is an
+   * upstream 400 at execution time, which is the worst moment to discover it.
+   *
+   * **THIS IS STILL NOT THE ESCALATION ROUTE.** Reaching this code requires an approval that two
+   * DISTINCT operators signed (`approvals_no_self_approval`), which requires an administrator to
+   * exist already. The FIRST administrator comes from identity's deploy-time bootstrap, one-shot
+   * and refused on re-run by a partial unique index that no client can route around.
+   * `bootstrap.test.ts` holds that line from this side.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  'identity.role.grant': async (ctx) => {
+    const role = requireString(ctx.approval.params, 'role')
+
+    const change = await ctx.identity.setRoles({
+      userId: ctx.approval.subjectId,
+      // The union, not the bare role. See above — `[role]` alone revokes `player`.
+      roles: [...new Set([BASE_PLATFORM_ROLE, role])],
+      // The APPROVER, not the requester. Identity records this as who authorised the promotion,
+      // and it is the same principal this service's own hash-chained audit row names.
+      actor: ctx.operator,
+      reason: `${ctx.approval.reasonCode}: ${ctx.approval.reason}`,
+      approvalId: ctx.approval.id,
+      correlationId: ctx.correlationId,
+    })
+
+    return {
+      userId: ctx.approval.subjectId,
+      roles: [...change.roles],
+      granted: [...change.granted],
+      revoked: [...change.revoked],
+    }
   },
 })

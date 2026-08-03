@@ -124,7 +124,7 @@ import { withInbox, SIGNATURE_HEADER, type Db } from './outbox.ts'
 // The registry, and the one place that decides which topics the operator audit log carries.
 // Read rather than restated: a decision copied into a consumer is a decision that drifts.
 import { auditRowFor, isRegisteredTopic, validateEnvelope, verifyDelivery } from '@cloudsforge/contracts-events'
-import { UpstreamError, type BillingClient, type LedgerClient, type MarketClient } from './upstreams.ts'
+import { UpstreamError, type BillingClient, type IdentityClient, type LedgerClient, type MarketClient } from './upstreams.ts'
 
 /** The verifier as this file needs it. An interface, so a test does not need a JWKS. */
 export interface PrincipalVerifier {
@@ -162,6 +162,9 @@ export interface ServerDeps {
   readonly ledger: LedgerClient
   readonly market: MarketClient
   readonly billing: BillingClient
+  /** Only `identity.role.grant` uses it, and it is the only call that presents the service token
+   *  because identity's role gate refuses an operator bearer outright. See `upstreams.ts`. */
+  readonly identity: IdentityClient
   readonly readiness: EstateDeps['readiness']
   readonly eventSigningSecret: string
   readonly approvalTtlMinutes: number
@@ -1251,6 +1254,7 @@ async function execute(
     ledger: deps.ledger,
     market: deps.market,
     billing: deps.billing,
+    identity: deps.identity,
     sql: deps.sql,
   }
 

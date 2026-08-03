@@ -144,8 +144,31 @@ test('every executable action cites the route it calls, by path and line', () =>
   }
 })
 
-test('the blocked list is exactly the role grant — the §3.3g answer', () => {
-  assert.deepEqual([...BLOCKED_ACTIONS], ['identity.role.grant'])
+/**
+ * **THE BLOCKED LIST IS NOW EMPTY, AND THAT IS AN INTENTIONAL EXPECTATION CHANGE.**
+ *
+ * This asserted `['identity.role.grant']` — the §3.3g answer — and it was written to fail on the
+ * day identity grew the route this repository's `actions.ts` header specified. That day is today:
+ * `micro-identity` has landed `PUT /internal/users/:id/roles`, gated on a SERVICE token holding
+ * `identity:admin`, writing a `platform_role_grants` row with `source='approval'` in the same
+ * transaction as the `users.roles` update, behind a deferred trigger that refuses the update
+ * without it. So the action has an upstream, an executor and a route citation.
+ *
+ * **This is not a weakening of the §3.3g answer; it is that answer being completed.** §3.3g said
+ * the WRITE belongs to identity and the AUTHORISATION belongs here. Both are now true. What has
+ * NOT changed, and what the assertions below pin, is that this service is not the escalation
+ * route: reaching the executor needs an approval two DISTINCT operators signed, which needs an
+ * administrator to already exist, and the FIRST one still comes from identity's one-shot
+ * deploy-time bootstrap. `bootstrap.test.ts` holds that line.
+ */
+test('NOTHING IS BLOCKED ANY MORE, and the role grant is what changed', () => {
+  assert.deepEqual([...BLOCKED_ACTIONS], [])
+  const spec = ACTIONS['identity.role.grant']!
+  assert.equal(spec.upstream, 'identity')
+  assert.equal(spec.blockedReason, null)
+  assert.ok(spec.route, 'an executable action with no route citation is the defect §3.3i records')
+  // Still two-operator. An action becoming executable must not also become cheaper to authorise.
+  assert.equal(spec.approval, 'two-operator')
 })
 
 test('every action names a subject kind, and none of them is a user costume', () => {

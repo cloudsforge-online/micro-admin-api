@@ -439,3 +439,77 @@ export function httpBillingClient(config: ClientConfig): BillingClient {
     },
   }
 }
+
+/* ------------------------------------------------------------------------ identity */
+
+export interface SetRolesRequest {
+  readonly userId: string
+  /** The COMPLETE role set the user is to end up with, not a delta. See `setRoles` below. */
+  readonly roles: readonly string[]
+  /** The operator who approved, as a principal — `user:<uuid>`. Never a service, never the requester. */
+  readonly actor: string
+  readonly reason: string
+  /** The approval this grant is attributed to. Identity's CHECK refuses a grant without one. */
+  readonly approvalId: string
+  readonly correlationId: string
+}
+
+export interface RoleChange {
+  readonly roles: readonly string[]
+  readonly granted: readonly string[]
+  readonly revoked: readonly string[]
+}
+
+export interface IdentityClient {
+  /** `PUT /internal/users/:id/roles` — identity/src/server.ts:1584, scope `identity:admin`. */
+  setRoles(request: SetRolesRequest): Promise<RoleChange>
+}
+
+/**
+ * The client for the most consequential call this service makes.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THIS IS THE SERVICE TOKEN, NOT THE OPERATOR'S BEARER, AND THAT IS FORCED BY THE GATE.**
+ *
+ * Every other executor here forwards the operator's own token where the upstream accepts one, so
+ * that the upstream's audit names the human. This one cannot: identity gates the route with
+ * `authenticateIdentityAdmin`, which requires a SERVICE token holding `identity:admin`
+ * (`identity/src/server.ts:626`) and refuses an operator token outright. That is deliberate on
+ * identity's side and was specified that way by this repository's own `actions.ts` header — a gate
+ * built on `authenticateAdmin` would refuse a service token and make the route unreachable from
+ * here, which is the exact shape of the defect that left the audit mirror empty all night.
+ *
+ * **So the human is carried in the BODY, and identity records it rather than inferring it.**
+ * `actor` is the approving operator's principal and `approvalId` names the approval. Identity
+ * writes a `platform_role_grants` row with `source = 'approval'` in the same transaction as the
+ * `users.roles` update, and its deferred constraint trigger refuses the update if that row is
+ * missing. So this call cannot promote somebody without leaving the trail, even if a future
+ * version of this client forgets to ask for one — the database refuses, not the caller.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export function httpIdentityClient(config: ClientConfig): IdentityClient {
+  const client = clientFor('identity', config)
+  return {
+    async setRoles(request) {
+      try {
+        // Body fields read from identity/src/server.ts:1589-1598: roles, actor, reason,
+        // approvalId. All four are required there and `approvalId` must be a uuid.
+        return await client.put<RoleChange>(
+          `/internal/users/${encodeURIComponent(request.userId)}/roles`,
+          {
+            roles: [...request.roles],
+            actor: request.actor,
+            reason: request.reason,
+            approvalId: request.approvalId,
+          },
+          {
+            requestId: request.correlationId,
+            headers: authHeader(config, { kind: 'service' }),
+          },
+        )
+      } catch (err) {
+        throw wrap('identity', err)
+      }
+    },
+  }
+}

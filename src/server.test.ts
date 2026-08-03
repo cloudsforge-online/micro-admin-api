@@ -312,13 +312,24 @@ test('THERE IS NO ROUTE THAT TAKES A userId AND ACTS FOR IT', { skip }, async ()
 
 /* ------------------------------------------------------------------ the approval route */
 
-test('a request is raised, and 501 for the action that has no upstream', { skip }, async () => {
+/**
+ * **INTENTIONAL EXPECTATION CHANGE — this asserted a 501 and now asserts acceptance.**
+ *
+ * The 501 was the §3.3g refusal: identity had no route that assigns `users.roles`, so the queue
+ * refused to accept work it could never execute. Identity has since built exactly the route this
+ * repository specified, so refusing would now be the lie — an operator would be told the estate
+ * cannot promote anyone when it can.
+ *
+ * The refusal machinery itself is NOT deleted: `ActionUnavailableError` and the `blockedReason`
+ * pairing still exist and are still pinned by `bootstrap.test.ts` and `routeidempotency.test.ts`,
+ * so the next action that lands without an upstream gets the same treatment.
+ */
+test('a role grant is now ACCEPTED into the queue, and still costs two operators', { skip }, async () => {
   const good = await raise(ONE)
   assert.equal(good.status, 201)
   assert.equal(good.body.approval.state, 'pending')
 
-  // ── THE §3.3g REFUSAL.
-  const blocked = await h().request('POST', '/v1/approvals', {
+  const grant = await h().request('POST', '/v1/approvals', {
     token: ONE,
     headers: { 'idempotency-key': freshKey() },
     body: {
@@ -326,16 +337,52 @@ test('a request is raised, and 501 for the action that has no upstream', { skip 
       subjectId: ALICE,
       params: { role: 'admin' },
       reasonCode: 'security_response',
-      reason: 'bootstrapping the first operator',
+      reason: 'promoting a second operator after the bootstrap',
     },
   })
-  assert.equal(blocked.status, 501)
-  assert.equal(blocked.body.error.code, 'action_has_no_upstream')
-  assert.match(blocked.body.error.message, /identity has no route that assigns users\.roles/)
-  assert.match(blocked.body.error.message, /PUT \/internal\/users\/:id\/roles/)
-  // And nothing was written. A queue that accepted work it cannot do would leave an approved row
-  // reading as two operators having authorised something that never happened.
-  assert.equal((await sql!`select id from approvals`).length, 1)
+  assert.equal(grant.status, 201)
+  // PENDING, not approved. Raising is not authorising, and the requester's own signature is not
+  // one of the two — `approvals_no_self_approval` is what makes four eyes mean four eyes.
+  assert.equal(grant.body.approval.state, 'pending')
+  assert.equal((await sql!`select id from approvals`).length, 2)
+})
+
+test('THE ROLE GRANT REACHES IDENTITY WITH THE APPROVAL ID AND WITHOUT REVOKING `player`', { skip }, async () => {
+  // The two silent failure modes of this executor, both asserted on the exact body sent:
+  //
+  //   1. `roles: ['admin']` would REVOKE `player`, because identity's route replaces the set
+  //      rather than adding to it (identity/src/platformRoles.ts:116-132) and every registered
+  //      user holds `player`. A privilege removal disguised as a grant.
+  //   2. A missing `approvalId` would be refused by identity's CHECK — but only there, and only
+  //      at execution time, which is the worst moment to find out.
+  const raised = await h().request('POST', '/v1/approvals', {
+    token: ONE,
+    headers: { 'idempotency-key': freshKey() },
+    body: {
+      action: 'identity.role.grant',
+      subjectId: ALICE,
+      params: { role: 'admin' },
+      reasonCode: 'security_response',
+      reason: 'promoting a second operator',
+    },
+  })
+  assert.equal(raised.status, 201)
+  const id = raised.body.approval.id
+
+  // A DIFFERENT operator approves, and the decision executes. Two eyes are not four.
+  const granted = await answer(TWO, id)
+  assert.equal(granted.status, 201, JSON.stringify(granted.body))
+  assert.equal(granted.body.approval.executionOutcome, 'succeeded')
+
+  assert.equal(h().identity.grants.length, 1)
+  const sent = h().identity.grants[0]!
+  assert.equal(sent.userId, ALICE)
+  assert.deepEqual([...sent.roles].sort(), ['admin', 'player'], '`player` must survive the promotion')
+  assert.equal(sent.approvalId, id, 'identity pairs source=approval to this id with a CHECK')
+  // The APPROVER is the recorded actor, not the requester — they are different questions and the
+  // grant trail answers "who signed for this".
+  assert.equal(sent.actor, OPERATOR_TWO)
+  assert.match(sent.reason, /security_response/)
 })
 
 test('an unknown action is 400, not 501', { skip }, async () => {
@@ -501,13 +548,16 @@ test('the queue and one request read back', { skip }, async () => {
   assert.equal(missing.status, 404)
 })
 
-test('the action catalogue is served, blocked entry and all', { skip }, async () => {
+test('the action catalogue is served, and the role grant is no longer blocked', { skip }, async () => {
+  // Intentional expectation change: this asserted `route === null` and a `blockedReason` naming a
+  // route identity did not have. Identity now has it, so the console must render the action as
+  // available rather than greying it out with a stale explanation.
   const res = await h().request('GET', '/v1/actions', { token: ONE })
   assert.equal(res.status, 200)
-  const blocked = res.body.actions.find((a: { name: string }) => a.name === 'identity.role.grant')
-  // A console renders the 501 before the operator hits it, using the same string the 501 carries.
-  assert.equal(blocked.route, null)
-  assert.match(blocked.blockedReason, /identity has no route/)
+  const grant = res.body.actions.find((a: { name: string }) => a.name === 'identity.role.grant')
+  assert.ok(grant, 'the role grant left the catalogue entirely')
+  assert.equal(grant.blockedReason, null)
+  assert.match(grant.route, /PUT \/internal\/users\/:id\/roles/)
   assert.ok(res.body.reasonCodes.includes('incident_remediation'))
 })
 
