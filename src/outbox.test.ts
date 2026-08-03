@@ -11,11 +11,12 @@
 
 import { test, before, beforeEach, after } from 'node:test'
 import assert from 'node:assert/strict'
+import { DELIVERY_TOLERANCE_MS, EVENT_ID_HEADER, signDelivery, verifyDelivery } from '@cloudsforge/contracts-events'
 import {
+  EVENT_ID_HEADER as EXPORTED_EVENT_ID_HEADER,
+  SIGNATURE_HEADER as EXPORTED_SIGNATURE_HEADER,
   createRelay,
   emitOn,
-  signEvent,
-  verifyEventSignature,
   withInbox,
   type Db,
 } from './outbox.ts'
@@ -54,26 +55,65 @@ after(async () => {
 
 /* ------------------------------------------------------------------ signing */
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// THIS SERVICE SPEAKS THE ESTATE'S SIGNING SCHEME, NOT ONE OF ITS OWN.
+//
+// It used to hand-roll `x-cloudsforge-signature: sha256=<hmac(body)>`. Every producer and every
+// inbox in the estate speaks `cf-signature: t=<s>,v1=<hmac("<s>.<body>")>`. The two agree on
+// neither the header name nor the value format, so this service's mirror refused every real
+// delivery and this service's own events were refused by every real subscriber.
+//
+// These first two cases are the ones that fail against the previous build: they assert the wire
+// CONSTANTS, which is the half a signing test normally forgets — the old scheme's MAC comparison
+// was perfectly correct and still could not talk to anybody.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+test('THE SIGNATURE HEADER IS THE ESTATE CONSTANT, not a local spelling', () => {
+  assert.equal(EXPORTED_SIGNATURE_HEADER, 'cf-signature')
+  assert.notEqual(EXPORTED_SIGNATURE_HEADER, 'x-cloudsforge-signature')
+})
+
+test('THE EVENT ID HEADER IS THE ESTATE CONSTANT, not the hard-coded `x-event-id`', () => {
+  assert.equal(EXPORTED_EVENT_ID_HEADER, 'cf-event-id')
+})
+
 test('a signature verifies over the exact bytes and nothing else', () => {
   const body = JSON.stringify({ topic: 'admin.flag.changed', key: 'a' })
-  const signature = signEvent(body, SECRET)
-  assert.equal(verifyEventSignature(body, SECRET, signature), true)
-  assert.equal(verifyEventSignature(`${body} `, SECRET, signature), false)
-  assert.equal(verifyEventSignature(body, 'another-secret-of-sufficient-length', signature), false)
+  const signature = signDelivery(body, SECRET)
+  assert.equal(verifyDelivery(body, signature, SECRET).ok, true)
+  // One trailing space. A verifier working from a re-serialisation would not notice.
+  assert.equal(verifyDelivery(`${body} `, signature, SECRET).ok, false)
+  assert.equal(verifyDelivery(body, signature, 'another-secret-of-sufficient-length').ok, false)
 })
 
-test('a signature of the wrong LENGTH is refused without a comparison', () => {
-  // `timingSafeEqual` throws on mismatched lengths, so the length is checked first — and a
-  // byte-at-a-time comparison of a MAC is a byte-at-a-time forgery oracle.
-  const body = '{}'
-  assert.equal(verifyEventSignature(body, SECRET, 'sha256=short'), false)
-  assert.equal(verifyEventSignature(body, SECRET, ''), false)
-})
-
-test('a Buffer and a string sign identically', () => {
+test('THE SCHEME HAS A REPLAY WINDOW, which the hand-rolled one did not', () => {
+  // The property actually gained by the change, and the reason it is not merely a rename. The old
+  // `sha256=<hmac(body)>` carried no timestamp, so a captured POST to the audit intake stayed
+  // valid for ever — on the one record a dispute is settled against.
   const body = '{"a":1}'
-  const signature = signEvent(body, SECRET)
-  assert.equal(verifyEventSignature(Buffer.from(body, 'utf8'), SECRET, signature), true)
+  const signedAt = 1_800_000_000_000
+  const signature = signDelivery(body, SECRET, signedAt)
+  assert.equal(verifyDelivery(body, signature, SECRET, { now: signedAt }).ok, true)
+  const stale = verifyDelivery(body, signature, SECRET, { now: signedAt + DELIVERY_TOLERANCE_MS + 1_000 })
+  assert.equal(stale.ok, false)
+  assert.equal(stale.ok === false && stale.reason, 'stale')
+  // And the timestamp is INSIDE the signed message, so it cannot be moved to refresh the window.
+  const moved = signature.replace(/^t=\d+/, `t=${Math.floor((signedAt + 60_000) / 1000)}`)
+  assert.equal(verifyDelivery(body, moved, SECRET, { now: signedAt + 60_000 }).ok, false)
+})
+
+test('a malformed or empty signature header is refused', () => {
+  assert.equal(verifyDelivery('{}', 'sha256=deadbeef', SECRET).ok, false)
+  assert.equal(verifyDelivery('{}', '', SECRET).ok, false)
+})
+
+test('rotation is a window: a superseded secret still verifies, and says so', () => {
+  const body = '{"a":1}'
+  const old = 'the-previous-secret-of-sufficient-length'
+  const signature = signDelivery(body, old)
+  const verified = verifyDelivery(body, signature, [SECRET, old])
+  assert.equal(verified.ok, true)
+  assert.equal(verified.ok === true && verified.keyIndex, 1, 'a non-zero index is what flags an unfinished rotation')
 })
 
 /* ------------------------------------------------------------------ the outbox */
@@ -143,9 +183,23 @@ test('the relay delivers to every active subscription and signs the body', { ski
   await relay(job, ctx)
 
   assert.equal(seen.length, 1)
-  const signature = seen[0]!.headers['x-cloudsforge-signature']!
-  // Signed over the exact bytes the client will send, so the MAC a subscriber recomputes matches.
-  assert.equal(verifyEventSignature(JSON.stringify(seen[0]!.body), SECRET, signature), true)
+
+  // ── THE HEADERS A REAL SUBSCRIBER READS, asserted by the estate's own constants rather than by
+  // strings copied from this file's implementation. Against the previous build the signature
+  // arrived under `x-cloudsforge-signature` and the id under `x-event-id`, so every inbox in the
+  // estate — all of which read `cf-signature` — saw an unsigned request and answered 401.
+  const signature = seen[0]!.headers[EXPORTED_SIGNATURE_HEADER]
+  assert.ok(signature, `the relay must send ${EXPORTED_SIGNATURE_HEADER}`)
+  // The id header is compared against the row in the database — an independent fact — rather than
+  // against the header itself, which would assert nothing.
+  const [row] = await sql!<{ id: string }[]>`select id from outbox`
+  assert.equal(seen[0]!.headers[EVENT_ID_HEADER], row!.id)
+
+  // ── AND IT IS VERIFIED FROM THE RECEIVING END, with the same function a subscriber calls, over
+  // the body the client actually received. This is what closes the serialisation coupling noted
+  // in `outbox.ts`: if `HttpClient` ever stringifies differently from the relay, this goes red.
+  assert.match(signature, /^t=\d+,v1=[0-9a-f]+$/, 'the estate scheme, not a local one')
+  assert.equal(verifyDelivery(JSON.stringify(seen[0]!.body), signature, SECRET).ok, true)
   assert.equal((await sql!`select id from outbox where published_at is not null`).length, 1)
 })
 

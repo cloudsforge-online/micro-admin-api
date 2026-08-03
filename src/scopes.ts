@@ -40,18 +40,37 @@
  *
  * **AND THE SCOPE NOBODY HAS.** There is no `admin:execute` that a service token can hold. Every
  * action that changes something in another service travels through the approval queue, and an
- * approval names two *human* operators. A service token on this surface can read and it can
- * mirror an audit row; it cannot request, approve or execute. See `server.ts`.
+ * approval names two *human* operators. A service token on this surface can read, and nothing
+ * else: it cannot request, approve or execute. See `server.ts`.
  */
 
 import { ForbiddenError, type Principal } from '@cloudsforge/auth'
 
 /** Read the audit mirror, the approval queue, the flags and the broadcasts. */
 export const READ_SCOPE = 'admin:read'
-/** Mirror an audit row from another service. Held by every service that writes audit rows. */
-export const MIRROR_SCOPE = 'admin:audit:write'
 
-export const ALL_SCOPES: readonly string[] = Object.freeze([READ_SCOPE, MIRROR_SCOPE])
+/**
+ * **`admin:audit:write` IS GONE, AND ITS ABSENCE IS THE POINT.**
+ *
+ * It gated `POST /v1/events`, the audit mirror. No service could ever hold it in a way that
+ * reached that route: an outbox relay is a background job woken by a Postgres poll and sends the
+ * delivery signature and the event id and nothing else — all twenty-one relays in the estate were
+ * read, not assumed. So the scope described a capability that was exercised zero times, while the
+ * estate's audit of record stayed empty. The route is now MAC-only; `server.ts` carries the
+ * argument and names precisely what was given up.
+ *
+ * The constant is DELETED rather than left unreferenced, following `micro-notify`, which deleted
+ * its `notify:ingest` rather than registering it after making the same repair. A scope in a
+ * service's published vocabulary that no route checks is a capability the vocabulary claims and
+ * does not have — and this file exists to make this service's authority auditable.
+ *
+ * Two orphans outside this repository follow and are REPORTED, not edited from here:
+ * `contracts/packages/auth/src/index.ts:157` still registers `admin:audit:write` in the estate
+ * scope vocabulary, and `micro-admin-web`'s README and `src/lib/` still describe the mirror as
+ * demanding it. Neither is harmful — an unused scope grants nothing — and neither is this
+ * repository's to change.
+ */
+export const ALL_SCOPES: readonly string[] = Object.freeze([READ_SCOPE])
 
 /**
  * Exact scope match. The §3.3h choice, in one line.

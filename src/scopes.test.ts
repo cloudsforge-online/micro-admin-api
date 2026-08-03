@@ -13,8 +13,17 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { ForbiddenError, hasScope } from '@cloudsforge/auth'
-import { ALL_SCOPES, MIRROR_SCOPE, READ_SCOPE, hasExactScope, requireExactScope } from './scopes.ts'
+import { ALL_SCOPES, READ_SCOPE, hasExactScope, requireExactScope } from './scopes.ts'
 import { operatorPrincipal, servicePrincipal, ALICE } from './testsupport.ts'
+
+/**
+ * A scope this service does NOT define, used to prove refusal.
+ *
+ * Deliberately a literal rather than a second real scope: the vocabulary is one scope now, and a
+ * refusal test that borrows another live scope stops working the moment the vocabulary changes —
+ * which is exactly what just happened to `admin:audit:write`.
+ */
+const NOT_A_SCOPE = 'admin:audit:write'
 
 test('an exact scope is granted', () => {
   const principal = servicePrincipal('lantern', [READ_SCOPE])
@@ -24,12 +33,12 @@ test('an exact scope is granted', () => {
 
 test('a scope not held is refused, and names what was required', () => {
   const principal = servicePrincipal('lantern', [READ_SCOPE])
-  assert.equal(hasExactScope(principal, MIRROR_SCOPE), false)
+  assert.equal(hasExactScope(principal, NOT_A_SCOPE), false)
   assert.throws(
-    () => requireExactScope(principal, MIRROR_SCOPE),
+    () => requireExactScope(principal, NOT_A_SCOPE),
     (err: unknown) => {
       assert.ok(err instanceof ForbiddenError)
-      assert.equal(err.required, MIRROR_SCOPE)
+      assert.equal(err.required, NOT_A_SCOPE)
       return true
     },
   )
@@ -81,16 +90,20 @@ test('a user principal holds no scopes at all', () => {
   assert.equal(hasScope(operator, READ_SCOPE), false)
 })
 
-test('the vocabulary is exactly two scopes, and neither can act', () => {
+test('THE VOCABULARY IS EXACTLY ONE SCOPE, and it cannot act', () => {
   // There is no `admin:execute`. Every action that changes another service travels through the
   // approval queue, and an approval names two HUMAN operators.
-  assert.deepEqual([...ALL_SCOPES].sort(), ['admin:audit:write', 'admin:read'])
+  //
+  // And there is no `admin:audit:write` any more: it gated the audit mirror, no outbox relay in
+  // the estate can present a bearer at all, so the mirror received nothing while the vocabulary
+  // advertised a capability that was exercised zero times. `server.ts` carries the argument.
+  assert.deepEqual([...ALL_SCOPES].sort(), ['admin:read'])
 })
 
-test('`admin:audit:write` does not imply `admin:read` under the exact reading', () => {
-  // It would under a prefix reading, since one is a prefix of nothing here — but a mirroring
-  // service should be able to WRITE its own audit rows without being able to READ the estate's.
-  const mirror = servicePrincipal('ledger', [MIRROR_SCOPE])
-  assert.equal(hasExactScope(mirror, READ_SCOPE), false)
-  assert.equal(hasExactScope(mirror, MIRROR_SCOPE), true)
+test('A SCOPE THIS SERVICE NO LONGER DEFINES GRANTS NOTHING, even to a service that holds it', () => {
+  // The point of deleting a constant rather than leaving it unreferenced: a token minted with the
+  // retired scope must not quietly keep working. It buys nothing, including on the mirror.
+  const holder = servicePrincipal('ledger', [NOT_A_SCOPE])
+  assert.equal(hasExactScope(holder, READ_SCOPE), false)
+  assert.equal(ALL_SCOPES.includes(NOT_A_SCOPE), false)
 })

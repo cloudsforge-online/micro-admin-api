@@ -27,7 +27,7 @@
  *      suspended.
  */
 
-import { createHmac, timingSafeEqual } from 'node:crypto'
+import { EVENT_ID_HEADER, SIGNATURE_HEADER, signDelivery } from '@cloudsforge/contracts-events'
 import type { Sql, TransactionSql } from 'postgres'
 import { HttpClient } from '@cloudsforge/http'
 import type { Logger } from '@cloudsforge/telemetry'
@@ -79,20 +79,42 @@ export async function emitOn(tx: Tx, producer: string, event: DomainEvent): Prom
 
 /* ------------------------------------------------------------------------ signing */
 
-export const SIGNATURE_HEADER = 'x-cloudsforge-signature'
-
-/** `sha256=<hex>` over the exact bytes sent, so a subscriber verifies before parsing. */
-export function signEvent(body: string, secret: string): string {
-  return `sha256=${createHmac('sha256', secret).update(body).digest('hex')}`
-}
-
-/** Timing-safe, because a byte-at-a-time comparison of a MAC is a byte-at-a-time forgery oracle. */
-export function verifyEventSignature(body: string | Buffer, secret: string, presented: string): boolean {
-  const expected = Buffer.from(signEvent(typeof body === 'string' ? body : body.toString('utf8'), secret))
-  const actual = Buffer.from(presented)
-  if (expected.length !== actual.length) return false
-  return timingSafeEqual(expected, actual)
-}
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE SIGNING SCHEME IS THE ESTATE'S, NOT THIS SERVICE'S OWN.**
+ *
+ * This module used to hand-roll one: header `x-cloudsforge-signature`, value
+ * `sha256=<hmac(body)>`. Every other service in the estate speaks `contracts-events`' scheme —
+ * header `cf-signature`, value `t=<seconds>,v1=<hmac("<seconds>.<body>")>`. The two agree on
+ * neither the header NAME nor the value FORMAT, and that had two consequences, both measured
+ * against the running estate rather than read off a diff:
+ *
+ *   1. **Inbound, the audit mirror was unreachable.** A correctly signed delivery from a real
+ *      producer arrived with `cf-signature`, this service looked for `x-cloudsforge-signature`,
+ *      found nothing, and answered `401 bad_signature` — before the bearer check that was the
+ *      other half of the same defect. So the estate's tamper-evident audit of record received
+ *      nothing at all, which is what `docs/ecosystem/17` §7 claim 9 rests on.
+ *
+ *   2. **Outbound, this service's own events were unreadable.** The relay below signed with the
+ *      hand-rolled scheme, so `micro-notify`, `micro-analytics` and `micro-activity` — all of
+ *      which verify with `verifyDelivery` — would refuse every event this service publishes.
+ *
+ * Adopting the estate scheme is also strictly STRONGER, which is why this is the direction of the
+ * fix rather than teaching the producers to speak the local dialect:
+ *
+ *   - **It has a timestamp, inside the signed message.** The old scheme had none, so a captured
+ *     request stayed valid for ever. On an audit intake — the one record a dispute is settled
+ *     against — an unbounded replay window means a captured "operator X reversed entry Y" can be
+ *     re-posted at will. `DELIVERY_TOLERANCE_MS` closes it to five minutes.
+ *   - **It takes a LIST of secrets**, so a rotation is a window rather than a flag day.
+ *   - **It is one implementation, verified by its owner's tests**, rather than a fourth copy of a
+ *     MAC comparison in a repository that does not own the wire format.
+ *
+ * Nothing about "verify before parsing" changes; that property was already right here and is what
+ * the file header argues for. What changes is that the verification now matches what is sent.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export { SIGNATURE_HEADER, EVENT_ID_HEADER }
 
 /* ------------------------------------------------------------------------ relay */
 
@@ -175,7 +197,17 @@ export function createRelay(deps: RelayDeps): Handler {
         correlationId: event.correlation_id,
         payload: event.payload,
       }
-      const signature = signEvent(JSON.stringify(envelope), deps.signingSecret)
+      // The signed bytes and the sent bytes must be identical or every subscriber 401s.
+      //
+      // Stated honestly rather than assumed: `HttpClient.request` takes an object and calls
+      // `JSON.stringify` on it ITSELF (`runtime/packages/http/src/index.ts:352`), so it cannot be
+      // handed the pre-serialised string — that would double-encode. What makes this safe is that
+      // both sides call the same `JSON.stringify` on the same object, which is deterministic. It
+      // is a coupling, not a proof, so `outbox.test.ts` closes it from the other end: it takes the
+      // body the client actually received and checks `verifyDelivery` accepts it under this
+      // signature. If the client ever serialises differently, that test goes red rather than
+      // twenty-one subscribers going quiet.
+      const signature = signDelivery(JSON.stringify(envelope), deps.signingSecret)
 
       for (const subscription of subscriptions) {
         await deliver(deps, clientFor, subscription, envelope, signature, deadlineMs)
@@ -241,7 +273,9 @@ async function deliver(
       body: envelope,
       deadlineMs,
       idempotencyKey: envelope.id,
-      headers: { [SIGNATURE_HEADER]: signature, 'x-event-id': envelope.id },
+      // `EVENT_ID_HEADER`, not the `x-event-id` this file used to hard-code: the estate's constant
+      // is `cf-event-id`, and a subscriber reading the contract's spelling saw no id at all.
+      headers: { [SIGNATURE_HEADER]: signature, [EVENT_ID_HEADER]: envelope.id },
       ...(envelope.correlationId ? { requestId: envelope.correlationId } : {}),
     })
     await deps.sql`

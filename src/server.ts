@@ -17,18 +17,22 @@
  *   - A user is only ever a SUBJECT (`subjectKind: 'user'`), never a costume. Where an approval
  *     names a user, what is being authorised is an action on a thing that user owns — an
  *     entitlement, a ledger entry — performed by the operator, recorded as the operator.
- *   - A SERVICE token cannot request, approve or execute anything. It can read (`admin:read`) and
- *     it can mirror an audit row (`admin:audit:write`). Approval is consent given by a person, and
- *     a service is not a person; a service token that could approve would make the four-eyes
- *     control satisfiable by two credentials on one machine.
+ *   - A SERVICE token cannot request, approve or execute anything. It can read (`admin:read`), and
+ *     that is now the entire service vocabulary. Approval is consent given by a person, and a
+ *     service is not a person; a service token that could approve would make the four-eyes control
+ *     satisfiable by two credentials on one machine.
  *
- * **`POST /v1/events` IS SIGNATURE-CHECKED BEFORE IT IS PARSED.** It is the intake for the whole
- * estate's audit mirror (17 §2). An unsigned intake there is a forgery endpoint: anyone who can
- * reach the port could write a row into the record a dispute is settled against, naming any
- * operator for any action. The body is verified against `OUTBOX_SIGNING_SECRET` over the exact
- * bytes received, with a timing-safe comparison, BEFORE `JSON.parse` is called on it — and the
- * bearer must additionally hold `admin:audit:write`, because a signature proves the sender knows
- * the estate secret and the scope proves which service it is.
+ * **`POST /v1/events` IS SIGNATURE-CHECKED BEFORE IT IS PARSED, AND READS NO BEARER.** It is the
+ * intake for the whole estate's audit mirror (17 §2). An unsigned intake there is a forgery
+ * endpoint: anyone who can reach the port could write a row into the record a dispute is settled
+ * against, naming any operator for any action. The body is verified with `contracts-events`'
+ * `verifyDelivery` against `OUTBOX_SIGNING_SECRET`, over the exact bytes received, BEFORE
+ * `JSON.parse` is called on it.
+ *
+ * It used to demand `admin:audit:write` as well. No outbox relay in this estate can present a
+ * bearer, and this service was additionally verifying a signature format nobody sends, so the
+ * mirror received nothing at all — the route below carries the full argument, what was given up,
+ * and what would restore it.
  *
  * **EVERY MUTATING ROUTE IS IDEMPOTENT.** `routeidempotency.test.ts` enumerates them from this
  * file's source and fails on one that neither wraps `withIdempotentRoute` nor states why it need
@@ -58,7 +62,7 @@ import {
 } from '@cloudsforge/auth'
 import type { Lifecycle } from '@cloudsforge/lifecycle'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
-import { MIRROR_SCOPE, READ_SCOPE, requireExactScope } from './scopes.ts'
+import { READ_SCOPE, requireExactScope } from './scopes.ts'
 import {
   ACTIONS,
   EXECUTORS,
@@ -116,10 +120,10 @@ import {
   requestFingerprint,
   withIdempotency,
 } from './idempotency.ts'
-import { withInbox, verifyEventSignature, SIGNATURE_HEADER, type Db } from './outbox.ts'
+import { withInbox, SIGNATURE_HEADER, type Db } from './outbox.ts'
 // The registry, and the one place that decides which topics the operator audit log carries.
 // Read rather than restated: a decision copied into a consumer is a decision that drifts.
-import { auditRowFor, isRegisteredTopic, validateEnvelope } from '@cloudsforge/contracts-events'
+import { auditRowFor, isRegisteredTopic, validateEnvelope, verifyDelivery } from '@cloudsforge/contracts-events'
 import { UpstreamError, type BillingClient, type LedgerClient, type MarketClient } from './upstreams.ts'
 
 /** The verifier as this file needs it. An interface, so a test does not need a JWKS. */
@@ -540,25 +544,76 @@ function buildRoutes(): Route[] {
 
     /* ---------------------------------------------------------------- the audit mirror */
 
+    /**
+     * The audit mirror: the intake for the estate's audit of record.
+     *
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * **MAC-ONLY. NO BEARER TOKEN IS READ HERE, AND THAT IS THE REPAIR.**
+     *
+     * This route had TWO independent walls, either of which alone made it undeliverable, and both
+     * were measured against the running estate before being touched:
+     *
+     *   1. **The wrong signature scheme.** It verified `x-cloudsforge-signature: sha256=<hmac>`,
+     *      a format this repository invented. Every producer sends `cf-signature:
+     *      t=<s>,v1=<hmac>`. A correctly signed delivery answered `401 bad_signature`. See
+     *      `outbox.ts`'s signing header for why adopting the estate scheme is strictly stronger
+     *      (it has a replay window; the local one had none).
+     *   2. **A bearer and an `admin:audit:write` scope no producer can present.** An outbox relay
+     *      is a background job woken by a Postgres poll — no session, no user, no way to mint a
+     *      token. All twenty-one relays in the estate were read, not assumed: every one sends the
+     *      signature and the event id and NOTHING else. Presenting the local scheme's signature
+     *      with no `Authorization` answered `401 unauthenticated`.
+     *
+     * So the mirror for all 26 audited topics received nothing, ever — which
+     * `deploy/README.md:183` had already recorded as making 17 §7 claim 9 unpassable. **An empty
+     * operator timeline during an incident looks like an answer**, and that is the worst failure
+     * mode this tool has: an operator asks "where did this user's money go", sees nothing, and
+     * concludes nothing happened.
+     *
+     * **WHAT WAS LOST, STATED PLAINLY RATHER THAN GLOSSED.** `source` used to be the
+     * scope-checked principal's service name, and an envelope whose `producer` disagreed with it
+     * was refused — "a service may mirror its own rows, not somebody else's". That check is gone
+     * with the bearer, and `source` is now `event.producer`. The residual risk is real and worth
+     * naming: any holder of the estate outbox secret can now mirror a row attributed to any
+     * producer. What still stands behind it is that `validateEnvelope` requires the producer to
+     * own the topic namespace, so a forged row must at least be internally consistent, and that
+     * the secret is held only by services — never by a browser and never by an operator.
+     *
+     * **This is not a net weakening**, because the alternative was not "keep the check": the
+     * check was attached to a route that refused 100% of legitimate traffic, so it protected
+     * nothing that existed. A no-rows audit log is not a safer audit log. The honest fix that
+     * restores the distinction is a PER-PRODUCER signing secret rather than one estate-wide
+     * secret, which is a `micro-deploy` and `contracts-events` change and is reported there.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
     define('POST', '/v1/events', async (ctx, deps) => {
       // ── SIGNATURE FIRST, BEFORE THE PARSE. See the file header.
-      const raw = await readRaw(ctx.req)
+      //
+      // Decoded exactly ONCE, and the same string is both verified and parsed. Verifying one
+      // string and parsing another is how an implementation drifts towards acting on something
+      // other than what it authenticated.
+      const raw = (await readRaw(ctx.req)).toString('utf8')
       const presented = headerOf(ctx.req, SIGNATURE_HEADER)
-      if (!presented || !verifyEventSignature(raw, deps.eventSigningSecret, presented)) {
+      const verification = presented
+        ? verifyDelivery(raw, presented, deps.eventSigningSecret, {
+            ...(deps.now ? { now: deps.now().getTime() } : {}),
+          })
+        : ({ ok: false, reason: 'malformed_header' } as const)
+      if (!verification.ok) {
         deps.metrics.increment('admin_audit_mirror_rejected_total', { reason: 'bad_signature' })
-        ctx.log.warn('an inbound event failed its signature check')
+        // The reason is logged, never returned: telling a prober "stale" rather than "mismatch"
+        // tells them which half of a forgery to fix.
+        ctx.log.warn('an inbound event failed its signature check', { reason: verification.reason })
         return errorReply(401, 'bad_signature', 'the event signature did not verify', ctx.requestId)
       }
-
-      // And the scope. A signature proves the sender holds the estate secret; the scope proves
-      // which service it is, which is what lands in `audit_events.source`.
-      const principal = await authenticate(ctx, deps)
-      requireExactScope(principal, MIRROR_SCOPE)
-      const sender = principal.kind === 'service' ? principal.service : 'unknown'
+      if (verification.keyIndex > 0) {
+        // Still accepting a rotated-out secret. Not an error; a countdown.
+        ctx.log.warn('an event was signed with a superseded secret', { keyIndex: verification.keyIndex })
+      }
 
       let envelope: Record<string, unknown>
       try {
-        const parsed: unknown = JSON.parse(raw.toString('utf8'))
+        const parsed: unknown = JSON.parse(raw)
         if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
           throw new BadRequestError('an event envelope must be a JSON object')
         }
@@ -596,16 +651,18 @@ function buildRoutes(): Route[] {
       }
       const event = validated.value
 
-      // ── THE SOURCE IS THE AUTHENTICATED SENDER, NOT A PAYLOAD FIELD.
-      // `validateEnvelope` proves the producer owns the topic namespace; the scope-checked
-      // principal proves who is actually on the connection. A service holding the mirror scope may
-      // mirror its own rows; it may not mirror somebody else's, and the two facts disagreeing is
-      // the only way to tell the difference.
-      if (event.producer !== sender) {
-        deps.metrics.increment('admin_audit_mirror_rejected_total', { reason: 'wrong_sender' })
-        ctx.log.warn('a service tried to mirror another service rows', { sender, producer: event.producer })
-        throw new ForbiddenError(`${MIRROR_SCOPE} for ${event.producer}`)
-      }
+      // ── THE SOURCE IS THE ENVELOPE'S PRODUCER, AND WHY THAT IS NOW THE BEST AVAILABLE FACT.
+      //
+      // It was the scope-checked principal's service name, cross-checked against `event.producer`.
+      // With the bearer gone — see the route header for why it had to go — there is no second,
+      // independent statement of who is on the connection, so the cross-check would compare
+      // `event.producer` with itself. A guard that compares a value to a copy of itself is exactly
+      // the kind of check this estate keeps producing and that cannot fail, so it is DELETED
+      // rather than left standing as reassurance.
+      //
+      // `validateEnvelope` above is what still constrains this: it requires the producer to own
+      // the topic namespace, so `producer: "ledger"` cannot carry an `identity.*` topic.
+      const sender = event.producer
 
       const mirrored = auditRowFor(event)
       if (!mirrored) {

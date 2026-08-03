@@ -23,7 +23,7 @@ against this repository's own source.
 
 | Route | What it is |
 | --- | --- |
-| `POST /v1/events` | The audit mirror intake. Signature-checked **before** it is parsed. |
+| `POST /v1/events` | The audit mirror intake. **HMAC only — no bearer is read.** Verified with `contracts-events`' `verifyDelivery` over the raw bytes, **before** they are parsed. The signature *is* the authentication: no outbox relay in the estate can present a token, and demanding one meant the event bus was refused by the route built to receive it. |
 | `GET /v1/audit` | The estate's audit of record, filtered by actor, action, subject or correlation id. |
 | `GET /v1/audit/verify` | Walk the chain and report every break. 200 either way; `ok` is the signal. |
 | `GET /v1/actions` | The closed action catalogue, including the one that is blocked and why. |
@@ -133,10 +133,20 @@ a sibling that calls `hasScope`. `scopes.test.ts` pins that in both directions, 
 that calls runtime's `hasScope` on the same principal and asserts it *would* have granted it — so
 the difference is a recorded decision rather than a 403 somebody has to reverse-engineer.
 
-**And the scope nobody has.** The vocabulary is two scopes: `admin:read` and `admin:audit:write`.
-There is no `admin:execute`. A service token can read and it can mirror an audit row; it cannot
-request, approve or execute. Approval is consent given by a person, and a service token that could
-approve would make four eyes satisfiable by two credentials sitting on one machine.
+**And the scope nobody has.** The vocabulary is one scope: `admin:read`. There is no
+`admin:execute`. A service token can read and nothing else; it cannot request, approve or execute.
+Approval is consent given by a person, and a service token that could approve would make four eyes
+satisfiable by two credentials sitting on one machine.
+
+**`admin:audit:write` is gone, and that is a repair rather than a relaxation.** It gated the audit
+mirror, and no producer in this estate could present it: an outbox relay is a background job woken
+by a Postgres poll, and every one of the twenty-one relays in the estate sends the delivery
+signature and the event id and nothing else. The mirror also verified a signature format this
+repository had invented and nobody sends. Both were measured against the running estate — a
+correctly signed delivery answered `401 bad_signature`, and the local format with no bearer
+answered `401 unauthenticated` — so the estate's audit of record received nothing at all. The
+scope constant was deleted rather than left unreferenced; a scope in a published vocabulary that no
+route checks is a capability this service claims and does not have.
 
 ---
 
@@ -364,11 +374,26 @@ state.
 1. **`PUT /internal/users/:id/roles` on identity.** Section 1. Until it exists the estate cannot
    issue its first service token without a hand-written `UPDATE`, and this service refuses to
    pretend otherwise.
-2. **No service mirrors its audit rows yet.** `POST /v1/events` is built, signed, scoped and
-   deduped, but nothing publishes `*.audit.recorded`. 17 §2 requires every service to; the mirror
-   is therefore empty in a real deployment until each of them emits. The topic is not registered in
-   `contracts/packages/events` either — the same finding `micro-devplatform` recorded for
-   `devplatform.*` at `contracts/packages/events/src/index.ts:222`.
+2. **The mirror now receives events, and what remains is a deploy question.** `POST /v1/events`
+   reads the domain topics that already exist rather than a `*.audit.recorded` stream nobody
+   publishes, and it is now reachable by the relays that send them: the route speaks
+   `contracts-events`' signing scheme (`cf-signature`) and authenticates with the MAC alone. The
+   shared `OUTBOX_SIGNING_SECRET` is already configured for this service in
+   `deploy/compose/docker-compose.estate.yml:1175`, with the same value every producer signs with,
+   so no deploy change is needed to make delivery work.
+
+   What `micro-deploy` still owes is the **subscriptions**: a producer only delivers here if a row
+   in its `event_subscriptions` names this service's `/v1/events` for that topic. That is
+   per-producer configuration and is reported to the owners of those repositories rather than
+   changed from here.
+
+   **Residual risk, stated rather than buried.** `source` is now the envelope's `producer` rather
+   than a scope-checked principal, so any holder of the estate outbox secret can mirror a row
+   attributed to any producer. `validateEnvelope` still requires a producer to own its topic
+   namespace, so a forged row must at least be internally consistent, and the secret is held only
+   by services. Restoring the stronger property needs a **per-producer signing secret** rather than
+   one estate-wide secret — a `micro-deploy` and `contracts-events` change, recorded here and in
+   `server.ts` rather than pretended away.
 3. **`@cloudsforge/contracts-admin` is uncut**, so the scope vocabulary and the action catalogue
    live in this service rather than in a published, schema-diff-enforced package.
 4. **No emergency freeze**, because its asymmetry spans ledger and policy. See §6.
