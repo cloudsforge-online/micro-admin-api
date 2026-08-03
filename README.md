@@ -3,7 +3,9 @@
 The operator BFF. **Cross-service operator actions behind a two-operator approval queue, a
 tamper-evident hash-chained audit mirror, feature flags and broadcasts.**
 
-Per [`03-repository-responsibilities.md:50`](../docs/ecosystem/03-repository-responsibilities.md),
+Design authority: [`ecosystem/03-repository-responsibilities.md`](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/03-repository-responsibilities.md)
+
+Per [`03-repository-responsibilities.md:50`](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/03-repository-responsibilities.md),
 this supersedes `platform/services/nimbus`'s admin proxies. Nimbus's audit is
 `log.warn({audit: …})` — a log line, which is sampled, expires, and can be lost under load (SD-11)
 — and its two proxies call bare `fetch` with no total-request timeout, so a hung ForgeKeyvault
@@ -48,7 +50,7 @@ not — the guard `micro-market` gained after two routes were found with none.
 
 **The decision splits three ways, and only the middle part is mine.**
 
-[`18-build-status.md` §3.3g](../docs/ecosystem/18-build-status.md) records — verified against a
+[`18-build-status.md` §3.3g](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/18-build-status.md) records — verified against a
 running deployment rather than reasoned about — that the estate cannot bootstrap itself.
 Re-checked here against source, all three claims hold:
 
@@ -120,7 +122,7 @@ other executor here is, and **not** yet end-to-end against the running estate.
 
 **Exact match only, on this service, deliberately.** `src/scopes.ts`.
 
-[`§3.3h`](../docs/ecosystem/18-build-status.md) records two matchers that disagree:
+[`§3.3h`](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/18-build-status.md) records two matchers that disagree:
 
 | Package | Line | Semantics |
 | --- | --- | --- |
@@ -437,3 +439,10 @@ state.
    This repository's copy states the limit precisely and pins both directions in `outbox.test.ts`
    (`a subscriber added while an event is OUTSTANDING does receive it` and `THE LIMIT: a subscriber
    added after the event PUBLISHED does not receive it`).
+
+---
+
+## Provenance
+
+The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, under
+human direction and review.
