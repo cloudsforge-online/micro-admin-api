@@ -504,7 +504,11 @@ export interface Harness {
 }
 
 export interface HarnessOptions {
-  readonly signingSecret?: string
+  /**
+   * The secrets the inbound event route will ACCEPT, newest first — a list, not a value, so a test
+   * can stage the overlap window a rolling rotation of `OUTBOX_SIGNING_SECRET` depends on.
+   */
+  readonly acceptSecrets?: readonly string[]
   readonly approvalTtlMinutes?: number
   readonly readiness?: EstateDeps['readiness']
   readonly now?: () => Date
@@ -539,7 +543,7 @@ export async function startHarness(
     billing,
     identity,
     readiness: options.readiness ?? fakeReadiness({ ledger: { ready: true, state: 'ready' } }),
-    eventSigningSecret: options.signingSecret ?? 'a-test-signing-secret-of-sufficient-length',
+    eventAcceptSecrets: options.acceptSecrets ?? ['a-test-signing-secret-of-sufficient-length'],
     approvalTtlMinutes: options.approvalTtlMinutes ?? 240,
     ...(options.now ? { now: options.now } : {}),
   })

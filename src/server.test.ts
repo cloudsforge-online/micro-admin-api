@@ -57,6 +57,9 @@ import {
 
 const SIGNING_SECRET = 'a-test-signing-secret-of-sufficient-length'
 
+/** The secret a rotation moves TO. Obviously fake, and long enough to pass the 24-character rule. */
+const ROTATED_SECRET = 'a-test-rotated-secret-of-sufficient-length'
+
 /** Opaque bearers. The token IS the identity here, so a forwarded one is checkable. */
 const ONE = 'operator-one-bearer'
 const TWO = 'operator-two-bearer'
@@ -81,7 +84,7 @@ before(async () => {
     [NOSCOPE]: servicePrincipal('site', []),
   })
   harness = await startHarness(sql, verifier, {
-    signingSecret: SIGNING_SECRET,
+    acceptSecrets: [SIGNING_SECRET],
     readiness: fakeReadiness({
       identity: { ready: true, state: 'ready' },
       ledger: { ready: true, state: 'ready' },
@@ -817,6 +820,60 @@ test('A BEARER BUYS NOTHING HERE: the MAC is the whole authentication', { skip }
   assert.equal(res.status, 401)
   assert.equal(res.body.error.code, 'bad_signature')
   assert.equal((await sql!`select seq from audit_events`).length, 0)
+})
+
+/* ------------------------------------------------ the rotation overlap window, end to end */
+
+/**
+ * **THE PROPERTY A ROLLING ROTATION DEPENDS ON.**
+ *
+ * `OUTBOX_SIGNING_SECRET` is one shared key across the estate. Rotating it means every producer
+ * and every receiver changes on the same day, and during that day some producers are still signing
+ * with the old key. If this route accepted only the new one, their deliveries would 401 — and the
+ * thing that goes quiet is the estate's audit of record, which during an incident is indistinguishable
+ * from "nothing happened".
+ *
+ * So: the NEW secret leads the accept list, the delivery is signed with the SUPERSEDED one, and it
+ * must still be recorded. A dedicated harness because the accept list is fixed at construction.
+ */
+test('A DELIVERY SIGNED WITH THE SUPERSEDED SECRET IS STILL ACCEPTED WHILE THE NEW ONE LEADS', { skip }, async () => {
+  const rotating = await startHarness(sql!, verifier!, {
+    acceptSecrets: [ROTATED_SECRET, SIGNING_SECRET],
+    readiness: fakeReadiness({ ledger: { ready: true, state: 'ready' } }),
+  })
+  try {
+    const raw = JSON.stringify(mirrorEnvelope())
+    const res = await rotating.request('POST', '/v1/events', {
+      // Signed with the OLD key, which is what a producer that has not been redeployed yet sends.
+      headers: { [SIGNATURE_HEADER]: signDelivery(raw, SIGNING_SECRET), 'content-type': 'application/json' },
+      body: raw,
+    })
+    assert.equal(res.status, 201, 'a producer still on the superseded secret must not be partitioned off')
+    assert.equal((await sql!`select seq from audit_events`).length, 1)
+  } finally {
+    await rotating.close()
+  }
+})
+
+test('A SECRET THAT IS NOT ON THE ACCEPT LIST IS STILL REFUSED', { skip }, async () => {
+  // The other direction. Accepting a list must not become accepting anything: once the old secret
+  // is dropped from the list, deliveries signed with it stop — which is what completes a rotation.
+  const rotated = await startHarness(sql!, verifier!, {
+    acceptSecrets: [ROTATED_SECRET],
+    readiness: fakeReadiness({ ledger: { ready: true, state: 'ready' } }),
+  })
+  try {
+    const raw = JSON.stringify(mirrorEnvelope())
+    const res = await rotated.request('POST', '/v1/events', {
+      headers: { [SIGNATURE_HEADER]: signDelivery(raw, SIGNING_SECRET), 'content-type': 'application/json' },
+      body: raw,
+    })
+    assert.equal(res.status, 401)
+    assert.equal(res.body.error.code, 'bad_signature')
+    assert.equal((await sql!`select seq from audit_events`).length, 0)
+  } finally {
+    await rotated.close()
+  }
 })
 
 test('a redelivered mirror row lands ONCE', { skip }, async () => {

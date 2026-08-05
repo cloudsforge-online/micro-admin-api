@@ -166,7 +166,14 @@ export interface ServerDeps {
    *  because identity's role gate refuses an operator bearer outright. See `upstreams.ts`. */
   readonly identity: IdentityClient
   readonly readiness: EstateDeps['readiness']
-  readonly eventSigningSecret: string
+  /**
+   * The secrets `POST /v1/events` will accept, newest first — a list so that rotating the estate's
+   * shared signing secret has an overlap window, rather than requiring every producer to change in
+   * the same instant this service does. `verifyDelivery` takes the candidates natively and reports
+   * which one matched; this service never loops, so the timing-safe comparison stays in the
+   * contract.
+   */
+  readonly eventAcceptSecrets: readonly string[]
   readonly approvalTtlMinutes: number
   readonly now?: () => Date
   readonly beforeScrape?: () => Promise<void>
@@ -598,7 +605,7 @@ function buildRoutes(): Route[] {
       const raw = (await readRaw(ctx.req)).toString('utf8')
       const presented = headerOf(ctx.req, SIGNATURE_HEADER)
       const verification = presented
-        ? verifyDelivery(raw, presented, deps.eventSigningSecret, {
+        ? verifyDelivery(raw, presented, deps.eventAcceptSecrets, {
             ...(deps.now ? { now: deps.now().getTime() } : {}),
           })
         : ({ ok: false, reason: 'malformed_header' } as const)

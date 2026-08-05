@@ -163,9 +163,11 @@ const server = createServer({
   billing,
   identity,
   readiness,
-  // The same secret signs what this service emits and VERIFIES the audit rows every other service
-  // mirrors here. See the header of `server.ts`: an unsigned audit intake is a forgery endpoint.
-  eventSigningSecret: env.outboxSigningSecret,
+  // Signing stays singular (see the relay below); ACCEPTING is a list, so the estate's shared
+  // secret can be rotated with an overlap window instead of a flag day. Unset, the list is exactly
+  // `[OUTBOX_SIGNING_SECRET]`. See the header of `server.ts`: an unsigned audit intake is a forgery
+  // endpoint, and a partitioned one is an audit of record that reads as "nothing happened".
+  eventAcceptSecrets: env.acceptSecrets,
   approvalTtlMinutes: env.approvalTtlMinutes,
   // Queue depth is sampled at scrape time rather than on a timer. There is no `setInterval` in
   // this repository, and CI greps for one — rule 8.

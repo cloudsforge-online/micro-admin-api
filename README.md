@@ -406,6 +406,23 @@ state.
    per-producer configuration and is reported to the owners of those repositories rather than
    changed from here.
 
+   **Rotating the shared secret.** `OUTBOX_SIGNING_SECRET` is one key held by 24 services, and its
+   current value is a placeholder committed to a public file, so it has to be rotated. It signs the
+   outbox→inbox hop, so if a producer moves to a new key while this receiver holds only the old one,
+   delivery partitions **silently** — and what goes quiet is the estate's audit of record, which
+   during an incident is indistinguishable from "nothing happened". So the receiving side takes a
+   list:
+
+   | Variable | Required | What it does |
+   |---|---|---|
+   | `OUTBOX_SIGNING_SECRET` | yes | The single key this service **signs** its own outbox deliveries with. Never a list: a producer signing under two keys has not rotated, it has forked. |
+   | `OUTBOX_ACCEPT_SECRETS` | no | Comma-separated, **newest first**. The keys `POST /v1/events` will **accept**. Unset, it is exactly `[OUTBOX_SIGNING_SECRET]`, which is today's behaviour byte for byte — so deploying this is a no-op, and that is what lets the rotation be staged one service at a time. Each entry is validated like the signing secret (no known placeholder, at least 24 characters), and a repeated entry is refused at boot. |
+
+   The duplicate rule is not tidiness. `verifyDelivery` reports the **index** of the key that
+   matched, and this route logs a warning naming it whenever it is not 0. That warning going quiet
+   across every producer is the signal that says the rotation has finished and the old key can be
+   dropped; a duplicated entry would make it ambiguous.
+
    **Residual risk, stated rather than buried.** `source` is now the envelope's `producer` rather
    than a scope-checked principal, so any holder of the estate outbox secret can mirror a row
    attributed to any producer. `validateEnvelope` still requires a producer to own its topic
