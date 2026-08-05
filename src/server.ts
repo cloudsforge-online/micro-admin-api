@@ -325,6 +325,34 @@ class BadRequestError extends Error {
   }
 }
 
+/**
+ * The body exceeded `MAX_BODY_BYTES` and was refused before it was buffered.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **IT IS ITS OWN ERROR BECAUSE THE CONNECTION MUST BE CLOSED, NOT JUST ANSWERED.**
+ *
+ * `readRaw` stops consuming the request the moment the cap is passed, which is the whole point —
+ * buffering first and checking after is the memory-exhaustion primitive it exists to remove. But
+ * that leaves UNREAD BYTES in the socket. On a keep-alive connection the next request is then
+ * parsed starting from the middle of the abandoned body, and the client sees `ECONNRESET` on a
+ * request that was perfectly well formed.
+ *
+ * Found by a test: an operator-surface authorisation check placed immediately after the
+ * oversized-body test failed with `ECONNRESET` after six seconds, and passed in isolation. The
+ * victim is always the NEXT caller to reuse the connection, which is what makes this the kind of
+ * defect that reads as a flaky network rather than as a bug.
+ *
+ * So the reply carries `connection: close`. One refused request costs one connection, which is the
+ * correct price and is what every other server does here.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+class BodyTooLargeError extends Error {
+  constructor() {
+    super('request body too large')
+    this.name = 'BodyTooLargeError'
+  }
+}
+
 class NotFoundError extends Error {
   constructor(message: string) {
     super(message)
@@ -498,6 +526,14 @@ async function handle(route: Route | undefined, ctx: RequestContext, deps: Serve
         err.message,
         ctx.requestId,
       )
+    }
+    if (err instanceof BodyTooLargeError) {
+      // 400 rather than 413 to keep the existing contract, but the connection goes: see the class.
+      return {
+        status: 400,
+        headers: { connection: 'close' },
+        body: { error: { code: 'bad_request', message: err.message, requestId: ctx.requestId } },
+      }
     }
     if (
       err instanceof BadRequestError ||
@@ -1815,7 +1851,7 @@ async function readRaw(req: IncomingMessage): Promise<Buffer> {
     size += buffer.length
     // Capped before buffering, not after: an unbounded body is a memory exhaustion primitive that
     // any authenticated caller could otherwise reach.
-    if (size > MAX_BODY_BYTES) throw new BadRequestError('request body too large')
+    if (size > MAX_BODY_BYTES) throw new BodyTooLargeError()
     chunks.push(buffer)
   }
   return Buffer.concat(chunks)
@@ -1852,5 +1888,11 @@ function send(res: ServerResponse, reply: Reply, requestId: string): void {
   for (const [key, value] of Object.entries(reply.headers ?? {})) headers[key.toLowerCase()] = value
   headers['content-length'] = String(Buffer.byteLength(payload))
   res.writeHead(reply.status, headers)
-  res.end(payload)
+  // An abandoned request body leaves unread bytes in the socket, so the connection cannot be
+  // reused — the next request on it would be parsed from the middle of the discarded body. The
+  // response is written FIRST and the socket destroyed only once it has flushed, or the caller
+  // gets a reset instead of the 400 that explains what they did wrong. See `BodyTooLargeError`.
+  res.end(payload, () => {
+    if (headers['connection'] === 'close') res.socket?.destroy()
+  })
 }

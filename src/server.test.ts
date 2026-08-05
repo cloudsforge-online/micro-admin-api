@@ -1369,3 +1369,81 @@ test('an oversized body is refused before it is buffered', { skip }, async () =>
   })
   assert.equal(res.status, 400)
 })
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+   THE BACKUP SURFACE IS OPERATOR-ONLY, INCLUDING ITS READS.
+
+   `admin` is `adminOnly` in `ui/packages/ui/src/surfaces.ts`, but that flag is a NAVIGATION filter
+   — `admin-web/src/lib/auth.tsx:4` says so in as many words, and `ProtectedRoute` only checks that
+   a session exists. This is the boundary, and these tests are what prove it holds.
+
+   Note what is NOT here: a `READER` case that succeeds. Every other read on this service admits a
+   service token holding the exact `admin:read` scope; these deliberately do not. A backup listing
+   names the directory the artefacts live in, the databases they cover and the checksums that
+   authenticate them — a map of where the estate's data is kept — and a read-only service
+   credential is a credential that sits in a container's environment. An unauthenticated restore is
+   a total compromise, and the read is most of the way to one.
+   ══════════════════════════════════════════════════════════════════════════════════════════════ */
+
+/** A GET may not carry a body; a mutating route needs one and an Idempotency-Key. */
+function bodyFor(method: string): { headers: Record<string, string>; body?: unknown } {
+  const headers = { 'idempotency-key': 'this-caller-should-never-get-this-far' }
+  if (method === 'GET') return { headers }
+  return {
+    headers,
+    body: { backupRunId: '11111111-1111-1111-1111-111111111111', mode: 'verify', rootPath: '/tmp' },
+  }
+}
+
+const BACKUP_ROUTES = [
+  ['GET', '/v1/backups'],
+  ['GET', '/v1/backups/settings'],
+  ['PUT', '/v1/backups/settings'],
+  ['GET', '/v1/backups/11111111-1111-1111-1111-111111111111'],
+  ['POST', '/v1/backups'],
+  ['GET', '/v1/restores'],
+  ['POST', '/v1/restores'],
+] as const
+
+test('an ordinary user without role:admin cannot reach ANY backup route', { skip }, async () => {
+  for (const [method, path] of BACKUP_ROUTES) {
+    // A valid key on the mutating ones, so the refusal cannot be mistaken for the 400 that a
+    // missing Idempotency-Key would produce. The 403 must come from the ROLE.
+    const res = await h().request(method, path, { token: PLAYER, ...bodyFor(method) })
+    assert.equal(res.status, 403, `${method} ${path} must be 403 for a non-admin`)
+    assert.match(res.body.error.message, /role:admin/, `${method} ${path}`)
+  }
+})
+
+test('a SERVICE token cannot reach the backup surface even holding admin:read', { skip }, async () => {
+  for (const [method, path] of BACKUP_ROUTES) {
+    const res = await h().request(method, path, { token: READER, ...bodyFor(method) })
+    assert.equal(res.status, 403, `${method} ${path} must refuse a service token`)
+    assert.match(res.body.error.message, /role:admin/, `${method} ${path}`)
+  }
+})
+
+test('an unauthenticated caller reaches nothing on the backup surface', { skip }, async () => {
+  for (const [method, path] of BACKUP_ROUTES) {
+    const res = await h().request(method, path, bodyFor(method))
+    assert.equal(res.status, 401, `${method} ${path} must be 401 without a token`)
+  }
+})
+
+/**
+ * The live restore has exactly one door, and this is the test that says so.
+ *
+ * An operator holding `role:admin` — the strongest credential on this surface — still cannot cause
+ * a live restore through the direct route. The refusal names the queue rather than being a bare
+ * 400, because an operator during an incident needs to be told where to go, not merely stopped.
+ */
+test('even an ADMIN cannot request a live restore directly; the queue is the only door', { skip }, async () => {
+  const res = await h().request('POST', '/v1/restores', {
+    token: ONE,
+    headers: { 'idempotency-key': 'an-admin-trying-the-direct-route' },
+    body: { backupRunId: '11111111-1111-1111-1111-111111111111', mode: 'live', reason: 'incident' },
+  })
+  assert.equal(res.status, 400)
+  assert.match(res.body.error.message, /estate\.restore approval/)
+  assert.match(res.body.error.message, /second operator/)
+})
