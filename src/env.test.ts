@@ -45,18 +45,34 @@ const REQUIRED: Record<string, string> = {
   LEDGER_URL: 'http://127.0.0.1:4007',
   MARKET_URL: 'http://127.0.0.1:4013',
   BILLING_URL: 'http://127.0.0.1:4009',
-  // A CREDENTIAL, despite the name. `a-real-looking-token-of-sufficient-length` used to sit here,
-  // which is neither a credential nor a token — it is a sentence. The live value measured on
-  // 2026-08-05 was a 701-byte JWT that had expired 26 hours earlier, and the fixture agreeing with
-  // neither shape is how a suite stays green over a service that cannot reach the ledger.
-  ADMIN_API_SERVICE_TOKEN: CREDENTIAL,
   // Required with NO default, deliberately — a default answer to "which estate am I?" is how a
   // testnet backup gets restored over mainnet balances. `testnet` here, never `mainnet`, so a
   // fixture can never stand in for the environment where the refusal actually matters.
   ADMIN_API_ESTATE_ENVIRONMENT: 'testnet',
 }
 
-for (const [key, value] of Object.entries(REQUIRED)) process.env[key] = value
+/**
+ * The two credential variables, and **NEITHER OF THEM IS IN `REQUIRED` ANY MORE — micro-org #222.**
+ *
+ * `ADMIN_API_SERVICE_TOKEN` used to be required, and the argument for that was written down: an
+ * optional credential here would be "a privileged BFF that silently cannot reach the ledger". The
+ * argument was right about the danger and wrong about the remedy. Requiring the variable kept a
+ * boot dependency on a **600-second token that nothing in this process could renew**, so a
+ * deployment holding a long-lived `ADMIN_API_IDENTITY_CREDENTIAL` and no token was correctly
+ * configured and refused to start, while one holding the expired JWT the estate actually ran
+ * booted happily and 401ed every ledger call for 26 hours.
+ *
+ * The silence is answered where it belongs instead: `upstreams.ts` names the mode it chose,
+ * `index.ts` logs `fatal` at boot when that mode cannot authenticate, and
+ * `admin_api_service_token_usable` answers the question on every scrape. A refusal to boot is a
+ * good alarm for a value that is WRONG; it is the wrong alarm for a value that is ABSENT while a
+ * deploy is being taught to pass its replacement.
+ */
+const CREDENTIALS: Record<string, string> = {
+  ADMIN_API_IDENTITY_CREDENTIAL: CREDENTIAL,
+}
+
+for (const [key, value] of Object.entries({ ...REQUIRED, ...CREDENTIALS })) process.env[key] = value
 
 const { EnvError, SERVICE, env, loadEnv, parseSecretList } = await import('./env.ts')
 
@@ -75,7 +91,11 @@ const { EnvError, SERVICE, env, loadEnv, parseSecretList } = await import('./env
 const NEWEST = randomBytes(48).toString('base64')
 const SUPERSEDED = randomBytes(48).toString('base64')
 
-const withEnv = (overrides: Record<string, string | undefined> = {}) => ({ ...REQUIRED, ...overrides })
+const withEnv = (overrides: Record<string, string | undefined> = {}) => ({
+  ...REQUIRED,
+  ...CREDENTIALS,
+  ...overrides,
+})
 
 test('the eager export validated the process environment at import', () => {
   // If it had not, this file would have exited with a structured fatal line before reaching here.
@@ -176,26 +196,59 @@ test('a short secret is refused, and the unit is BYTES rather than keystrokes', 
  * A token is not a credential. A JWT is minted with a short life and is read HERE ONLY AT BOOT, so
  * it is dead on the next restart at the latest; a credential confers nothing by itself, is
  * revocable, and survives a restart. The refusal is therefore correct rather than inconvenient,
- * and it must stay a refusal: there is no JWT exemption, no fallback to a weaker assertion, and
- * this variable is not made optional to dodge the problem.
+ * and it must stay a refusal: there is no JWT exemption and no fallback to a weaker assertion.
+ *
+ * **BOTH NAMES FACE IT.** The class of a value is a property of the VALUE and never of the variable
+ * holding it: measured the same day, `SETTLEMENT_SERVICE_TOKEN` held `cfsc_` + 43 characters while
+ * this one held a 701-byte expired JWT. A guard picked from the name would have been right for
+ * exactly one of them, which is why the loop below runs over both and neither is exempt.
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
-test('ADMIN_API_SERVICE_TOKEN refuses a JWT by name, however well-formed it is', () => {
+test('a JWT is refused BY NAME on either credential variable, however well-formed it is', () => {
   // Header and payload segments only; the guard matches SHAPE and never decodes, because this is a
   // refusal rather than a parse. The value is not a real token and carries no signature.
   const jwt = `eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.${randomBytes(400).toString('base64url')}.sig`
-  assert.throws(
-    () => loadEnv(withEnv({ ADMIN_API_SERVICE_TOKEN: jwt })),
-    (err: unknown) =>
-      err instanceof EnvError &&
-      /ADMIN_API_SERVICE_TOKEN/.test(err.message) &&
-      /TOKEN, not a credential/.test(err.message) &&
-      // Not one byte of it. A 701-byte JWT echoed into a fatal log line is a bearer token in the
-      // log collector, which is a wider audience than the file it came from.
-      !err.message.includes(jwt.slice(0, 40)),
-  )
+  for (const name of ['ADMIN_API_SERVICE_TOKEN', 'ADMIN_API_IDENTITY_CREDENTIAL'] as const) {
+    assert.throws(
+      () => loadEnv(withEnv({ [name]: jwt })),
+      (err: unknown) =>
+        err instanceof EnvError &&
+        new RegExp(name).test(err.message) &&
+        /TOKEN, not a credential/.test(err.message) &&
+        // Not one byte of it. A 701-byte JWT echoed into a fatal log line is a bearer token in the
+        // log collector, which is a wider audience than the file it came from.
+        !err.message.includes(jwt.slice(0, 40)),
+      `${name} must refuse a JWT`,
+    )
+  }
   // And the credential it must be replaced with loads, hyphens and all.
   assert.equal(loadEnv(withEnv({ ADMIN_API_SERVICE_TOKEN: CREDENTIAL })).serviceToken, CREDENTIAL)
+  assert.equal(loadEnv(withEnv()).identityCredential, CREDENTIAL)
+})
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **ABSENCE IS A SUPPORTED MODE. PRESENT-AND-RUBBISH IS NOT.** The pair is the whole demotion.
+ *
+ * Compose interpolates `${ADMIN_API_IDENTITY_CREDENTIAL:-}`, so an unset credential arrives as the
+ * EMPTY STRING rather than as `undefined` — and `migrator.ts` shares this environment while
+ * dialling nobody. `null` is the absence said once, and `upstreams.ts` turns it into a NAMED mode
+ * rather than into a request that goes out unauthenticated.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+test('an ABSENT credential loads as null; a present rubbish one still refuses to boot', () => {
+  assert.equal(loadEnv(withEnv({ ADMIN_API_IDENTITY_CREDENTIAL: '' })).identityCredential, null)
+  assert.equal(loadEnv(withEnv({ ADMIN_API_IDENTITY_CREDENTIAL: '   ' })).identityCredential, null)
+  // The legacy variable is absent from `REQUIRED`, so this is the default state of the fixture.
+  assert.equal(loadEnv(withEnv()).serviceToken, null)
+
+  // Absent is supported; a 20-character placeholder is a deployment that BELIEVES it has a
+  // credential, and it is refused exactly as loudly as before the demotion.
+  assert.throws(
+    () => loadEnv(withEnv({ ADMIN_API_IDENTITY_CREDENTIAL: 'cfsc_short' })),
+    (err: unknown) =>
+      err instanceof EnvError && /ADMIN_API_IDENTITY_CREDENTIAL/.test(err.message),
+  )
 })
 
 /* ---------------------------------------------------------- the rotation overlap window */

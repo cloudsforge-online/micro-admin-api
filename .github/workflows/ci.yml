@@ -42,13 +42,15 @@ jobs:
       # away (micro-org `service-ci.yml`, the `env_args` loop).
       smoke-env: |
         OUTBOX_SIGNING_SECRET=@generate
-        # ── ADMIN_API_SERVICE_TOKEN IS THE ONE VARIABLE `@generate` CANNOT SERVE ───────────────
+        # ── THE CREDENTIAL IS THE ONE VARIABLE `@generate` CANNOT SERVE ────────────────────────
         #
-        # It is a `cfsc_` CREDENTIAL (micro-org #222), it is REQUIRED — `upstreams.ts` presents it
-        # on every ledger call, because `ledger/src/server.ts`'s `authorise` refuses a user
-        # principal outright — and unlike wallet, settlement, market and hub-api this service has
-        # never made its credential optional. So it cannot simply be omitted the way theirs are:
-        # the container would exit at import and never answer /livez.
+        # It is a `cfsc_` CREDENTIAL (micro-org #222): the long-lived, revocable value
+        # `ServiceTokenProvider` exchanges at identity for a 600-second token on every call that
+        # needs one, because `ledger/src/server.ts`'s `authorise` refuses a user principal outright.
+        #
+        # It is OPTIONAL as of #222 — absence is a supported boot, so the image can answer /livez
+        # without one — but it is set here on purpose: a smoke test that boots the credential-less
+        # mode would be testing the configuration this fix exists to retire.
         #
         # `@generate` cannot serve it either: `openssl rand` produces a base64 KEY, and this slot
         # needs `cfsc_` + base64url. So this line used to carry a readable literal,
@@ -65,7 +67,13 @@ jobs:
         # about committed key-shaped strings, and for one more: the base64url alphabet means the
         # minted value contains a hyphen about five runs in six, so CI exercises BOTH the mainnet
         # (alphanumeric) and testnet (hyphenated) credential shapes on its own.
-        ADMIN_API_SERVICE_TOKEN=@credential
+        #
+        # THE NAME CHANGED WITH THE MECHANISM. `ADMIN_API_SERVICE_TOKEN` is now an optional
+        # migration aid the deploy is being taught to drop; `ADMIN_API_IDENTITY_CREDENTIAL` is the
+        # long-lived value `ServiceTokenProvider` EXCHANGES for a 600-second token. Setting the
+        # credential here means the smoke test boots the image in the mode production will run in,
+        # rather than in the one being retired.
+        ADMIN_API_IDENTITY_CREDENTIAL=@credential
         IDENTITY_JWKS_URL=http://127.0.0.1:4001/.well-known/jwks.json
         IDENTITY_ISSUER=http://127.0.0.1:4001
         IDENTITY_URL=http://127.0.0.1:4001

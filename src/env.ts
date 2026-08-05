@@ -119,43 +119,50 @@ function requiredSigningSecret(source: Source, name: string): string {
 }
 
 /**
- * A SERVICE CREDENTIAL this service must have, held to `assertServiceCredential`.
+ * A SERVICE CREDENTIAL that may be absent, but must be REAL if present.
  *
  * ══════════════════════════════════════════════════════════════════════════════════════════════
- * **THIS WILL REFUSE THE VALUE THE LIVE ESTATE IS RUNNING TODAY, AND THAT IS THE POINT — #222.**
+ * **THIS REFUSES THE VALUE THE LIVE ESTATE IS RUNNING TODAY, AND THAT IS THE POINT — #222.**
  *
  * Measured live on 2026-08-05: `ADMIN_API_SERVICE_TOKEN` held a 701-byte JWT that had **expired 26
- * hours earlier**, on a container reporting healthy. It is genuinely read — `index.ts` closes over
- * `env.serviceToken` and `upstreams.ts` puts it in the `authorization` header of every ledger call
- * a `{ kind: 'service' }` credential names, because `ledger/src/server.ts`'s `authorise` refuses a
- * user principal outright. So every reversal and every trial-balance read this service has made
- * since that expiry answered 401, while `/livez` stayed green.
+ * hours earlier**, on a container reporting healthy. It was genuinely read — `index.ts` closed over
+ * `env.serviceToken` and `upstreams.ts` put it verbatim in the `authorization` header of every
+ * ledger call a `{ kind: 'service' }` credential names, because `ledger/src/server.ts`'s
+ * `authorise` refuses a user principal outright. So every reversal and every trial-balance read
+ * this service made since that expiry answered 401, while `/livez` stayed green — the healthcheck
+ * never exercises the credential, which is why nothing noticed for a day.
  *
- * A JWT read once at boot is dead on the next restart at the latest; that is the ten-minute cliff
- * (#197) wearing a variable name that looks fine. `assertServiceCredential` refuses a JWT BY NAME,
- * so this service will now refuse to boot until a real `cfsc_` credential is minted for it with
- * `deploy/scripts/estate-bootstrap.sh`. **No JWT exemption, no weaker assertion, and not made
- * optional to dodge the problem**: an optional credential here would be a privileged BFF that
- * silently cannot reach the ledger, which is the state that has been live for 26 hours and is
- * precisely what nobody noticed. A container that will not start is the cheapest possible way to
- * discover it.
+ * A JWT read once at boot is dead ten minutes later, and dead on the next restart at the latest;
+ * that is the ten-minute cliff (#197) wearing a variable name that looks fine.
+ * `assertServiceCredential` refuses a JWT BY NAME, so a deployment still passing one will not
+ * boot until it is replaced by a real `cfsc_` credential from `deploy/scripts/estate-bootstrap.sh`.
+ * No JWT exemption and no weaker assertion.
  *
- * REQUIRED rather than optional, unlike wallet's and settlement's credentials. Those two are
- * optional because CI's startup smoke test boots the image with a fixed environment; admin-api has
- * no such job, its compose block ALWAYS sets this variable (with a placeholder default), and it
- * has been required since the service was written. Making it optional now would be a behaviour
- * change smuggled in under a hardening commit.
- * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * ── WHY `null` RATHER THAN `''`, AND WHY THE EMPTY CHECK COMES FIRST ───────────────────────────
+ *
+ * Compose interpolates `${ADMIN_API_IDENTITY_CREDENTIAL:-}`, so an UNSET credential arrives as the
+ * EMPTY STRING rather than as `undefined`. That is the supported "not configured yet" mode, not a
+ * malformed value, and `migrator.ts` shares this environment while dialling nobody — turning it
+ * into `exit(1)` would fail `admin-api-migrate`, which the service's own compose block waits on
+ * through `service_completed_successfully`. `null` says the absence once; `''` is falsy exactly
+ * where a caller tests for it and truthy in `Object.keys`, which is how a mode gets chosen by
+ * accident.
+ *
+ * What is NOT supported is a value that is present and rubbish. A 20-character placeholder is a
+ * deployment that BELIEVES it has a credential, and it fails on its first ledger call with a 401
+ * that reads exactly like the ledger being unwell.
  *
  * ── WHY NOT `assertGeneratedSecret` ────────────────────────────────────────────────────────────
  *
- * Because it would refuse every credential this estate has ever minted. A credential is `cfsc_` +
- * base64url, which is neither wholly base64 nor wholly hex — the underscore in its own prefix
- * disqualifies it — and the testnet body CONTAINS A HYPHEN while the mainnet body does not, so a
- * "no hyphens" rule passes one estate and kills the other.
+ * Because it would refuse every credential this estate has ever minted, on both networks. A
+ * credential is `cfsc_` + base64url, which is neither wholly base64 nor wholly hex — the underscore
+ * in its own prefix disqualifies it — and **the testnet body CONTAINS A HYPHEN while the mainnet
+ * body does not**, so the "no hyphens" instinct that is correct for the signing key above reads as
+ * obviously right, passes mainnet, and kills testnet at boot.
  */
-function requiredCredential(source: Source, name: string): string {
-  const value = required(source, name)
+function optionalCredential(source: Source, name: string): string | null {
+  const value = source[name]?.trim()
+  if (!value) return null
   asEnvError(() => assertServiceCredential(name, value))
   return value
 }
@@ -245,18 +252,47 @@ export interface Env {
   /** Soft. Entitlement revocation is an approval action. */
   readonly billingUrl: string
   /**
-   * The scoped service credential. Not shared: SD-05.
+   * The long-lived, revocable `cfsc_` credential this process EXCHANGES for a service token.
    *
-   * A `cfsc_` CREDENTIAL, and the variable's `*_SERVICE_TOKEN` name is the reason to say so out
-   * loud. Four variables in this estate carry that suffix and they are not one class: measured on
-   * 2026-08-05, `SETTLEMENT_SERVICE_TOKEN` held `cfsc_` + 43 characters while this one held a
-   * 701-byte JWT, expired. A guard chosen from the NAME would have been right for one of them.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * **THIS IS THE FIX, AND `serviceToken` BELOW IS THE THING IT REPLACES.**
    *
-   * Presented as `Bearer` on every ledger call — `upstreams.ts`, `{ kind: 'service' }` — because
-   * `ledger/src/server.ts`'s `authorise` refuses a user principal outright. Market and billing
-   * take the operator's own bearer instead, which is why this is the only credential here.
+   * A credential is worth nothing on its own. `ServiceTokenProvider` posts it to identity's
+   * `POST /service-tokens/exchange` (`identity/src/server.ts:1615`) and gets back an ordinary
+   * 600-second token (`identity/src/tokens.ts:33`), then re-mints before expiry on traffic. The
+   * exchange consumes nothing, so N replicas boot from one credential and a restart six days later
+   * still works. **The 600 seconds is deliberately unchanged**: rotation IS expiry, and a longer
+   * TTL only moves the cliff — settlement's was 600 seconds and it still produced 1,315 undelivered
+   * withdrawals, because the defect was never the number.
+   *
+   * `estate-bootstrap.sh` §5b already mints this into `tokens.env`; the deploy simply has to pass
+   * it. Optional, because absence must be a boot the image survives — CI's startup smoke test and
+   * `migrator.ts` both load this file, and neither dials a peer. `upstreams.ts` reports the mode it
+   * chose and `index.ts` logs `fatal` when that mode cannot authenticate, which is the loud failure
+   * the healthcheck could never be.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
    */
-  readonly serviceToken: string
+  readonly identityCredential: string | null
+  /**
+   * The pre-minted service token. **A MIGRATION AID WITH A STATED END, NOT A MODE.**
+   *
+   * Held to `assertServiceCredential` exactly as `identityCredential` is, so the expired JWT the
+   * estate is running today is refused BY NAME rather than presented for another day. It exists at
+   * all only because `docker-compose.estate.yml` sets `ADMIN_API_SERVICE_TOKEN` and does not yet
+   * pass `ADMIN_API_IDENTITY_CREDENTIAL`, and a deploy is not this repository's edit to make.
+   * **Delete this field once the deploy passes the credential.**
+   *
+   * The variable's `*_SERVICE_TOKEN` name is worth saying out loud. Four variables in this estate
+   * carry that suffix and they are not one class: measured on 2026-08-05, `SETTLEMENT_SERVICE_TOKEN`
+   * held `cfsc_` + 43 characters while this one held a 701-byte expired JWT. **A guard chosen from
+   * the NAME would have been right for exactly one of them**, which is why both are checked on the
+   * shape of the value they actually carry.
+   *
+   * Whatever it holds, it loses to `identityCredential` when both are set — see `upstreams.ts`.
+   * That precedence is the whole of the deploy's migration: add the credential, restart, remove
+   * this one, and no window exists in which the dead token wins.
+   */
+  readonly serviceToken: string | null
   readonly upstreamDeadlineMs: number
 
   /**
@@ -350,10 +386,12 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     ledgerUrl: required(source, 'LEDGER_URL'),
     marketUrl: required(source, 'MARKET_URL'),
     billingUrl: required(source, 'BILLING_URL'),
-    // A CREDENTIAL, not a token, whatever the variable is called. See `requiredCredential`: the
-    // live value is an expired JWT, this refuses it, and that refusal is #222 being closed rather
-    // than a regression.
-    serviceToken: requiredCredential(source, 'ADMIN_API_SERVICE_TOKEN'),
+    // The credential that is EXCHANGED, and the token that is not. Both face the same assertion,
+    // because the class of a value is a property of the value and never of the variable holding
+    // it: the live `ADMIN_API_SERVICE_TOKEN` is an expired JWT and this refuses it, which is #222
+    // being closed rather than a regression.
+    identityCredential: optionalCredential(source, 'ADMIN_API_IDENTITY_CREDENTIAL'),
+    serviceToken: optionalCredential(source, 'ADMIN_API_SERVICE_TOKEN'),
     upstreamDeadlineMs: integer(source, 'ADMIN_API_UPSTREAM_DEADLINE_MS', 5_000, 100, 60_000),
 
     // Default four hours. Long enough that a second operator in another timezone can answer,

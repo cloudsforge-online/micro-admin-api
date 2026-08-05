@@ -276,6 +276,24 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
       kind: 'counter',
       labels: ['tile', 'status'],
     })
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+    // micro-org #222. The two gauges that answer "can this process authenticate right now", which
+    // is the question that had no answer anywhere while `ADMIN_API_SERVICE_TOKEN` sat expired for
+    // 26 hours on a container reporting healthy. Sampled in `beforeScrape`; see `index.ts` for why
+    // this is a gauge rather than a readiness probe.
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+    .register({
+      name: 'admin_api_service_token_usable',
+      help: '1 when a live service token is held. NOT "a token is present" — an expired token is retained on purpose.',
+      kind: 'gauge',
+      labels: [],
+    })
+    .register({
+      name: 'admin_api_service_token_expires_in_seconds',
+      help: 'Seconds until the held service token expires. Goes NEGATIVE while identity is unreachable, which is the signal.',
+      kind: 'gauge',
+      labels: [],
+    })
 }
 
 interface Reply {

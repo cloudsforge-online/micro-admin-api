@@ -30,7 +30,7 @@ import { claimEstateIdentity } from './backups.ts'
 import { SCHEMA_VERSION } from './migrations.ts'
 import { createServer, registerServiceMetrics } from './server.ts'
 import { registerHandlers, rescheduleRecurring, seedRecurring } from './jobs.ts'
-import { httpBillingClient, httpIdentityClient, httpLedgerClient, httpMarketClient, probeReadiness } from './upstreams.ts'
+import { buildUpstreams, probeReadiness } from './upstreams.ts'
 import type { Db } from './outbox.ts'
 
 // 1. Environment. Importing `./env.ts` validated it; a missing or placeholder secret has already
@@ -115,16 +115,53 @@ try {
 }
 
 // 5. The upstreams, before the Lifecycle so its probes can close over their URLs. Each takes this
-//    service's own scoped token — never a shared one (SD-05) — and each uses it only where the
+//    service's own scoped bearer — never a shared one (SD-05) — and each uses it only where the
 //    upstream refuses an operator's own bearer. See the header of `upstreams.ts`.
-const serviceToken = () => env.serviceToken
-const clientConfig = { deadlineMs: env.upstreamDeadlineMs, serviceToken }
-const ledger = httpLedgerClient({ baseUrl: env.ledgerUrl, ...clientConfig })
-const market = httpMarketClient({ baseUrl: env.marketUrl, ...clientConfig })
-const billing = httpBillingClient({ baseUrl: env.billingUrl, ...clientConfig })
-// The role-grant upstream. Presents this service's own token, never an operator's — identity's
-// `identity:admin` gate refuses a user principal outright (identity/src/server.ts:626).
-const identity = httpIdentityClient({ baseUrl: env.identityUrl, ...clientConfig })
+//
+//    ONE LINE, and the body of it lives in `upstreams.ts` where a test can reach it. What used to
+//    be here was `const serviceToken = () => env.serviceToken` — a dead JWT read once at import,
+//    presented verbatim for 26 hours, structurally invisible to every test in this repository
+//    because they all build their own client. micro-org #222.
+const upstreams = buildUpstreams(env, {
+  onEvent: (event) => {
+    if (event.kind === 'minted') {
+      logger.info('service token minted', {
+        service: event.service,
+        expiresIn: event.expiresIn,
+        refreshInMs: event.refreshInMs,
+      })
+    } else if (event.kind === 'exchange_failed') {
+      // `warn`, not `fatal`, and only because of `hadUsableToken`: a failed exchange while a live
+      // token is still held is the outage the provider is built to ride out, and paging on it
+      // would page on every identity blip.
+      logger.warn('service credential exchange failed', { ...event })
+    }
+  },
+})
+const { ledger, market, billing, identity, clientConfig } = upstreams
+
+// ────────────────────────────────────────────────────────────────────────────────────────────────
+// Said at boot, at the level its consequence deserves, because the alternative is what actually
+// happened: an operator console that looks entirely healthy while every privileged action it can
+// take has been answering 401 for a day.
+// ────────────────────────────────────────────────────────────────────────────────────────────────
+if (upstreams.mode === 'none') {
+  logger.fatal('NO CREDENTIAL AT ALL — every ledger reversal and every role grant will fail', {
+    remedy:
+      'set ADMIN_API_IDENTITY_CREDENTIAL (long-lived, cfsc_…, from POST /service-credentials); ' +
+      'estate-bootstrap.sh already mints it into tokens.env',
+  })
+} else if (upstreams.mode === 'static') {
+  logger.fatal('EXPIRING TOKEN, NOT A CREDENTIAL — every service call will 401 about ten minutes from now', {
+    whatWillHappen:
+      'ADMIN_API_SERVICE_TOKEN lives 600s and nothing in this process can renew it. From minute ten ' +
+      'the ledger refuses every approved reversal and every trial-balance read, and identity refuses ' +
+      'every role grant — while /livez stays green, because it makes no outbound call.',
+    remedy: 'set ADMIN_API_IDENTITY_CREDENTIAL in the deploy and remove ADMIN_API_SERVICE_TOKEN',
+  })
+} else {
+  logger.info('service credential mode', { mode: upstreams.mode, identityUrl: env.identityUrl })
+}
 
 /** Every upstream the estate view reports on, with its `/readyz` probe. */
 const readiness = [
@@ -221,6 +258,36 @@ const server = createServer({
     const stats = await queue.stats()
     metrics.set('jobs_pending', stats.pending)
     metrics.set('jobs_overdue', stats.overdue)
+
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    // **THE QUESTION THAT HAD NO ANSWER ANYWHERE WHILE THE TOKEN QUIETLY DIED FOR 26 HOURS:**
+    // can this process authenticate to its peers right now?
+    //
+    // A GAUGE rather than a readiness probe, and that is a decision rather than an omission.
+    // `serviceTokenProbe` exists in `@cloudsforge/auth` and is deliberately not wired, for the
+    // reason market's `upstreams.ts` gives and which holds at least as strongly here:
+    //
+    //   1. **The console's read surface is served from this service's own tables.** The audit
+    //      mirror, the approval queue, the flags and the broadcasts make no outbound call. A hard
+    //      probe on the credential would take the OPERATOR CONSOLE out of the balancer over a
+    //      variable those routes cannot touch — during, by definition, an incident.
+    //   2. **Pulling the replica would fix nothing.** Every replica reads the same environment, so
+    //      a probe decides which container refuses, not whether one does.
+    //   3. The write paths that need the bearer already fail honestly at the point of use: a
+    //      `ServiceTokenUnavailableError` is 503 rather than 401, so nothing tells an operator the
+    //      ledger refused them when the truth is that nobody configured this service.
+    //
+    // Deliberately NOT "is a token present". An expired token is retained after it dies — that is
+    // the most useful thing an operator can be shown — so presence would report healthy across
+    // exactly the outage this exists to make visible.
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    const snapshot = upstreams.identityTokens?.snapshot()
+    metrics.set('admin_api_service_token_usable', snapshot?.hasUsableToken === true ? 1 : 0)
+    if (snapshot?.expiresInSeconds !== undefined && snapshot.expiresInSeconds !== null) {
+      // Goes steadily NEGATIVE while identity is unreachable, which is what says "identity has
+      // been down for four minutes" where an absent token says nothing at all.
+      metrics.set('admin_api_service_token_expires_in_seconds', snapshot.expiresInSeconds)
+    }
   },
 })
 

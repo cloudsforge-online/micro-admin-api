@@ -53,9 +53,41 @@
  * outside for that reason, and nothing here is an equivalent: the caller of every method below is
  * an authenticated operator, and the operation names a ledger entry, a moderation case or an
  * entitlement — never "whoever this user is".
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE SERVICE BEARER IS NOW EXCHANGED, NOT PRESENTED — micro-org #222.**
+ *
+ * `serviceToken` below used to be `() => string`, and `index.ts:120` filled it with
+ * `() => env.serviceToken`: one string, read once at import, put verbatim in the `authorization`
+ * header of every call this file marks `{ kind: 'service' }`. Measured on the live estate on
+ * 2026-08-05, that string was a 701-byte JWT that had **expired 26 hours earlier** on a container
+ * reporting healthy — so every ledger reversal, every trial-balance read and every role grant this
+ * service attempted for a day came back 401, and `/livez` never noticed because it makes no
+ * outbound call.
+ *
+ * That is the ten-minute cliff (#197), and it is not a shape a longer expiry can fix. `settlement`
+ * read a 600-second token once at boot (`settlement/src/index.ts:83`), authenticated for ten
+ * minutes after each restart, was dead thereafter, and produced **1,315 undelivered withdrawal
+ * attempts** against a treasury that read as empty. A longer-lived JWT would have moved that cliff,
+ * not removed it.
+ *
+ * So `serviceToken` is `() => Promise<string>` — async because the value is now MINTED rather than
+ * read, and a function because it must be able to differ between two calls a minute apart. See
+ * `buildUpstreams` at the foot of this file for who fills it.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 
 import { HttpClient, HttpError, type ResultEvent } from '@cloudsforge/http'
+import {
+  ServiceTokenProvider,
+  ServiceTokenUnavailableError,
+  type ProviderEvent,
+} from '@cloudsforge/auth'
+// TYPE-ONLY, and that matters. `./env.ts` validates the process environment at import and calls
+// `process.exit(1)` when it is incomplete, so a value import here would make this module — and
+// therefore every test of the wiring in it — impossible to load without a full environment. That
+// is the same "untestable therefore unchecked" property that let the cliff survive.
+import type { Env } from './env.ts'
 
 /** An upstream refused, or could not be reached. Distinguished, because they mean different things. */
 export class UpstreamError extends Error {
@@ -85,8 +117,15 @@ function wrap(upstream: string, err: unknown): UpstreamError {
 export interface ClientConfig {
   readonly baseUrl: string
   readonly deadlineMs: number
-  /** This service's own scoped service token. Used only where a user token is refused. */
-  readonly serviceToken: () => string
+  /**
+   * This service's own scoped service bearer, MINTED per call. Used only where a user token is
+   * refused.
+   *
+   * Async and a function, because what it returns is a short-lived token exchanged from a
+   * long-lived credential and re-minted before expiry. It **rejects** rather than resolving
+   * `undefined` when this process cannot authenticate — see `buildUpstreams`.
+   */
+  readonly serviceToken: () => Promise<string>
   readonly fetch?: typeof globalThis.fetch
   readonly onResult?: (event: ResultEvent) => void
 }
@@ -107,8 +146,22 @@ function clientFor(name: string, config: ClientConfig): HttpClient {
  */
 export type Credential = { readonly kind: 'service' } | { readonly kind: 'operator'; readonly bearer: string }
 
-function authHeader(config: ClientConfig, credential: Credential): Record<string, string> {
-  const token = credential.kind === 'service' ? config.serviceToken() : credential.bearer
+/**
+ * ASYNC, and the `await` at each of the eight call sites is the fix rather than a cost.
+ *
+ * A synchronous `authHeader` could only ever return a string somebody already held, which is
+ * precisely the seam that let a dead JWT be presented for 26 hours. Minting happens here, at the
+ * moment the header is built, so a token that expired between two operator actions is replaced
+ * before it is sent rather than discovered by the peer.
+ *
+ * The operator branch stays untouched and stays sync in spirit: an operator's bearer is theirs,
+ * arrives on the inbound request, and is nothing this service may mint, refresh or substitute.
+ */
+async function authHeader(
+  config: ClientConfig,
+  credential: Credential,
+): Promise<Record<string, string>> {
+  const token = credential.kind === 'service' ? await config.serviceToken() : credential.bearer
   return { authorization: `Bearer ${token}` }
 }
 
@@ -271,7 +324,7 @@ export function httpLedgerClient(config: ClientConfig): LedgerClient {
               operatorRecordedIn: 'admin-api audit_events',
             },
           },
-          { idempotencyKey: request.idempotencyKey, requestId: request.correlationId, headers: authHeader(config, { kind: 'service' }) },
+          { idempotencyKey: request.idempotencyKey, requestId: request.correlationId, headers: await authHeader(config, { kind: 'service' }) },
         )
         return { ...answer.entry, replayed: answer.replayed }
       } catch (err) {
@@ -303,7 +356,7 @@ export function httpLedgerClient(config: ClientConfig): LedgerClient {
           {
             idempotencyKey: request.idempotencyKey,
             requestId: request.correlationId,
-            headers: authHeader(config, { kind: 'service' }),
+            headers: await authHeader(config, { kind: 'service' }),
           },
         )
         return { id: answer.entry.id, replayed: answer.replayed }
@@ -314,7 +367,7 @@ export function httpLedgerClient(config: ClientConfig): LedgerClient {
     async trialBalance() {
       try {
         return await client.get<TrialBalance>('/trial-balance', {
-          headers: authHeader(config, { kind: 'service' }),
+          headers: await authHeader(config, { kind: 'service' }),
         })
       } catch (err) {
         throw wrap('ledger', err)
@@ -327,7 +380,7 @@ export function httpLedgerClient(config: ClientConfig): LedgerClient {
         // encoding here is what a well-behaved client owes it.
         const answer = await client.get<{ balances: readonly AccountBalance[] }>(
           `/accounts/${encodeURIComponent(subject)}/balances`,
-          { headers: authHeader(config, { kind: 'service' }) },
+          { headers: await authHeader(config, { kind: 'service' }) },
         )
         return answer.balances ?? []
       } catch (err) {
@@ -374,7 +427,7 @@ export function httpMarketClient(config: ClientConfig): MarketClient {
           { state: request.state, notes: request.notes },
           {
             requestId: request.correlationId,
-            headers: authHeader(config, { kind: 'operator', bearer: request.operatorBearer }),
+            headers: await authHeader(config, { kind: 'operator', bearer: request.operatorBearer }),
           },
         )
         return answer.case
@@ -386,7 +439,7 @@ export function httpMarketClient(config: ClientConfig): MarketClient {
       try {
         const answer = await client.get<{ cases: readonly ModerationCase[] }>(
           '/v1/moderation/cases?state=open',
-          { headers: authHeader(config, { kind: 'operator', bearer: operatorBearer }) },
+          { headers: await authHeader(config, { kind: 'operator', bearer: operatorBearer }) },
         )
         return answer.cases ?? []
       } catch (err) {
@@ -430,7 +483,7 @@ export function httpBillingClient(config: ClientConfig): BillingClient {
           { reason: request.reason, refund: request.refund },
           {
             requestId: request.correlationId,
-            headers: authHeader(config, { kind: 'operator', bearer: request.operatorBearer }),
+            headers: await authHeader(config, { kind: 'operator', bearer: request.operatorBearer }),
           },
         )
       } catch (err) {
@@ -504,12 +557,155 @@ export function httpIdentityClient(config: ClientConfig): IdentityClient {
           },
           {
             requestId: request.correlationId,
-            headers: authHeader(config, { kind: 'service' }),
+            headers: await authHeader(config, { kind: 'service' }),
           },
         )
       } catch (err) {
         throw wrap('identity', err)
       }
     },
+  }
+}
+
+/* ------------------------------------------------------------------------ the wiring */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **WHY THE WIRING LIVES HERE AND NOT IN `index.ts`.**
+ *
+ * Because the defect was a WIRING defect, and wiring that lives in the composition root is wiring
+ * no test can reach. `index.ts` opens a pool, asserts a schema, claims an estate identity, starts a
+ * job runner and calls `listen()` — importing it from a test starts a server against a database. So
+ * the line that was wrong,
+ *
+ *     const serviceToken = () => env.serviceToken        // index.ts:120, for the life of the
+ *                                                        // process and of the container
+ *
+ * was structurally untestable, and this repository's 311-line `upstreams.test.ts` could not have
+ * caught it however carefully it had been written: every case in it builds its own `config()` with
+ * its own token, so it proves the CLIENTS work and says nothing about what the SERVICE hands them.
+ * `wallet/src/upstreams.ts`, `market/src/upstreams.ts` and `foresight/src/upstreams.ts` each
+ * learned this the same way. `servicetoken.test.ts` beside this file goes through the function
+ * below, and reverting its body to `() => env.serviceToken` turns that file red.
+ *
+ * **ONE PROVIDER FOR ALL FOUR PEERS**, for the same reason there was one token: it is minted for
+ * `service:admin-api` carrying the scopes admin-api needs — `ledger:post`, `ledger:read`,
+ * `identity:admin` — and each peer checks the one it cares about. Four providers would be four
+ * exchanges and four refresh schedules against one identity for one process.
+ *
+ * **BOTH HOOKS, AND THE SECOND IS NOT DECORATION.** `serviceToken` keeps the bearer fresh on a
+ * schedule computed from this process's clock. `fetch` is the provider's `authorizedFetch`, which
+ * catches a 401 from a peer, discards exactly the token that was refused, re-mints and replays
+ * once. Without the second, correctness would rest on this process and the ledger agreeing about
+ * what time it is — and on no credential ever being revoked mid-flight.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+/**
+ * How this process obtains a service bearer, NAMED rather than inferred from whether a string is
+ * set.
+ *
+ * `exchanged` is correct. `static` is the defect, still running wherever a deployment has not yet
+ * been given the credential its bootstrap already mints. `none` cannot authenticate at all. Three
+ * states, because "the bearer stopped working" and "there is no bearer" send an operator to
+ * different places at three in the morning — and this service is where they come to look.
+ */
+export type CredentialMode = 'exchanged' | 'static' | 'none'
+
+export interface Upstreams {
+  readonly mode: CredentialMode
+  /** `null` unless `mode` is `exchanged`. What `index.ts` samples for the readiness gauge. */
+  readonly identityTokens: ServiceTokenProvider | null
+  readonly ledger: LedgerClient
+  readonly market: MarketClient
+  readonly billing: BillingClient
+  readonly identity: IdentityClient
+  /** The shared config, so `probeReadiness` can be called for a peer with the same transport. */
+  readonly clientConfig: Omit<ClientConfig, 'baseUrl'>
+}
+
+/** The subset of `Env` this needs. Named so a test does not have to build a whole environment. */
+export type UpstreamEnv = Pick<
+  Env,
+  | 'identityUrl'
+  | 'identityCredential'
+  | 'serviceToken'
+  | 'ledgerUrl'
+  | 'marketUrl'
+  | 'billingUrl'
+  | 'upstreamDeadlineMs'
+>
+
+export interface UpstreamOptions {
+  /** Test seam. Production uses the global `fetch`. */
+  readonly fetch?: typeof globalThis.fetch | undefined
+  readonly onEvent?: ((event: ProviderEvent) => void) | undefined
+  readonly onResult?: ((event: ResultEvent) => void) | undefined
+}
+
+export function buildUpstreams(env: UpstreamEnv, options: UpstreamOptions = {}): Upstreams {
+  const identityTokens = env.identityCredential
+    ? new ServiceTokenProvider({
+        identityUrl: env.identityUrl,
+        credential: env.identityCredential,
+        // Not narrowed. Identity issues this service's whole allowlist, and at boot this process
+        // cannot know which of its call sites will be reached first — a ledger reversal approved
+        // at 02:00, a trial-balance tile rendered on the first page load, or a role grant. A
+        // narrowing that drifted from `deploy/scripts/derive-grants.mjs` would 403 with nothing in
+        // either log naming the cause.
+        ...(options.fetch ? { fetch: options.fetch } : {}),
+        ...(options.onEvent ? { onEvent: options.onEvent } : {}),
+      })
+    : null
+
+  // **THE CREDENTIAL WINS.** This is the state the estate will actually be in for one deploy:
+  // `ADMIN_API_SERVICE_TOKEN` is set today and stays set while the credential is added. If the
+  // pre-minted token won, the deploy would look correct, the boot log would say `exchanged`, and
+  // the cliff would still be there.
+  const mode: CredentialMode = identityTokens ? 'exchanged' : env.serviceToken ? 'static' : 'none'
+
+  /**
+   * What every `{ kind: 'service' }` call site asks for its bearer.
+   *
+   * **Rejects rather than resolving `undefined` or `''` when there is nothing to present.** An
+   * empty bearer goes out as the literal `Bearer `, comes back 401, and tells an operator that the
+   * LEDGER refused admin-api — when the truth is that nobody configured admin-api. Those are
+   * different mornings and this service exists to keep them apart.
+   * `ServiceTokenUnavailableError` maps to 503 under `statusFor`, never 401, for the same reason
+   * `Verifier` answers 503 on an unreachable JWKS: a fault in the thing that decides authentication
+   * is not evidence that the caller is unauthenticated.
+   */
+  const serviceToken = (): Promise<string> => {
+    if (identityTokens) return identityTokens.token()
+    if (env.serviceToken) return Promise.resolve(env.serviceToken)
+    return Promise.reject(
+      new ServiceTokenUnavailableError(
+        'no identity credential is configured; set ADMIN_API_IDENTITY_CREDENTIAL ' +
+          '(long-lived, cfsc_…, from POST /service-credentials)',
+      ),
+    )
+  }
+
+  // The provider's own `fetch` is the transport it EXCHANGES over; `authorizedFetch` is what the
+  // four clients get. It is the layer where a 401 is visible and where the header was set, so
+  // hooking it needs no change at any call site above and cannot be forgotten at one of them.
+  const fetch = identityTokens?.authorizedFetch ?? options.fetch
+  const clientConfig = {
+    deadlineMs: env.upstreamDeadlineMs,
+    serviceToken,
+    ...(fetch ? { fetch } : {}),
+    ...(options.onResult ? { onResult: options.onResult } : {}),
+  }
+
+  return {
+    mode,
+    identityTokens,
+    clientConfig,
+    ledger: httpLedgerClient({ baseUrl: env.ledgerUrl, ...clientConfig }),
+    market: httpMarketClient({ baseUrl: env.marketUrl, ...clientConfig }),
+    billing: httpBillingClient({ baseUrl: env.billingUrl, ...clientConfig }),
+    // The role-grant upstream. Presents this service's own bearer, never an operator's — identity's
+    // `identity:admin` gate refuses a user principal outright (identity/src/server.ts:626).
+    identity: httpIdentityClient({ baseUrl: env.identityUrl, ...clientConfig }),
   }
 }

@@ -49,7 +49,12 @@ function config(overrides: Partial<ClientConfig> = {}): ClientConfig {
   return {
     baseUrl: target.baseUrl,
     deadlineMs: 2_000,
-    serviceToken: () => SERVICE_TOKEN,
+    // `async`, because the seam is now `() => Promise<string>`: the bearer is MINTED at the moment
+    // the header is built rather than read once at boot. Every case in this file still supplies a
+    // fixed string, and that is the limit of what this file can say — see `servicetoken.test.ts`,
+    // which drives `buildUpstreams` past a token's own expiry because a suite of cases that each
+    // build their own client is exactly what could not see micro-org #222.
+    serviceToken: async () => SERVICE_TOKEN,
     ...overrides,
   }
 }
