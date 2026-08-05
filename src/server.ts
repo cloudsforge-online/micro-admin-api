@@ -121,6 +121,7 @@ import {
   withIdempotency,
 } from './idempotency.ts'
 import { withInbox, SIGNATURE_HEADER, type Db } from './outbox.ts'
+import { eraseSubject } from './erasure.ts'
 // The registry, and the one place that decides which topics the operator audit log carries.
 // Read rather than restated: a decision copied into a consumer is a decision that drifts.
 import { auditRowFor, isRegisteredTopic, validateEnvelope, verifyDelivery } from '@cloudsforge/contracts-events'
@@ -134,6 +135,9 @@ export interface PrincipalVerifier {
 const MAX_BODY_BYTES = 256 * 1024
 const SAFE_REQUEST_ID = /^[A-Za-z0-9._-]{1,128}$/
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** The one topic this service does more with than mirror. See `src/erasure.ts`. */
+const USER_DELETED_TOPIC = 'identity.user.deleted'
 
 /**
  * There is no audit topic, and this constant is gone.
@@ -682,8 +686,8 @@ function buildRoutes(): Route[] {
         return { status: 202, body: { status: 'ignored', topic } }
       }
 
-      const outcome = await withInbox(deps.sql, topic, eventId, async (tx) =>
-        appendAudit(
+      const outcome = await withInbox(deps.sql, topic, eventId, async (tx) => {
+        const appended = await appendAudit(
           tx,
           {
             actor: mirrored.actor,
@@ -698,8 +702,47 @@ function buildRoutes(): Route[] {
             occurredAt: new Date(mirrored.occurredAt),
           },
           deps.now,
-        ),
-      )
+        )
+
+        // ════════════════════════════════════════════════════════════════════════════════════
+        // GDPR erasure, on top of the mirror rather than instead of it.
+        //
+        // `identity.user.deleted` is `audited: true` in `TOPIC_AUDIT`
+        // (`contracts/packages/events/src/audit.ts:117`), so the event that REQUESTS the erasure
+        // appends its own audit row above naming the subject. That row is kept deliberately: it
+        // is the evidence that the request was received and acted on, which is precisely what
+        // Art. 5(2) accountability asks for. It is then restricted on read like every other row
+        // about that subject.
+        //
+        // Everything that follows — why the chain is not rewritten, which Article retains it,
+        // what IS erased and what is merely restricted, and the per-table decision — is the
+        // header of `src/erasure.ts`. It lives there and not here because it is long, and
+        // because it must sit beside the code that implements it rather than beside the
+        // dispatch that calls it.
+        //
+        // In the SAME transaction as the mirror and the inbox claim, so the audit row, the
+        // register entry and the acknowledgement cannot disagree about whether this happened.
+        // ════════════════════════════════════════════════════════════════════════════════════
+        if (topic !== USER_DELETED_TOPIC) return { audit: appended, erasure: null }
+
+        const payload = event.payload as Record<string, unknown>
+        // `payload.userId`, not `envelope.actor`: on this topic the actor is whoever ASKED for
+        // the deletion, which is the deleted user only when they deleted themselves.
+        const named = typeof payload['userId'] === 'string' ? payload['userId'] : ''
+        // identity sends a bare uuid; the `user:<uuid>` ledger spelling is stripped explicitly
+        // because `audit_events.subject_id` and `approvals.subject_id` hold the bare form.
+        const userId = named.startsWith('user:') ? named.slice('user:'.length) : named
+        if (!UUID.test(userId)) {
+          throw new BadRequestError('identity.user.deleted requires a uuid userId')
+        }
+        const erasure = await eraseSubject(tx, {
+          userId,
+          sourceEventId: eventId,
+          tombstoneAt: typeof payload['tombstoneAt'] === 'string' ? payload['tombstoneAt'] : null,
+          reason: typeof payload['reason'] === 'string' ? payload['reason'] : null,
+        })
+        return { audit: appended, erasure }
+      })
       if (outcome.status === 'duplicate') {
         return { status: 200, body: { status: 'duplicate', eventId } }
       }
@@ -707,7 +750,24 @@ function buildRoutes(): Route[] {
         source: sender,
         outcome: mirrored.outcome,
       })
-      return { status: 201, body: { status: 'recorded', seq: outcome.value.seq.toString(), hash: outcome.value.hash } }
+      const erasure = outcome.value.erasure
+      if (erasure) {
+        // Counts and column names only. Never the subject id.
+        ctx.log.info('subject erasure registered', {
+          registered: erasure.registered,
+          approvalsAnonymised: erasure.approvalsAnonymised,
+          auditRowsRestricted: erasure.auditRowsRestricted,
+        })
+      }
+      return {
+        status: 201,
+        body: {
+          status: 'recorded',
+          seq: outcome.value.audit.seq.toString(),
+          hash: outcome.value.audit.hash,
+          ...(erasure ? { erasure } : {}),
+        },
+      }
     }),
 
     /* ---------------------------------------------------------------- audit reads */

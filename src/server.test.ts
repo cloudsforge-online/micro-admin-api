@@ -30,7 +30,7 @@ import { createHmac } from 'node:crypto'
  */
 import { DELIVERY_TOLERANCE_MS, SIGNATURE_HEADER, signDelivery } from '@cloudsforge/contracts-events'
 import { READ_SCOPE } from './scopes.ts'
-import { verifyChain } from './audit.ts'
+import { readAudit, verifyChain, type AuditRow } from './audit.ts'
 import {
   ALICE,
   BOB,
@@ -1149,6 +1149,205 @@ test('an unknown severity is refused', { skip }, async () => {
 test('a retracted broadcast that does not exist is 404', { skip }, async () => {
   const res = await h().request('DELETE', '/v1/broadcasts/99999999-9999-4999-8999-999999999999', { token: ONE })
   assert.equal(res.status, 404)
+})
+
+/* ------------------------------------------------------------------ GDPR erasure */
+
+/**
+ * `identity.user.deleted` as identity actually sends it: `{ userId, tombstoneAt, reason }` with the
+ * envelope key set to the bare user id (`identity/src/deletion.ts:113-125`). The actor is the
+ * operator who raised it, NOT the deleted user — which is the normal case for a support-raised
+ * deletion and the case a handler reading `envelope.actor` gets wrong.
+ */
+const ERASED_USER = '018f0000-0000-7000-8000-0000000000aa'
+
+function deletionEnvelope(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: '88888888-8888-4888-8888-888888888888',
+    topic: 'identity.user.deleted',
+    key: ERASED_USER,
+    occurredAt: '2026-08-01T00:00:00.000Z',
+    producer: 'identity',
+    version: '1.0',
+    actor: OPERATOR_ONE,
+    correlationId: 'req-erasure',
+    payload: {
+      userId: ERASED_USER,
+      tombstoneAt: '2026-09-01T00:00:00.000Z',
+      reason: 'user_requested',
+    },
+    ...overrides,
+  }
+}
+
+async function deliverDeletion(overrides: Record<string, unknown> = {}): Promise<number> {
+  const signed = sign(deletionEnvelope(overrides))
+  const res = await h().request('POST', '/v1/events', {
+    headers: { [SIGNATURE_HEADER]: signed.signature, 'content-type': 'application/json' },
+    body: signed.raw,
+  })
+  return res.status
+}
+
+test('ERASURE: the audit chain is NOT rewritten, and still verifies afterwards', { skip }, async () => {
+  // ════════════════════════════════════════════════════════════════════════════════════════
+  // The decision this whole design turns on. `audit_events` is a hash chain over `subject_id`
+  // and `payload`, so rewriting either invalidates that row's hash and every hash after it —
+  // and a chain that has been legitimately rewritten once is indistinguishable from one an
+  // operator rewrote to cover a theft. The rows are RETAINED under Art. 17(3)(b) and (e), and
+  // withheld from the read surface under Art. 18 instead. `src/erasure.ts` carries the argument.
+  // ════════════════════════════════════════════════════════════════════════════════════════
+  const signed = sign(
+    mirrorEnvelope({
+      id: '99999999-9999-4999-8999-999999999999',
+      topic: 'identity.mfa.removed',
+      producer: 'identity',
+      key: ERASED_USER,
+      payload: { method: 'totp' },
+    }),
+  )
+  await h().request('POST', '/v1/events', {
+    headers: { [SIGNATURE_HEADER]: signed.signature, 'content-type': 'application/json' },
+    body: signed.raw,
+  })
+  const [before] = await sql!<{ n: string; h: string }[]>`
+    select count(*) as n, max(hash) as h from audit_events`
+
+  assert.equal(await deliverDeletion(), 201)
+
+  // Not one hashed byte moved. The row about the erased user is still exactly the row that was
+  // appended, which is the property that makes this log evidence.
+  const [after] = await sql!<{ n: string }[]>`
+    select count(*) as n from audit_events where subject_id = ${ERASED_USER}`
+  assert.ok(Number(after?.n) >= 1, 'the audit rows about the subject were deleted')
+  assert.equal((await verifyChain(sql!, { from: 0n })).ok, true, 'erasure broke the hash chain')
+  assert.ok(before?.h)
+})
+
+test('ERASURE: the read surface withholds the subject and the mirrored payload', { skip }, async () => {
+  const signed = sign(
+    mirrorEnvelope({
+      id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      topic: 'identity.mfa.removed',
+      producer: 'identity',
+      key: ERASED_USER,
+      // The payload is a mirrored copy of a producer's envelope and is the only column here that
+      // can carry an actual name or handle. It is the half that matters most.
+      payload: { method: 'totp', handle: 'spiros' },
+    }),
+  )
+  await h().request('POST', '/v1/events', {
+    headers: { [SIGNATURE_HEADER]: signed.signature, 'content-type': 'application/json' },
+    body: signed.raw,
+  })
+
+  const visible = await readAudit(sql!, { subjectKind: 'user', subjectId: ERASED_USER })
+  assert.ok(visible.events.length >= 1, 'the fixture wrote no row, so this test proves nothing')
+  assert.equal(visible.events[0]?.subjectId, ERASED_USER)
+  assert.deepEqual(visible.events[0]?.payload, { method: 'totp', handle: 'spiros' })
+
+  assert.equal(await deliverDeletion(), 201)
+
+  const page = await readAudit(sql!, { subjectKind: 'user' })
+  const mine = page.events.filter((e: AuditRow) => e.action === 'identity.mfa.removed')
+  assert.ok(mine.length >= 1)
+  for (const row of mine) {
+    assert.equal(row.subjectId, 'erased:restricted', 'the subject id was disclosed after erasure')
+    assert.deepEqual(row.payload, {}, 'the mirrored payload was disclosed after erasure')
+    // The actor is NOT restricted: it names the operator who acted, not the customer.
+    assert.equal(row.actor, OPERATOR_ONE)
+    // The hashes still read, because they are the evidence the chain is intact and a digest is
+    // not a re-identification path.
+    assert.match(row.hash, /^[0-9a-f]{64}$/)
+  }
+})
+
+test('ERASURE: a non-user subject sharing the id is untouched', { skip }, async () => {
+  // ════════════════════════════════════════════════════════════════════════════════════════
+  // `audit_events.subject_id` is deliberately `text` and may name a ledger entry, a market case
+  // or an on-chain hash (`migrations.ts:39-40`). Matching on the id alone would restrict — from
+  // every operator read, during an incident — an audit row about a movement of money that no
+  // data subject ever asked about. Only `subject_kind = 'user'` is in scope.
+  // ════════════════════════════════════════════════════════════════════════════════════════
+  const signed = sign(
+    mirrorEnvelope({
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      topic: 'ledger.entry.posted',
+      producer: 'ledger',
+      // A ledger entry whose id happens to be the same string as the erased user's.
+      key: ERASED_USER,
+      payload: { amount: '1000' },
+    }),
+  )
+  await h().request('POST', '/v1/events', {
+    headers: { [SIGNATURE_HEADER]: signed.signature, 'content-type': 'application/json' },
+    body: signed.raw,
+  })
+  assert.equal(await deliverDeletion(), 201)
+
+  const ledgerRows = await readAudit(sql!, { subjectKind: 'ledger_entry' })
+  const posted = ledgerRows.events.filter((e: AuditRow) => e.action === 'ledger.entry.posted')
+  assert.ok(posted.length >= 1, 'the ledger fixture did not land')
+  assert.equal(posted[0]?.subjectId, ERASED_USER, 'a ledger entry was restricted by a user erasure')
+  assert.deepEqual(posted[0]?.payload, { amount: '1000' })
+
+  // And the register itself refuses to hold anything but a user.
+  await assert.rejects(
+    () => sql!`
+      insert into audit_subject_erasures (subject_kind, subject_id, source_event_id)
+      values ('ledger_entry', ${ERASED_USER}, ${'cccccccc-cccc-4ccc-8ccc-cccccccccccc'})`,
+    /audit_subject_erasures_user_only/,
+  )
+})
+
+test('ERASURE: an approval about the user is anonymised, and four eyes survive', { skip }, async () => {
+  // `approvals` is NOT hash-chained, so the subject CAN be genuinely de-linked rather than merely
+  // restricted. What must survive is the four-eyes evidence — two distinct operators — and that
+  // does not need to know which customer the action was about.
+  const requested = await h().request('POST', '/v1/approvals', {
+    token: ONE,
+    headers: { 'idempotency-key': freshKey() },
+    body: {
+      // The only action in the registry whose subject IS a user (`actions.ts:312`); every other
+      // one names a ledger entry, a moderation case or an entitlement. `subject_kind` comes from
+      // the action rather than from the body, which is what makes that true rather than hoped.
+      action: 'identity.role.grant',
+      subjectId: ERASED_USER,
+      params: { role: 'admin' },
+      reasonCode: 'regulatory_request',
+      reason: 'granting the operator role after an access review',
+    },
+  })
+  assert.equal(requested.status, 201)
+
+  assert.equal(await deliverDeletion(), 201)
+
+  const [approval] = await sql!<{ subject_id: string; requested_by: string }[]>`
+    select subject_id, requested_by from approvals`
+  assert.equal(approval?.subject_id, 'erased:restricted', 'the approval still names the customer')
+  // The operator attribution is retained: an approval whose operators are anonymous cannot
+  // evidence that two people were involved, which is the control the table exists to enforce.
+  assert.equal(approval?.requested_by, OPERATOR_ONE)
+})
+
+test('ERASURE: the register is append-only and a redelivery is a duplicate', { skip }, async () => {
+  assert.equal(await deliverDeletion(), 201)
+  // Same event id: the inbox dedupes it, so nothing is registered twice.
+  assert.equal(await deliverDeletion(), 200)
+
+  const rows = await sql!<{ subject_id: string }[]>`select subject_id from audit_subject_erasures`
+  assert.equal(rows.length, 1)
+
+  // An erasure is a fact, not configuration. Every restriction on the read path derives from this
+  // table, so a DELETE here would silently re-expose every audit row about that person.
+  await assert.rejects(
+    () => sql!`delete from audit_subject_erasures where subject_id = ${ERASED_USER}`,
+    /append-only/,
+  )
+  await assert.rejects(
+    () => sql!`update audit_subject_erasures set subject_id = 'someone-else'`,
+    /append-only/,
+  )
 })
 
 /* ------------------------------------------------------------------ bodies */

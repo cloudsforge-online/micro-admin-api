@@ -587,6 +587,89 @@ export const MIGRATIONS: readonly Migration[] = [
         for each row execute function engagement_transfer_within_cap();
     `,
   },
+
+  {
+    version: 9,
+    name: 'erasure-register',
+    up: `
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+      -- THE ERASURE REGISTER, AND WHY THE AUDIT LOG ITSELF IS NOT TOUCHED.
+      --
+      -- The full argument, with the Article numbers, is the header of \`src/erasure.ts\`. The short
+      -- form: \`audit_events\` is a hash chain over \`subject_id\` and \`payload\` among other
+      -- columns, so rewriting either invalidates that row's hash and every hash after it. An audit
+      -- trail exists so that it cannot be edited by the person it records, and the subject of an
+      -- admin action is frequently the person with the strongest motive to edit it. The rows are
+      -- RETAINED under Art. 17(3)(b) — AML/CTF record-keeping — and 17(3)(e) — defence of legal
+      -- claims — and withheld from every read surface under Art. 18 instead.
+      --
+      -- This table is what makes that withholding possible, and what makes the retention
+      -- defensible: Art. 5(2) requires us to be able to DEMONSTRATE compliance, and "we kept it
+      -- under 17(3)" is not demonstrable without a record of who asked and when.
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+      create table if not exists audit_subject_erasures (
+        subject_kind    text        not null,
+        subject_id      text        not null,
+        -- The event that requested it. Unique, so a redelivery cannot register a second erasure
+        -- and a register entry can always be traced back to the delivery that caused it.
+        source_event_id uuid        not null,
+        -- identity's deadline, carried on the event so we do not have to know its configuration.
+        tombstone_at    timestamptz,
+        reason          text,
+        erased_at       timestamptz not null default now(),
+
+        constraint audit_subject_erasures_pk primary key (subject_kind, subject_id),
+        constraint audit_subject_erasures_event_uniq unique (source_event_id),
+
+        -- ══════════════════════════════════════════════════════════════════════════════════
+        -- ONLY A USER MAY BE ERASED, AND THE DATABASE IS WHAT SAYS SO.
+        --
+        -- \`audit_events.subject_id\` is deliberately \`text\` rather than a uuid, because the
+        -- subject may be a ledger entry id, a market case id, an account handle or an on-chain
+        -- hash (migrations.ts:39-40). Only a subject that IS a person is in scope for erasure.
+        --
+        -- Without this, a register row naming a ledger entry would silently restrict — from every
+        -- operator read, during an incident — an audit row about a movement of money that no
+        -- data subject ever asked about, and nothing would look wrong. The handler filters on
+        -- \`subject_kind\` too; this is the half that survives somebody editing the handler.
+        -- ══════════════════════════════════════════════════════════════════════════════════
+        constraint audit_subject_erasures_user_only check (subject_kind = 'user')
+      );
+
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+      -- AN ERASURE, ONCE REGISTERED, CANNOT BE WITHDRAWN.
+      --
+      -- Every restriction on the read path is derived from this table, so a DELETE here silently
+      -- un-restricts every audit row about that person and re-exposes their subject id and the
+      -- mirrored payloads beside it. An UPDATE that changed \`subject_id\` would do the same to one
+      -- person while restricting an unrelated one.
+      --
+      -- There is no legitimate caller for either. An erasure is a fact about something that
+      -- happened; it is not configuration. Registering the same subject twice is already handled
+      -- by \`on conflict do nothing\` in the handler, which needs no UPDATE.
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+      create or replace function audit_erasure_register_is_final() returns trigger
+        language plpgsql
+      as $$
+      begin
+        raise exception
+          'the erasure register is append-only; an erasure cannot be withdrawn or re-pointed'
+          using errcode = 'check_violation';
+      end;
+      $$;
+
+      drop trigger if exists audit_subject_erasures_immutable on audit_subject_erasures;
+      create trigger audit_subject_erasures_immutable
+        before update or delete on audit_subject_erasures
+        for each row execute function audit_erasure_register_is_final();
+
+      -- Erasure de-links the subject of a four-eyes approval — that table is NOT hash-chained, so
+      -- it can be genuinely anonymised rather than merely restricted. The lookup is on both
+      -- columns, because matching \`subject_id\` alone would rewrite an approval about a ledger
+      -- entry that happens to share the uuid.
+      create index if not exists approvals_subject_idx on approvals (subject_kind, subject_id);
+    `,
+  },
 ]
 
 /**
@@ -616,6 +699,7 @@ export const TABLES: readonly string[] = Object.freeze([
   'engagement_policies',
   'engagement_fee_recycle',
   'audit_chain_checkpoints',
+  'audit_subject_erasures',
   'audit_events',
   'approvals',
   'broadcasts',

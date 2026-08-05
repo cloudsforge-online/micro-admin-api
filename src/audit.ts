@@ -45,6 +45,7 @@
  */
 
 import { createHash } from 'node:crypto'
+import { ERASABLE_SUBJECT_KIND, RESTRICTED_SUBJECT, erasedSubjects } from './erasure.ts'
 import type { Sql, TransactionSql } from 'postgres'
 
 export type Db = Sql
@@ -515,25 +516,61 @@ export async function readAudit(sql: Db, query: AuditQuery = {}): Promise<AuditP
 
   const page = rows.slice(0, limit)
   const last = page[page.length - 1]
+
+  // ══════════════════════════════════════════════════════════════════════════════════════════
+  // RESTRICTION OF PROCESSING (Art. 18), APPLIED HERE BECAUSE IT CANNOT BE APPLIED TO THE ROW.
+  //
+  // The stored row is never edited — it is hash-chained, and `src/erasure.ts` carries the full
+  // argument for why that makes in-place erasure unavailable and which lawful basis retains it.
+  // What CAN be withdrawn is the disclosure, and this is the only place the log is disclosed.
+  //
+  // `payload` is the half that matters most. It is a mirrored copy of a producer's envelope and
+  // is the only column in this table that can carry an actual name, handle or address, so it is
+  // replaced wholesale rather than filtered — a key-by-key allowlist over somebody else's payload
+  // shape is a rule that silently stops covering a field the day a producer adds one.
+  //
+  // Applied AFTER the page is selected, deliberately. Filtering erased subjects out of the query
+  // would change `nextCursor` and the page size, so an operator paging through the log would see
+  // pages of varying length and could infer exactly which rows were erased from the gaps — which
+  // is the linkage this is meant to prevent.
+  //
+  // There is no unredacted route past this: no query parameter, no scope, no admin flag. Reading
+  // the raw row means direct database access, which is a break-glass with its own controls, and
+  // that is the right place for that decision to be made.
+  // ══════════════════════════════════════════════════════════════════════════════════════════
+  const userSubjects = page
+    .filter((row) => row.subject_kind === ERASABLE_SUBJECT_KIND)
+    .map((row) => row.subject_id)
+  const erased = await erasedSubjects(sql, userSubjects)
+
   return {
-    events: page.map((row) => ({
-      seq: BigInt(row.seq),
-      id: row.id,
-      occurredAt: row.occurred_at.toISOString(),
-      recordedAt: row.recorded_at.toISOString(),
-      actor: row.actor,
-      action: row.action,
-      subjectKind: row.subject_kind,
-      subjectId: row.subject_id,
-      reasonCode: row.reason_code,
-      outcome: row.outcome as AuditOutcome,
-      source: row.source,
-      sourceEventId: row.source_event_id,
-      correlationId: row.correlation_id,
-      payload: row.payload,
-      prevHash: row.prev_hash,
-      hash: row.hash,
-    })),
+    events: page.map((row) => {
+      const restricted =
+        row.subject_kind === ERASABLE_SUBJECT_KIND && erased.has(row.subject_id)
+      return {
+        seq: BigInt(row.seq),
+        id: row.id,
+        occurredAt: row.occurred_at.toISOString(),
+        recordedAt: row.recorded_at.toISOString(),
+        // `actor` is NOT restricted: it names the operator who acted, not the customer. An audit
+        // whose actors are anonymous is not an audit. See `erasure.ts`'s per-table decision.
+        actor: row.actor,
+        action: row.action,
+        subjectKind: row.subject_kind,
+        subjectId: restricted ? RESTRICTED_SUBJECT : row.subject_id,
+        reasonCode: row.reason_code,
+        outcome: row.outcome as AuditOutcome,
+        source: row.source,
+        sourceEventId: row.source_event_id,
+        correlationId: row.correlation_id,
+        payload: restricted ? {} : row.payload,
+        // The hashes are returned unchanged, and that is correct rather than an oversight: they
+        // are the evidence the chain is intact, they are derived from data the reader is not
+        // being shown, and a digest is not a re-identification path.
+        prevHash: row.prev_hash,
+        hash: row.hash,
+      }
+    }),
     nextCursor: rows.length > limit && last ? last.seq : null,
   }
 }
