@@ -50,23 +50,22 @@ jobs:
         # never made its credential optional. So it cannot simply be omitted the way theirs are:
         # the container would exit at import and never answer /livez.
         #
-        # There is no `@generate` form for a credential, because `openssl rand` produces a key and
-        # identity mints a credential AGAINST A ROW. The proper fix is a `@credential` expansion in
-        # micro-org's `service-ci.yml` beside the existing one; that repository is not this one.
+        # `@generate` cannot serve it either: `openssl rand` produces a base64 KEY, and this slot
+        # needs `cfsc_` + base64url. So this line used to carry a readable literal,
+        # `cfsc_ci-only-NOT-a-real-credential-…`, with a note saying it passed ONLY because
+        # `assertServiceCredential` ran no placeholder-marker check, and that the day that check
+        # was added this line should go red and move to a `@credential` form.
         #
-        # Until then: a fixture with the right SHAPE and deliberately the wrong LOOK. It is 43
-        # base64url characters, which is the 32-byte floor exactly, and it is READABLE ON PURPOSE
-        # so that nobody can mistake it for a credential identity minted or copy it into a deploy —
-        # a random-looking literal committed here would be indistinguishable from the real thing,
-        # which is the objection `service-ci.yml` itself raises against committed key-shaped
-        # strings. Nothing accepts it; the smoke test presents it to nobody.
+        # That day is today. The marker check is in @cloudsforge/secrets 1.2.0 — a `cfsc_` prefix
+        # on a placeholder was a hole big enough to boot a real service — and `service-ci.yml` now
+        # has the `@credential` expansion the note asked for. It mints `cfsc_` + 43 base64url
+        # characters per run, which is the 32-byte floor exactly, and throws it away.
         #
-        # NOTE FOR WHOEVER CLOSES THE GAP: this passes only because `assertServiceCredential` runs
-        # no placeholder-MARKER check, unlike `assertGeneratedSecret` and `assertOpaqueSecret`. The
-        # day that marker check is added to the credential path — and it should be — this line
-        # goes red and must move to the `@credential` form. That is the intended failure, not a
-        # surprise.
-        ADMIN_API_SERVICE_TOKEN=cfsc_ci-only-NOT-a-real-credential-1234567890XYZ
+        # A per-run value is better than the literal for the reason `service-ci.yml` already gives
+        # about committed key-shaped strings, and for one more: the base64url alphabet means the
+        # minted value contains a hyphen about five runs in six, so CI exercises BOTH the mainnet
+        # (alphanumeric) and testnet (hyphenated) credential shapes on its own.
+        ADMIN_API_SERVICE_TOKEN=@credential
         IDENTITY_JWKS_URL=http://127.0.0.1:4001/.well-known/jwks.json
         IDENTITY_ISSUER=http://127.0.0.1:4001
         IDENTITY_URL=http://127.0.0.1:4001
