@@ -6,8 +6,23 @@
  * make the failures specific.
  */
 
+import { randomBytes } from 'node:crypto'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+
+/**
+ * A service credential, and THIS FIXTURE CONTAINS HYPHENS ON PURPOSE — that is the most important
+ * thing about it.
+ *
+ * A credential body is base64**url**, so `-` and `_` are in its alphabet. Measured on the running
+ * estates: the mainnet credential is alphanumeric and the testnet one CONTAINS A HYPHEN. So a
+ * "secrets have no hyphens" rule — which is correct for the signing key below, and which every
+ * placeholder this estate wrote would have failed — passes mainnet and kills testnet at boot.
+ *
+ * Keeping a hyphenated credential here means that mistake fails CI instead of failing one estate
+ * in production. Do not "tidy" the hyphens out of this value.
+ */
+const CREDENTIAL = 'cfsc_TToR-eOeVTDnqhX1-nu6-u7DoCr4MCfa86g4g6kd404'
 
 /**
  * A valid environment, applied to the process BEFORE `./env.ts` is imported.
@@ -19,12 +34,22 @@ const REQUIRED: Record<string, string> = {
   ADMIN_API_DATABASE_URL: 'postgres://admin:admin@127.0.0.1:5432/admin_api',
   IDENTITY_JWKS_URL: 'http://127.0.0.1:4001/.well-known/jwks.json',
   IDENTITY_ISSUER: 'http://127.0.0.1:4001',
-  OUTBOX_SIGNING_SECRET: 'a-real-looking-secret-of-sufficient-length',
+  // GENERATED, not written. The literal that used to sit here was
+  // `a-real-looking-secret-of-sufficient-length` — hyphenated, 42 characters, and therefore past
+  // the old 24-character floor. It is the same family of value as micro-org #142's
+  // `estate-only-outbox-secret-00000000000000`, which reached 44 containers unchallenged; every
+  // test in this file was built on it, so the suite was asserting that a "real-LOOKING" secret is
+  // a real one. `openssl rand -base64 48` is what the runbook already tells an operator to run.
+  OUTBOX_SIGNING_SECRET: randomBytes(48).toString('base64'),
   IDENTITY_URL: 'http://127.0.0.1:4001',
   LEDGER_URL: 'http://127.0.0.1:4007',
   MARKET_URL: 'http://127.0.0.1:4013',
   BILLING_URL: 'http://127.0.0.1:4009',
-  ADMIN_API_SERVICE_TOKEN: 'a-real-looking-token-of-sufficient-length',
+  // A CREDENTIAL, despite the name. `a-real-looking-token-of-sufficient-length` used to sit here,
+  // which is neither a credential nor a token — it is a sentence. The live value measured on
+  // 2026-08-05 was a 701-byte JWT that had expired 26 hours earlier, and the fixture agreeing with
+  // neither shape is how a suite stays green over a service that cannot reach the ledger.
+  ADMIN_API_SERVICE_TOKEN: CREDENTIAL,
   // Required with NO default, deliberately — a default answer to "which estate am I?" is how a
   // testnet backup gets restored over mainnet balances. `testnet` here, never `mainnet`, so a
   // fixture can never stand in for the environment where the refusal actually matters.
@@ -36,11 +61,19 @@ for (const [key, value] of Object.entries(REQUIRED)) process.env[key] = value
 const { EnvError, SERVICE, env, loadEnv, parseSecretList } = await import('./env.ts')
 
 /**
- * Obviously fake, and long enough to pass the 24-character rule. Never a real value: a secret in a
- * test fixture is a secret in the repository, and this file is public.
+ * "The new one" and "the one being rotated out" for the acceptance-list cases below.
+ *
+ * These were `accept-secret-newest-0000000000000000` and `accept-secret-superseded-00000000000`,
+ * whose own comment said they were "long enough to pass the 24-character rule". That is the defect
+ * stated out loud: both are hyphenated, zero-padded placeholders of exactly the family that
+ * reached 44 containers as micro-org #142, and this suite asserted they were VALID secrets.
+ *
+ * Generated rather than replaced with better-looking literals, so a placeholder cannot creep back
+ * in the next time somebody needs a fixture. They are still never real values — a secret in a test
+ * fixture is a secret in the repository, and this file is public — but they are now real SHAPES.
  */
-const NEWEST = 'accept-secret-newest-0000000000000000'
-const SUPERSEDED = 'accept-secret-superseded-00000000000'
+const NEWEST = randomBytes(48).toString('base64')
+const SUPERSEDED = randomBytes(48).toString('base64')
 
 const withEnv = (overrides: Record<string, string | undefined> = {}) => ({ ...REQUIRED, ...overrides })
 
@@ -67,19 +100,102 @@ test('every required variable names itself when it is missing', () => {
 })
 
 test('a known placeholder is refused rather than booted with', () => {
-  for (const name of ['OUTBOX_SIGNING_SECRET', 'ADMIN_API_SERVICE_TOKEN']) {
+  // Both variables refuse it, but NOT by the same rule, and the split is the whole of this change:
+  // one is a key this estate generates, the other is a credential identity mints. The old suite
+  // ran one loop over both names because the service ran one function over both values.
+  assert.throws(
+    () => loadEnv(withEnv({ OUTBOX_SIGNING_SECRET: 'CHANGE_ME' })),
+    /known placeholder/,
+  )
+  assert.throws(
+    () => loadEnv(withEnv({ ADMIN_API_SERVICE_TOKEN: 'CHANGE_ME' })),
+    (err: unknown) =>
+      err instanceof EnvError &&
+      /ADMIN_API_SERVICE_TOKEN/.test(err.message) &&
+      /not a service credential/.test(err.message),
+  )
+
+  // THE ONE THE OLD DENY-LIST COULD NOT CATCH, AND THE REASON THE LIST IS GONE. This exact
+  // 40-character string is `deploy/compose/docker-compose.estate.yml`'s default for this
+  // service's own credential; the outbox sibling of it reached 44 containers as micro-org #142.
+  // Neither was on anybody's list of exact strings, and neither could be — the next placeholder
+  // somebody writes is by definition not on the list. Both are refused now for a property they
+  // cannot shed, and neither message may echo the value.
+  for (const [name, value] of [
+    ['OUTBOX_SIGNING_SECRET', 'estate-only-outbox-secret-00000000000000'],
+    ['ADMIN_API_SERVICE_TOKEN', 'estate-placeholder-token-0000000000000000'],
+  ] as const) {
     assert.throws(
-      () => loadEnv(withEnv({ [name]: 'CHANGE_ME' })),
-      /known placeholder/,
-      `${name} should refuse a placeholder`,
+      () => loadEnv(withEnv({ [name]: value })),
+      (err: unknown) =>
+        err instanceof EnvError && new RegExp(name).test(err.message) && !err.message.includes(value),
+      `${name} must refuse the estate's own placeholder without echoing it`,
     )
   }
 })
 
-test('a short secret is refused — length is the only entropy proxy available here', () => {
-  assert.throws(() => loadEnv(withEnv({ OUTBOX_SIGNING_SECRET: 'short' })), /at least 24 characters/)
-  // Set above the point at which a human-chosen string is plausible, so a memorable password fails.
-  assert.throws(() => loadEnv(withEnv({ ADMIN_API_SERVICE_TOKEN: 'correct-horse-battery' })), /at least 24/)
+test('a short secret is refused, and the unit is BYTES rather than keystrokes', () => {
+  // These assertions used to demand the message say "at least 24 characters" — the keystroke floor
+  // that let micro-org #142's 40-character placeholder through every service in the estate.
+  // Pinning that wording made the test a defence of the defective rule: any fix that stopped
+  // counting characters would fail CI, however much better the new rule was.
+  //
+  // What they assert now is the PROPERTY that matters. `hunter2` happens to be spelled in the
+  // base64 alphabet, so it is not the alphabet that catches it — it decodes to 5 bytes.
+  assert.throws(
+    () => loadEnv(withEnv({ OUTBOX_SIGNING_SECRET: 'hunter2' })),
+    (err: unknown) =>
+      err instanceof EnvError &&
+      /5 bytes of key material/.test(err.message) &&
+      /at least 32/.test(err.message) &&
+      !err.message.includes('hunter2'),
+  )
+  // A credential is measured the same way, off its base64url body. `cfsc_short` is a deployment
+  // that BELIEVES it has a credential — worse than one that knows it has none, because it fails at
+  // the ledger with a 401 that reads as "ledger rejected admin-api".
+  assert.throws(
+    () => loadEnv(withEnv({ ADMIN_API_SERVICE_TOKEN: 'cfsc_short' })),
+    (err: unknown) =>
+      err instanceof EnvError &&
+      /ADMIN_API_SERVICE_TOKEN/.test(err.message) &&
+      /at least 32/.test(err.message) &&
+      !err.message.includes('cfsc_short'),
+  )
+})
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **#222: THE LIVE VALUE OF THIS VARIABLE IS AN EXPIRED JWT, AND THIS IS THE TEST THAT SAYS SO.**
+ *
+ * Measured on 2026-08-05: `ADMIN_API_SERVICE_TOKEN` held a 701-byte JWT that had expired 26 hours
+ * earlier, on a container reporting healthy. `upstreams.ts` puts that value in the `authorization`
+ * header of every ledger call, so every reversal and trial-balance read since the expiry answered
+ * 401 while `/livez` stayed green — a privileged BFF that cannot reach the ledger and does not say
+ * so anywhere an operator looks.
+ *
+ * A token is not a credential. A JWT is minted with a short life and is read HERE ONLY AT BOOT, so
+ * it is dead on the next restart at the latest; a credential confers nothing by itself, is
+ * revocable, and survives a restart. The refusal is therefore correct rather than inconvenient,
+ * and it must stay a refusal: there is no JWT exemption, no fallback to a weaker assertion, and
+ * this variable is not made optional to dodge the problem.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+test('ADMIN_API_SERVICE_TOKEN refuses a JWT by name, however well-formed it is', () => {
+  // Header and payload segments only; the guard matches SHAPE and never decodes, because this is a
+  // refusal rather than a parse. The value is not a real token and carries no signature.
+  const jwt = `eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.${randomBytes(400).toString('base64url')}.sig`
+  assert.throws(
+    () => loadEnv(withEnv({ ADMIN_API_SERVICE_TOKEN: jwt })),
+    (err: unknown) =>
+      err instanceof EnvError &&
+      /ADMIN_API_SERVICE_TOKEN/.test(err.message) &&
+      /TOKEN, not a credential/.test(err.message) &&
+      // Not one byte of it. A 701-byte JWT echoed into a fatal log line is a bearer token in the
+      // log collector, which is a wider audience than the file it came from.
+      !err.message.includes(jwt.slice(0, 40)),
+  )
+  // And the credential it must be replaced with loads, hyphens and all.
+  assert.equal(loadEnv(withEnv({ ADMIN_API_SERVICE_TOKEN: CREDENTIAL })).serviceToken, CREDENTIAL)
 })
 
 /* ---------------------------------------------------------- the rotation overlap window */
@@ -114,7 +230,17 @@ test('OUTBOX_ACCEPT_SECRETS takes a list newest first, which is the overlap wind
 test('every entry in OUTBOX_ACCEPT_SECRETS is validated exactly like the signing secret', () => {
   // No escape hatch: a list is not a way to smuggle in a value that would be refused on its own.
   assert.throws(() => loadEnv(withEnv({ OUTBOX_ACCEPT_SECRETS: `${NEWEST},changeme` })), /known placeholder/)
-  assert.throws(() => loadEnv(withEnv({ OUTBOX_ACCEPT_SECRETS: `${NEWEST},short` })), /at least 24 characters/)
+  // The index matters, and it is what replaced the old `/at least 24 characters/` assertion: an
+  // operator with the file open counts commas, so the message must name WHICH entry failed — and
+  // must not carry the entry itself.
+  assert.throws(
+    () => loadEnv(withEnv({ OUTBOX_ACCEPT_SECRETS: `${NEWEST},hunter2` })),
+    (err: unknown) =>
+      err instanceof EnvError &&
+      /OUTBOX_ACCEPT_SECRETS\[1\]/.test(err.message) &&
+      /at least 32/.test(err.message) &&
+      !err.message.includes('hunter2'),
+  )
   assert.throws(() => parseSecretList('', 'X'), EnvError)
   assert.throws(() => parseSecretList(' , , ', 'X'), EnvError)
 })

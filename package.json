@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/admin-api",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "description": "The operator BFF. Cross-service operator actions behind an approval queue that refuses self-approval, a tamper-evident hash-chained audit mirror, feature flags and broadcasts. Supersedes the frozen platform/services/nimbus admin proxies, whose audit is a log line and whose pay proxy is deleted outright now the gateway handles CORS.",
   "license": "MIT",
@@ -35,6 +35,7 @@
     "@cloudsforge/http": "link:../runtime/packages/http",
     "@cloudsforge/jobs": "link:../runtime/packages/jobs",
     "@cloudsforge/lifecycle": "link:../runtime/packages/lifecycle",
+    "@cloudsforge/secrets": "link:../runtime/packages/secrets",
     "@cloudsforge/telemetry": "link:../runtime/packages/telemetry",
     "postgres": "^3.4.5",
     "tsx": "^4.19.2"

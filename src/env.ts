@@ -11,8 +11,11 @@
  *
  *   1. **A missing variable names itself.** `undefined` propagating into a connection string
  *      surfaces four layers later as an unreadable driver error.
- *   2. **A known placeholder is refused outright.** A default secret in source is not convenient,
- *      it is catastrophic, and a placeholder that boots is a placeholder that reaches production.
+ *   2. **A placeholder is refused outright.** A default secret in source is not convenient, it is
+ *      catastrophic, and a placeholder that boots is a placeholder that reaches production. What
+ *      makes that refusal real rather than decorative is that `@cloudsforge/secrets` checks the
+ *      SHAPE of a value rather than membership of a list of exact strings — see the block where
+ *      this file's own `PLACEHOLDERS` set used to be.
  *
  * ## Why the upstream URLs are all required and none of them is optional
  *
@@ -34,6 +37,12 @@
  */
 
 import { hostname } from 'node:os'
+import {
+  SecretError,
+  assertGeneratedSecret,
+  assertServiceCredential,
+  parseSecretList as parseSharedSecretList,
+} from '@cloudsforge/secrets'
 
 /**
  * The service's own name. A constant rather than a variable: it is a property of the repository,
@@ -50,18 +59,23 @@ export class EnvError extends Error {
   }
 }
 
-const PLACEHOLDERS = new Set([
-  'changeme',
-  'change-me',
-  'change_me',
-  'placeholder',
-  'secret',
-  'token',
-  'dev-secret',
-  'dev-outbox-signing-secret',
-  'replace-with-a-real-secret',
-  'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-])
+/**
+ * THE `PLACEHOLDERS` SET THAT USED TO BE HERE IS GONE, AND ITS ABSENCE IS THE FIX.
+ *
+ * It held ten exact strings and was paired with a 24-character floor. Neither could fail for the
+ * value that actually reached 44 containers on both networks: micro-org #142's
+ * `estate-only-outbox-secret-00000000000000` is 40 characters and was on nobody's list — and
+ * neither is `estate-placeholder-token-0000000000000000`, which is the default this repository's
+ * OWN compose block gives `ADMIN_API_SERVICE_TOKEN` (`deploy/compose/docker-compose.estate.yml`).
+ * A check that cannot fail is worse than no check, because the absence of an alarm gets read as
+ * the absence of a problem — and this service is the estate's audit of record and its privileged
+ * operator surface.
+ *
+ * A deny-list of exact strings is structurally unable to work: the next placeholder somebody
+ * writes is, by definition, not on it. `@cloudsforge/secrets` asserts the SHAPE of a value
+ * instead, which is the property a placeholder cannot have. It is imported rather than copied so
+ * that this service cannot drift from the other sixteen.
+ */
 
 type Source = Readonly<Record<string, string | undefined>>
 
@@ -71,16 +85,78 @@ function required(source: Source, name: string): string {
   return value
 }
 
-function requiredSecret(source: Source, name: string, minLength = 24): string {
+/**
+ * Re-wrap the shared guard's `SecretError` as this service's `EnvError`.
+ *
+ * `loadEnv` documents a single error class for every configuration failure, and the boot path
+ * catches that one class. The message is preserved verbatim — it already names the variable and
+ * the command that fixes it, and it never contains the value.
+ */
+function asEnvError<T>(run: () => T): T {
+  try {
+    return run()
+  } catch (err) {
+    if (err instanceof SecretError) throw new EnvError(err.message)
+    throw err
+  }
+}
+
+/**
+ * The estate's shared event-bus HMAC key — here, the only thing between an unauthenticated POST
+ * and a row written into the estate's audit of record naming any operator for any action.
+ *
+ * `assertGeneratedSecret` asserts what a placeholder cannot have: the base64 or hex alphabet (no
+ * hyphens — every placeholder this estate wrote had one), 32 decoded BYTES rather than 24
+ * keystrokes, and a measured Shannon entropy floor. The old `minLength` parameter is gone rather
+ * than kept in front: it is a strict subset of the shape check, and running it first answers a
+ * 40-character placeholder with "must be at least 24 characters" — true, useless, and about the
+ * wrong property.
+ */
+function requiredSigningSecret(source: Source, name: string): string {
   const value = required(source, name)
-  if (PLACEHOLDERS.has(value.toLowerCase())) {
-    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
-  }
-  // Length is a proxy for entropy and the only one available here. It is set above the point at
-  // which a human-chosen string is plausible, so a memorable password fails this check too.
-  if (value.length < minLength) {
-    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
-  }
+  asEnvError(() => assertGeneratedSecret(name, value))
+  return value
+}
+
+/**
+ * A SERVICE CREDENTIAL this service must have, held to `assertServiceCredential`.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THIS WILL REFUSE THE VALUE THE LIVE ESTATE IS RUNNING TODAY, AND THAT IS THE POINT — #222.**
+ *
+ * Measured live on 2026-08-05: `ADMIN_API_SERVICE_TOKEN` held a 701-byte JWT that had **expired 26
+ * hours earlier**, on a container reporting healthy. It is genuinely read — `index.ts` closes over
+ * `env.serviceToken` and `upstreams.ts` puts it in the `authorization` header of every ledger call
+ * a `{ kind: 'service' }` credential names, because `ledger/src/server.ts`'s `authorise` refuses a
+ * user principal outright. So every reversal and every trial-balance read this service has made
+ * since that expiry answered 401, while `/livez` stayed green.
+ *
+ * A JWT read once at boot is dead on the next restart at the latest; that is the ten-minute cliff
+ * (#197) wearing a variable name that looks fine. `assertServiceCredential` refuses a JWT BY NAME,
+ * so this service will now refuse to boot until a real `cfsc_` credential is minted for it with
+ * `deploy/scripts/estate-bootstrap.sh`. **No JWT exemption, no weaker assertion, and not made
+ * optional to dodge the problem**: an optional credential here would be a privileged BFF that
+ * silently cannot reach the ledger, which is the state that has been live for 26 hours and is
+ * precisely what nobody noticed. A container that will not start is the cheapest possible way to
+ * discover it.
+ *
+ * REQUIRED rather than optional, unlike wallet's and settlement's credentials. Those two are
+ * optional because CI's startup smoke test boots the image with a fixed environment; admin-api has
+ * no such job, its compose block ALWAYS sets this variable (with a placeholder default), and it
+ * has been required since the service was written. Making it optional now would be a behaviour
+ * change smuggled in under a hardening commit.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * ── WHY NOT `assertGeneratedSecret` ────────────────────────────────────────────────────────────
+ *
+ * Because it would refuse every credential this estate has ever minted. A credential is `cfsc_` +
+ * base64url, which is neither wholly base64 nor wholly hex — the underscore in its own prefix
+ * disqualifies it — and the testnet body CONTAINS A HYPHEN while the mainnet body does not, so a
+ * "no hyphens" rule passes one estate and kills the other.
+ */
+function requiredCredential(source: Source, name: string): string {
+  const value = required(source, name)
+  asEnvError(() => assertServiceCredential(name, value))
   return value
 }
 
@@ -110,28 +186,21 @@ function integer(source: Source, name: string, fallback: number, min: number, ma
  *
  * Copied from `devplatform/src/env.ts:103`, which took the shape from activity's
  * `ACTIVITY_INGEST_SECRETS`. Each entry is validated exactly as a single secret is: a list is not a
- * way to smuggle in a value that `requiredSecret` would refuse on its own.
+ * way to smuggle in a value that `requiredSigningSecret` would refuse on its own.
  */
 export function parseSecretList(raw: string, name: string): readonly string[] {
-  const entries = raw
-    .split(',')
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0)
-  if (entries.length === 0) throw new EnvError(`${name} is required — at least one secret`)
-  for (const entry of entries) {
-    if (PLACEHOLDERS.has(entry.toLowerCase())) {
-      throw new EnvError(`${name} contains a known placeholder — generate real secrets`)
-    }
-    if (entry.length < 24) {
-      throw new EnvError(`${name} entries must each be at least 24 characters`)
-    }
-  }
-  if (new Set(entries).size !== entries.length) {
-    // A duplicated secret makes the "which key verified this" answer ambiguous, and that answer is
-    // what tells an operator whether a rotation has finished and the old key can be dropped.
-    throw new EnvError(`${name} lists the same secret twice`)
-  }
-  return Object.freeze(entries)
+  // Argument order is flipped on the way through: this service's exported signature is
+  // `(raw, name)` and the shared one is `(name, raw)`. Kept rather than changed because the
+  // signature is part of this module's public surface, and a silent flip of two `string`
+  // parameters is a change the type checker cannot catch.
+  //
+  // EVERY ENTRY FACES THE FULL RULE, INCLUDING THE OUTGOING ONE. In a rotation overlap window the
+  // outgoing key is the one an attacker already holds if it leaked, and "just for the drain" is
+  // exactly how a placeholder survives the rotation that was meant to remove it. The duplicate
+  // check that used to live here moved with it, unchanged — a duplicated secret makes the "which
+  // key verified this" answer ambiguous, and that answer is what tells an operator whether a
+  // rotation has finished and the old key can be dropped.
+  return asEnvError(() => parseSharedSecretList(name, raw))
 }
 
 export interface Env {
@@ -175,7 +244,18 @@ export interface Env {
   readonly marketUrl: string
   /** Soft. Entitlement revocation is an approval action. */
   readonly billingUrl: string
-  /** The scoped service credential. Not shared: SD-05. */
+  /**
+   * The scoped service credential. Not shared: SD-05.
+   *
+   * A `cfsc_` CREDENTIAL, and the variable's `*_SERVICE_TOKEN` name is the reason to say so out
+   * loud. Four variables in this estate carry that suffix and they are not one class: measured on
+   * 2026-08-05, `SETTLEMENT_SERVICE_TOKEN` held `cfsc_` + 43 characters while this one held a
+   * 701-byte JWT, expired. A guard chosen from the NAME would have been right for one of them.
+   *
+   * Presented as `Bearer` on every ledger call — `upstreams.ts`, `{ kind: 'service' }` — because
+   * `ledger/src/server.ts`'s `authorise` refuses a user principal outright. Market and billing
+   * take the operator's own bearer instead, which is why this is the only credential here.
+   */
   readonly serviceToken: string
   readonly upstreamDeadlineMs: number
 
@@ -248,7 +328,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
   }
 
   // Read before the object literal because the accept list falls back to it.
-  const outboxSigningSecret = requiredSecret(source, 'OUTBOX_SIGNING_SECRET')
+  const outboxSigningSecret = requiredSigningSecret(source, 'OUTBOX_SIGNING_SECRET')
 
   return {
     port: integer(source, 'PORT', 4014, 1, 65_535),
@@ -270,7 +350,10 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     ledgerUrl: required(source, 'LEDGER_URL'),
     marketUrl: required(source, 'MARKET_URL'),
     billingUrl: required(source, 'BILLING_URL'),
-    serviceToken: requiredSecret(source, 'ADMIN_API_SERVICE_TOKEN'),
+    // A CREDENTIAL, not a token, whatever the variable is called. See `requiredCredential`: the
+    // live value is an expired JWT, this refuses it, and that refusal is #222 being closed rather
+    // than a regression.
+    serviceToken: requiredCredential(source, 'ADMIN_API_SERVICE_TOKEN'),
     upstreamDeadlineMs: integer(source, 'ADMIN_API_UPSTREAM_DEADLINE_MS', 5_000, 100, 60_000),
 
     // Default four hours. Long enough that a second operator in another timezone can answer,

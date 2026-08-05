@@ -26,12 +26,47 @@ jobs:
       port: 4014
       # The image startup smoke test boots the real service, and `env.ts` validates its
       # configuration at import — so the container needs the variables it declares, not just a
-      # database, or it exits before it serves /livez. These are CI-only NON-secrets: throwaway
-      # values that only have to clear a length check and a placeholder check, and URLs that are
-      # never dialled because /livez needs no upstream. Never a real credential.
+      # database, or it exits before it serves /livez. The URLs below are never dialled, because
+      # /livez makes no outbound call.
+      #
+      # THE SENTENCE THAT USED TO BE HERE — "throwaway values that only have to clear a length
+      # check and a placeholder check" — WAS THE DEFECT STATED OUT LOUD IN CONFIGURATION. A length
+      # check plus a deny-list of exact strings is precisely the pair that let micro-org #142's
+      # 40-character `estate-only-outbox-secret-…` onto 44 containers on both networks: it was long
+      # enough, and it was on nobody's list. `env.ts` now runs `@cloudsforge/secrets`, which checks
+      # the SHAPE of the value instead, and has no CI exemption on purpose.
+      #
+      # The answer is not a weaker guard. CI does not need a WEAK secret, it needs A secret —
+      # nothing in the smoke test verifies a signature against anything else — so the shared
+      # workflow expands `=@generate` into a fresh `openssl rand -base64 48` per run and throws it
+      # away (micro-org `service-ci.yml`, the `env_args` loop).
       smoke-env: |
-        OUTBOX_SIGNING_SECRET=ci-only-not-a-real-signing-value-000000
-        ADMIN_API_SERVICE_TOKEN=ci-only-not-a-real-service-value-000000
+        OUTBOX_SIGNING_SECRET=@generate
+        # ── ADMIN_API_SERVICE_TOKEN IS THE ONE VARIABLE `@generate` CANNOT SERVE ───────────────
+        #
+        # It is a `cfsc_` CREDENTIAL (micro-org #222), it is REQUIRED — `upstreams.ts` presents it
+        # on every ledger call, because `ledger/src/server.ts`'s `authorise` refuses a user
+        # principal outright — and unlike wallet, settlement, market and hub-api this service has
+        # never made its credential optional. So it cannot simply be omitted the way theirs are:
+        # the container would exit at import and never answer /livez.
+        #
+        # There is no `@generate` form for a credential, because `openssl rand` produces a key and
+        # identity mints a credential AGAINST A ROW. The proper fix is a `@credential` expansion in
+        # micro-org's `service-ci.yml` beside the existing one; that repository is not this one.
+        #
+        # Until then: a fixture with the right SHAPE and deliberately the wrong LOOK. It is 43
+        # base64url characters, which is the 32-byte floor exactly, and it is READABLE ON PURPOSE
+        # so that nobody can mistake it for a credential identity minted or copy it into a deploy —
+        # a random-looking literal committed here would be indistinguishable from the real thing,
+        # which is the objection `service-ci.yml` itself raises against committed key-shaped
+        # strings. Nothing accepts it; the smoke test presents it to nobody.
+        #
+        # NOTE FOR WHOEVER CLOSES THE GAP: this passes only because `assertServiceCredential` runs
+        # no placeholder-MARKER check, unlike `assertGeneratedSecret` and `assertOpaqueSecret`. The
+        # day that marker check is added to the credential path — and it should be — this line
+        # goes red and must move to the `@credential` form. That is the intended failure, not a
+        # surprise.
+        ADMIN_API_SERVICE_TOKEN=cfsc_ci-only-NOT-a-real-credential-1234567890XYZ
         IDENTITY_JWKS_URL=http://127.0.0.1:4001/.well-known/jwks.json
         IDENTITY_ISSUER=http://127.0.0.1:4001
         IDENTITY_URL=http://127.0.0.1:4001
