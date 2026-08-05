@@ -416,7 +416,7 @@ state.
    | Variable | Required | What it does |
    |---|---|---|
    | `OUTBOX_SIGNING_SECRET` | yes | The single key this service **signs** its own outbox deliveries with. Never a list: a producer signing under two keys has not rotated, it has forked. |
-   | `OUTBOX_ACCEPT_SECRETS` | no | Comma-separated, **newest first**. The keys `POST /v1/events` will **accept**. Unset, it is exactly `[OUTBOX_SIGNING_SECRET]`, which is today's behaviour byte for byte — so deploying this is a no-op, and that is what lets the rotation be staged one service at a time. Each entry is validated like the signing secret (no known placeholder, at least 24 characters), and a repeated entry is refused at boot. |
+   | `OUTBOX_ACCEPT_SECRETS` | no | Comma-separated, **newest first**. The keys `POST /v1/events` will **accept**. Unset, it is exactly `[OUTBOX_SIGNING_SECRET]`, which is today's behaviour byte for byte — so deploying this is a no-op, and that is what lets the rotation be staged one service at a time. Each entry is validated like the signing secret — `@cloudsforge/secrets` asserts the SHAPE of a generated key (base64 or hex, 32 decoded BYTES, an entropy floor), replacing the deny-list-plus-24-CHARACTER-floor that micro-org #142's 40-character placeholder walked straight through — and a repeated entry is refused at boot. |
 
    The duplicate rule is not tidiness. `verifyDelivery` reports the **index** of the key that
    matched, and this route logs a warning naming it whenever it is not 0. That warning going quiet
