@@ -26,6 +26,7 @@ import { Verifier } from '@cloudsforge/auth'
 import { Lifecycle, httpProbe, installSignalHandlers, postgresProbe } from '@cloudsforge/lifecycle'
 import { Logger, Metrics, registerHttpMetrics, registerJobMetrics } from '@cloudsforge/telemetry'
 import { SERVICE, env } from './env.ts'
+import { claimEstateIdentity } from './backups.ts'
 import { SCHEMA_VERSION } from './migrations.ts'
 import { createServer, registerServiceMetrics } from './server.ts'
 import { registerHandlers, rescheduleRecurring, seedRecurring } from './jobs.ts'
@@ -49,6 +50,8 @@ logger.info('starting', {
   version: env.version,
   schemaVersion: SCHEMA_VERSION,
   approvalTtlMinutes: env.approvalTtlMinutes,
+  estateEnvironment: env.estateEnvironment,
+  composeProject: env.composeProject,
 })
 
 // 3. The database pool. Opened before the schema assertion for the obvious reason that the
@@ -66,6 +69,47 @@ try {
   await assertSchemaAtLeast(sql as unknown as DbSql, SCHEMA_VERSION)
 } catch (err) {
   logger.fatal('schema assertion failed', { err, required: SCHEMA_VERSION })
+  await sql.end({ timeout: 5 }).catch(() => {})
+  process.exit(1)
+}
+
+// 4b. Claim this estate's identity, or refuse to start.
+//
+//     ══════════════════════════════════════════════════════════════════════════════════════════
+//     **THE BOOT REFUSAL THAT MAKES A CROSS-ENVIRONMENT RESTORE UNREACHABLE.**
+//
+//     `estate_identity` holds one immutable row saying which estate this database belongs to. It is
+//     written here, once, on first boot. Every subsequent boot COMPARES rather than writes, and a
+//     disagreement between the configured environment and the claimed one exits the process.
+//
+//     That turns two different mistakes into the same loud failure at the same early moment:
+//     a container pointed at the wrong database, and a compose file labelled with the wrong
+//     environment. On 2026-08-05 the second of those happened twice — the seeder ran against the
+//     MAINNET project whatever it was asked for — and the same defect on a restore path overwrites
+//     real balances. A backup is stamped with this value and a restore is refused on it by
+//     `restore_runs_environment_matches()`, so a wrong value here poisons every artefact taken
+//     afterwards. It is worth a refusal to serve.
+//
+//     Placed AFTER the schema assertion because `estate_identity` arrives in migration 10, and
+//     BEFORE the routes because no request may be answered by a replica that does not know which
+//     estate it is.
+//     ══════════════════════════════════════════════════════════════════════════════════════════
+try {
+  const identity = await claimEstateIdentity(
+    sql as unknown as Db,
+    env.estateEnvironment,
+    `service:${SERVICE}@${env.instanceId}`,
+  )
+  logger.info(identity.claimed ? 'estate identity claimed' : 'estate identity confirmed', {
+    environment: identity.environment,
+    composeProject: env.composeProject,
+    claimedAt: identity.claimedAt,
+  })
+} catch (err) {
+  logger.fatal('estate identity check failed — refusing to start', {
+    err,
+    configured: env.estateEnvironment,
+  })
   await sql.end({ timeout: 5 }).catch(() => {})
   process.exit(1)
 }
@@ -169,6 +213,8 @@ const server = createServer({
   // endpoint, and a partitioned one is an audit of record that reads as "nothing happened".
   eventAcceptSecrets: env.acceptSecrets,
   approvalTtlMinutes: env.approvalTtlMinutes,
+  estateEnvironment: env.estateEnvironment,
+  composeProject: env.composeProject,
   // Queue depth is sampled at scrape time rather than on a timer. There is no `setInterval` in
   // this repository, and CI greps for one — rule 8.
   beforeScrape: async () => {
@@ -211,6 +257,7 @@ registerHandlers(runner, {
   instanceId: env.instanceId,
   auditVerifyBatch: env.auditVerifyBatch,
   idempotencyTtlDays: env.idempotencyTtlDays,
+  composeProject: env.composeProject,
 })
 await seedRecurring(queue)
 runner.start()

@@ -17,8 +17,15 @@
  *   `approvals.expire`  key `approvals`    — expiry writes an audit row per request. Two expirers
  *                                            would show one expiry twice in the audit of record.
  *   `idempotency.reap`  key `idempotency`  — one table, one DELETE loop.
+ *   `backup.schedule`   key `backup:sched…`— there is ONE backup cadence. Two schedulers would
+ *                                            each decide a backup was due and queue two full
+ *                                            dumps of the same cluster, and retention would then
+ *                                            evict a genuinely older set to store the duplicate.
  *
- * None of these keys is a row id, because none of the contended resources is a row.
+ * None of these keys is a row id, because none of the contended resources is a row. The `backup.*`
+ * WORK jobs are the deliberate exception and are keyed by run id — they are distinct artefacts
+ * rather than recurring ticks, and collapsing two of them would silently discard one. See
+ * `enqueueBackupJob` in `src/backups.ts`; those handlers live in `deploy/backup`, not here.
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  *
  * **THE VERIFICATION JOB DOES NOT WRITE A CHECKPOINT WHEN THE CHAIN IS BROKEN.** Checkpointing an
@@ -29,7 +36,16 @@
 
 import { JobQueue, JobRunner, backoffFor, type Handler } from '@cloudsforge/jobs'
 import type { Logger, Metrics } from '@cloudsforge/telemetry'
-import { verifyChain, writeCheckpoint } from './audit.ts'
+import { appendAudit, verifyChain, writeCheckpoint } from './audit.ts'
+import {
+  BACKUP_PRUNE,
+  BACKUP_RESTORE,
+  BACKUP_RUN,
+  enqueueBackupJob,
+  readSettings,
+  requestBackup,
+  requestRestore,
+} from './backups.ts'
 import { expirePending } from './approvals.ts'
 import { reapIdempotencyKeys } from './idempotency.ts'
 import { createRelay, type Db } from './outbox.ts'
@@ -49,6 +65,7 @@ export const AUDIT_VERIFY = 'audit.verify'
 export const OUTBOX_RELAY = 'outbox.relay'
 export const APPROVALS_EXPIRE = 'approvals.expire'
 export const IDEMPOTENCY_REAP = 'idempotency.reap'
+export const BACKUP_SCHEDULE = 'backup.schedule'
 
 /** Every recurring job, its lease key, and how long until it runs again. */
 export const RECURRING: ReadonlyArray<{ kind: string; key: string; everyMs: number }> = Object.freeze([
@@ -58,6 +75,11 @@ export const RECURRING: ReadonlyArray<{ kind: string; key: string; everyMs: numb
   // window in which a tamper goes unnoticed at most one day.
   { kind: AUDIT_VERIFY, key: 'audit:chain', everyMs: 24 * 60 * 60_000 },
   { kind: IDEMPOTENCY_REAP, key: 'idempotency', everyMs: 6 * 60 * 60_000 },
+  // ── THE SCHEDULER, NOT THE BACKUP. Ticks every five minutes and decides whether a backup, a
+  //    verification or a prune is DUE; the work itself is a `backup.*` job this service never
+  //    claims. Five minutes is a granularity, not a cadence — the cadence is `backup_settings`,
+  //    which an operator can change from the panel without a deploy.
+  { kind: BACKUP_SCHEDULE, key: 'backup:schedule', everyMs: 5 * 60_000 },
 ])
 
 export interface JobDeps {
@@ -68,6 +90,8 @@ export interface JobDeps {
   readonly instanceId: string
   readonly auditVerifyBatch: number
   readonly idempotencyTtlDays: number
+  /** Which compose project's volumes a scheduled backup names. See `env.ts`. */
+  readonly composeProject: string
   readonly now?: () => Date
 }
 
@@ -130,12 +154,129 @@ export function createIdempotencyReaper(deps: JobDeps): Handler {
   }
 }
 
+/**
+ * Decide whether a backup, a self-verification or a prune is due, and queue it.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THIS SERVICE SCHEDULES THE WORK AND NEVER DOES IT.** The handlers for `backup.run`,
+ * `backup.restore`, `backup.verify` and `backup.prune` are registered by `deploy/backup`, a
+ * separate deployable holding the credentials and the volume mounts. `JobRunner.claim()` filters by
+ * REGISTERED kind, so the rows this enqueues are invisible to this process's own runner — which is
+ * what lets one queue serve two trust domains without a handler collision.
+ *
+ * **THE PERIODIC SELF-VERIFICATION IS THE HALF THAT MATTERS MOST.** A backup that silently stopped
+ * working looks exactly like one that works: same row, same green state, same size. The only thing
+ * that tells them apart is restoring it, so `backup.verify` restores the newest set into a SCRATCH
+ * database, checks it and drops it. It never touches a live database and needs no approval,
+ * deliberately — a safety check that required ceremony is a safety check that stops being run.
+ *
+ * Everything is derived from `backup_settings`, so an operator changes the cadence from the panel
+ * rather than through a deploy. There is no `setInterval` here: this is a leased recurring job like
+ * every other, and CI greps the repository for the alternative.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export function createBackupScheduler(deps: JobDeps): Handler {
+  const now = deps.now ?? (() => new Date())
+  return async () => {
+    const settings = await readSettings(deps.sql)
+    const at = now()
+
+    if (settings.scheduleEnabled) {
+      // "Due" is measured from the last time a backup was ATTEMPTED, not the last time one
+      // succeeded. Measuring from success means a broken backup is retried every five minutes for
+      // ever, which turns one failure into a pager storm and, worse, into a directory full of
+      // partial sets competing for the retention budget.
+      const since = new Date(at.getTime() - settings.scheduleEveryMinutes * 60_000).toISOString()
+      const recent = await deps.sql<{ n: number }[]>`
+        select count(*)::int as n from backup_runs where queued_at >= ${since}::timestamptz
+      `
+      if ((recent[0]?.n ?? 0) === 0) {
+        const queued = await deps.sql.begin(async (tx) => {
+          const backup = await requestBackup(tx, {
+            kind: 'full',
+            requestedBy: SERVICE_PRINCIPAL,
+            reason: `scheduled every ${settings.scheduleEveryMinutes} minutes`,
+            composeProject: deps.composeProject,
+            correlationId: null,
+          })
+          await enqueueBackupJob(tx, BACKUP_RUN, `backup:${backup.id}`, { backupRunId: backup.id })
+          // Scheduled or not, a backup is an event with an accountable principal. The audit of
+          // record should not have a gap where the automatic ones happened.
+          await appendAudit(tx, {
+            actor: SERVICE_PRINCIPAL,
+            action: 'admin.backup.requested',
+            subjectKind: 'backup_run',
+            subjectId: backup.id,
+            outcome: 'allowed',
+            payload: { kind: 'full', scheduled: true, environment: backup.environment },
+          })
+          return { value: backup }
+        })
+        deps.logger.info('scheduled backup queued', {
+          backupRunId: queued.value.id,
+          environment: queued.value.environment,
+        })
+      }
+    }
+
+    if (settings.verifyEnabled) {
+      const since = new Date(at.getTime() - settings.verifyEveryMinutes * 60_000).toISOString()
+      const recent = await deps.sql<{ n: number }[]>`
+        select count(*)::int as n from restore_runs
+         where mode = 'verify' and queued_at >= ${since}::timestamptz
+      `
+      // Never while any restore is in flight. `requestRestore` refuses that anyway; checking here
+      // as well keeps a predictable refusal out of the job's failure counter, because a job that
+      // fails on a normal condition trains an operator to ignore its alerts.
+      const inflight = await deps.sql<{ n: number }[]>`
+        select count(*)::int as n from restore_runs where state in ('queued','running')
+      `
+      if ((recent[0]?.n ?? 0) === 0 && (inflight[0]?.n ?? 0) === 0) {
+        const newest = await deps.sql<{ id: string }[]>`
+          select id from backup_runs where state = 'succeeded' order by queued_at desc limit 1
+        `
+        const target = newest[0]?.id
+        if (target) {
+          await deps.sql.begin(async (tx) => {
+            const restore = await requestRestore(tx, {
+              backupRunId: target,
+              mode: 'verify',
+              targets: [],
+              requestedBy: SERVICE_PRINCIPAL,
+              reason: 'periodic self-verification',
+              approvalId: null,
+              confirmation: null,
+              correlationId: null,
+            })
+            await enqueueBackupJob(tx, BACKUP_RESTORE, `restore:${restore.id}`, {
+              restoreRunId: restore.id,
+            })
+            return { value: restore }
+          })
+          deps.logger.info('periodic backup verification queued', { backupRunId: target })
+        }
+      }
+    }
+
+    // Retention runs every tick and is cheap when there is nothing to do: the runner reads the
+    // settings and returns immediately if the set is within both the copy count and the ceiling.
+    await deps.sql.begin(async (tx) => {
+      await enqueueBackupJob(tx, BACKUP_PRUNE, 'backup:prune', {})
+      return { value: null }
+    })
+  }
+}
+
 export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
   return runner
     .register(AUDIT_VERIFY, createAuditVerifier(deps))
     .register(OUTBOX_RELAY, createRelay({ sql: deps.sql, logger: deps.logger, signingSecret: deps.signingSecret }))
     .register(APPROVALS_EXPIRE, createApprovalExpirer(deps))
     .register(IDEMPOTENCY_REAP, createIdempotencyReaper(deps))
+    // NOT `backup.run`/`backup.restore`/`backup.verify`/`backup.prune`. Those belong to
+    // `deploy/backup`; registering one here would make this process claim work it cannot do, and a
+    // claimed job with no credentials fails five times and dead-letters silently.
+    .register(BACKUP_SCHEDULE, createBackupScheduler(deps))
 }
 
 /**

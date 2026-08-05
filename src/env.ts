@@ -196,7 +196,39 @@ export interface Env {
   readonly auditVerifyBatch: number
   /** Retention for spent idempotency claims. Must outlive every caller's retry horizon. */
   readonly idempotencyTtlDays: number
+
+  /**
+   * Which estate this is — `mainnet`, `testnet` or `development`.
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * **REQUIRED, WITH NO DEFAULT, AND THE ABSENCE OF A DEFAULT IS THE WHOLE CONTROL.**
+   *
+   * A default here would be a default answer to "which estate am I?", and the wrong answer to that
+   * question restores a testnet backup over real balances. On 2026-08-05 the estate seeder took a
+   * target parameter and ran against the MAINNET project regardless, twice — so the failure mode is
+   * measured, not imagined.
+   *
+   * At boot this value is compared against `estate_identity`, a row claimed once and immutable
+   * thereafter. A disagreement is a REFUSAL TO START: it means either this container is pointed at
+   * the wrong database or the compose file is labelled wrongly, and both are things that must be
+   * discovered by a container that will not boot rather than by a restore six weeks later.
+   *
+   * The variable carries no credential vocabulary in its name, so `secret-hygiene` has nothing to
+   * say about it — the same reason the durations here are `…_MINUTES` and `…_DAYS`.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  readonly estateEnvironment: 'mainnet' | 'testnet' | 'development'
+  /**
+   * The compose project this estate runs under — `cloudsforge-estate` or `cf-testnet`.
+   *
+   * Recorded on every backup run because it is what names the docker volumes a restore has to put
+   * back (`<project>_custody-keys`). It is descriptive rather than enforcing: the ENVIRONMENT is
+   * what a restore is gated on, and this is what tells an operator which volumes the set came from.
+   */
+  readonly composeProject: string
 }
+
+const ESTATE_ENVIRONMENTS = new Set(['mainnet', 'testnet', 'development'])
 
 const LEVELS = new Set(['debug', 'info', 'warn', 'error'])
 
@@ -204,6 +236,15 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
   const logLevel = optional(source, 'LOG_LEVEL', 'info')
   if (!LEVELS.has(logLevel)) {
     throw new EnvError(`LOG_LEVEL must be one of debug, info, warn, error (got ${logLevel})`)
+  }
+
+  // `required`, not `optional`. See the field's comment: a default answer to "which estate am I?"
+  // is how a testnet backup gets restored over mainnet balances.
+  const estateEnvironment = required(source, 'ADMIN_API_ESTATE_ENVIRONMENT')
+  if (!ESTATE_ENVIRONMENTS.has(estateEnvironment)) {
+    throw new EnvError(
+      `ADMIN_API_ESTATE_ENVIRONMENT must be one of mainnet, testnet, development (got ${estateEnvironment})`,
+    )
   }
 
   // Read before the object literal because the accept list falls back to it.
@@ -237,6 +278,13 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     approvalTtlMinutes: integer(source, 'ADMIN_API_APPROVAL_TTL_MINUTES', 240, 1, 20_160),
     auditVerifyBatch: integer(source, 'ADMIN_API_AUDIT_VERIFY_BATCH', 5_000, 1, 1_000_000),
     idempotencyTtlDays: integer(source, 'ADMIN_API_IDEMPOTENCY_TTL_DAYS', 14, 1, 365),
+
+    estateEnvironment: estateEnvironment as Env['estateEnvironment'],
+    // Defaulted, unlike the environment, and the asymmetry is deliberate: the compose default IS
+    // `cloudsforge-estate` (see deploy/compose/mainnet.env, which omits CF_PROJECT for exactly that
+    // reason), and this value is descriptive rather than a gate. Getting it wrong names the wrong
+    // volumes in a manifest; getting the environment wrong destroys balances.
+    composeProject: optional(source, 'ADMIN_API_COMPOSE_PROJECT', 'cloudsforge-estate'),
   }
 }
 

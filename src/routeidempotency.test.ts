@@ -38,6 +38,8 @@ const EXEMPT: Readonly<Record<string, string>> = {
     'a state transition claimed with `where retracted_at is null`; the second attempt matches no row and is refused rather than audited twice',
   'PUT /v1/engagement/policies/:service':
     'an upsert keyed on the service, exactly like PUT /v1/flags/:key: a retry writes the same row, the audit payload carries before and after, and the lowering it performs is idempotent by value — the raise path travels through POST /v1/approvals, which IS wrapped',
+  'PUT /v1/backups/settings':
+    'an UPDATE of one singleton row whose every column is last-write-wins. A retry writes the same eight values and produces no second artefact — no backup is taken, no restore is queued, nothing is created. The two routes here that DO create durable artefacts, POST /v1/backups and POST /v1/restores, are both wrapped',
 }
 
 function mutatingRoutes(): Array<{ key: string; wrapped: boolean }> {

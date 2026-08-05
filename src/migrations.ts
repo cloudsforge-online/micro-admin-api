@@ -670,6 +670,427 @@ export const MIGRATIONS: readonly Migration[] = [
       create index if not exists approvals_subject_idx on approvals (subject_kind, subject_id);
     `,
   },
+
+  {
+    version: 10,
+    name: 'backups',
+    up: `
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+      -- BACKUP AND RESTORE. The control plane only: this service NEVER touches a dump file.
+      --
+      -- WHAT THIS SERVICE OWNS: the catalogue, the authority to start a run, the environment
+      -- invariant, and the audit row. WHAT IT DOES NOT OWN: the bytes. Rule 1 gives this service
+      -- exactly one database and CI greps the source for a second DSN, so a process that dumps
+      -- twenty-nine OTHER databases cannot live in \`admin-api/src\` — and should not, because
+      -- reading every database in the cluster is a different trust domain from composing an
+      -- operator's console. The data plane is \`deploy/backup\`, a separate deployable that leases
+      -- \`backup.*\` jobs out of the table below. \`JobRunner.claim()\` filters by REGISTERED kind
+      -- (runtime/packages/jobs/src/index.ts:380), so this service enqueues work it will never
+      -- claim, and the runner claims work nothing else will take. One queue, two processes, no
+      -- handler collision — and if no runner is deployed the rows sit \`queued\` and the console
+      -- says so, which is honest rather than silent.
+      --
+      -- ── THE THREE INVARIANTS, IN THE SCHEMA, BECAUSE A ROUTE IS WHAT AN ATTACKER GETS PAST ──
+      --
+      --   \`estate_identity_is_immutable\`      An estate says which environment it is EXACTLY
+      --                                        ONCE, and can never say anything else.
+      --   \`restore_runs_environment_matches\`  A restore whose backup was taken in another
+      --                                        environment cannot be written down.
+      --   \`restore_runs_live_needs_approval\`  A restore that overwrites live data cannot exist
+      --                                        without an approval two operators signed.
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+
+      -- ── ARTEFACT OF IDENTITY. The fact a restore is checked against.
+      --
+      -- 2026-08-05, twice: the seeder ran \`docker compose\` against the MAINNET project whatever
+      -- the target was, so a testnet action recreated a mainnet container. A restore with that bug
+      -- overwrites real balances with test ones. The defence cannot be a parameter — the bug WAS a
+      -- parameter that was ignored — so it is this row: written once at first boot from
+      -- ADMIN_API_ESTATE_ENVIRONMENT, immutable thereafter, and compared against the environment
+      -- recorded INSIDE the backup artefact. Both sides self-identify and neither is passed in.
+      --
+      -- The service refuses to start when its configured environment disagrees with this row
+      -- (src/index.ts), which is what turns a mis-pointed compose file into a container that will
+      -- not boot instead of a restore into the wrong estate.
+      create table if not exists estate_identity (
+        singleton   boolean     primary key default true,
+        environment text        not null,
+        claimed_at  timestamptz not null default now(),
+        claimed_by  text        not null,
+        constraint estate_identity_one_row check (singleton),
+        constraint estate_identity_known
+          check (environment in ('mainnet','testnet','development'))
+      );
+
+      -- An estate's identity is a fact about which estate this IS, not configuration. Allowing an
+      -- UPDATE would let a compose file edit re-label mainnet as testnet and thereby unlock exactly
+      -- the restore this table exists to refuse. There is no legitimate caller: an estate that is
+      -- genuinely a different estate has a different database.
+      create or replace function estate_identity_is_final() returns trigger
+        language plpgsql
+      as $$
+      begin
+        raise exception
+          'the estate identity is claimed once and cannot be changed (it is what a restore is checked against)'
+          using errcode = 'check_violation';
+      end;
+      $$;
+
+      drop trigger if exists estate_identity_immutable on estate_identity;
+      create trigger estate_identity_immutable
+        before update or delete on estate_identity
+        for each row execute function estate_identity_is_final();
+
+      -- ── SETTINGS. One row. The destination is configurable from the panel because the owner
+      -- asked for it; every bound on it is a CHECK because "configurable" must not mean
+      -- "unbounded". Filling the destination disk on this host stops the miner and the chain.
+      create table if not exists backup_settings (
+        singleton              boolean     primary key default true,
+        -- The default is the second physical disk (/dev/sdb1, 1.4 TB free), mounted at /data on
+        -- the host and bound to /backups in the runner. It is a DIFFERENT SPINDLE from the one
+        -- holding the databases, which is the whole point: backups beside the thing they back up
+        -- die with it. See docs for what this does and does not protect against.
+        root_path              text        not null default '/backups',
+        -- How many complete backup sets to keep. The prune job removes the oldest beyond this.
+        retention_copies       integer     not null default 14,
+        -- The hard ceiling. The runner refuses to START a run that could exceed it, and the prune
+        -- job enforces it after. 200 GiB against 1.4 TB free leaves the chain its headroom with an
+        -- order of magnitude to spare.
+        ceiling_bytes          bigint      not null default 214748364800,
+        -- Refuse to write when the destination filesystem has less than this free, whatever the
+        -- ceiling says. A ceiling protects the disk from THIS system; this protects it from
+        -- everything else that shares the disk.
+        min_free_bytes         bigint      not null default 107374182400,
+        schedule_enabled       boolean     not null default true,
+        schedule_every_minutes integer     not null default 1440,
+        -- Periodic self-verification: restore the newest backup into a scratch database and report.
+        -- A backup that silently stopped working looks exactly like one that works.
+        verify_enabled         boolean     not null default true,
+        verify_every_minutes   integer     not null default 1440,
+        updated_at             timestamptz not null default now(),
+        updated_by             text        not null default 'migration:10',
+
+        constraint backup_settings_one_row check (singleton),
+        -- Absolute, no traversal, no shell metacharacters. This string becomes a path in a process
+        -- that runs tar and pg_restore; a route validates it too, and this is what holds when the
+        -- write arrives by another door.
+        constraint backup_settings_root_is_absolute
+          check (root_path ~ '^/[A-Za-z0-9._/-]{0,255}$' and root_path !~ '\\.\\.'),
+        constraint backup_settings_retention_sane
+          check (retention_copies between 1 and 365),
+        -- Floor 1 GiB: a ceiling below one backup set means every run fails. Roof 1 TiB: below the
+        -- 1.4 TB free, so the setting cannot be used to fill the disk that holds the chain.
+        constraint backup_settings_ceiling_sane
+          check (ceiling_bytes between 1073741824 and 1099511627776),
+        constraint backup_settings_headroom_sane
+          check (min_free_bytes between 1073741824 and 1099511627776),
+        constraint backup_settings_schedule_sane
+          check (schedule_every_minutes between 15 and 43200),
+        constraint backup_settings_verify_sane
+          check (verify_every_minutes between 60 and 43200)
+      );
+      insert into backup_settings (singleton, updated_by) values (true, 'migration:10')
+        on conflict (singleton) do nothing;
+
+      -- ── THE RUNS.
+      create table if not exists backup_runs (
+        id                    uuid        primary key default gen_random_uuid(),
+        -- THE MARKER. Copied into MANIFEST.json on disk, and the artefact is what a restore is
+        -- checked against — not this row, which a restoring host may not even have.
+        environment           text        not null,
+        compose_project       text        not null,
+        kind                  text        not null default 'full',
+        state                 text        not null default 'queued',
+        -- 'user:<uuid>' for an operator, 'service:admin-api' for the scheduled run. A backup
+        -- nobody asked for is still a backup somebody is accountable for.
+        requested_by          text        not null,
+        reason                text,
+        root_path             text        not null,
+        -- <root>/<environment>/<stamp>. Null until the runner claims the row and creates it.
+        directory             text,
+        queued_at             timestamptz not null default now(),
+        started_at            timestamptz,
+        finished_at           timestamptz,
+        total_bytes           bigint,
+        artefact_count        integer,
+        -- The checksum OF THE MANIFEST, which itself carries a checksum per artefact. One value
+        -- that commits to every byte of the set.
+        manifest_sha256       text,
+        -- pg_control's system identifier: a fact about the cluster, generated at initdb and
+        -- unique to it. Distinguishes "restore into the same cluster" from "restore into a rebuilt
+        -- one", which are different operations with different risks.
+        cluster_system_id     text,
+        -- Whether the custody VAULT (ciphertext) is in this set. The KEYRING never is, and there
+        -- is deliberately no column that could ever say it was. See src/backups.ts.
+        includes_custody      boolean     not null default false,
+        -- ══════════════════════════════════════════════════════════════════════════════════════
+        -- WHETHER THE MINER COINBASE KEYS ARE IN THIS SET — AS CIPHERTEXT, ALWAYS.
+        --
+        -- The Hearth miners hold their reward key natively, in PLAINTEXT, in a 240-byte JSON file
+        -- at mode 0600 on one disk, with no backup and no rotation path. The mainnet coinbase
+        -- 0x980d…5b45 held 9,332 EMBER of genuinely mined coin when this was written. Losing that
+        -- file loses that money exactly as losing a custody blob does, and it is the single most
+        -- valuable unprotected artefact on the host.
+        --
+        -- So it is backed up — and it is encrypted BEFORE it is written, to an age recipient whose
+        -- private half never exists on this machine. That is the difference between fixing
+        -- durability and creating a disclosure: an unencrypted key copied to a second disk in the
+        -- same room is a second place to steal it from.
+        --
+        -- This column exists so the console can say a key backup EXISTS without ever showing what
+        -- is in it, and so an operator can see at a glance which sets would need the offline
+        -- identity to recover fully.
+        -- ══════════════════════════════════════════════════════════════════════════════════════
+        includes_secrets      boolean     not null default false,
+        error                 text,
+        correlation_id        text,
+        -- The last time a restore of THIS set was actually proven to work, and by which run.
+        -- Null means: nobody has ever restored this. A backup nobody has restored is a wish.
+        verified_at           timestamptz,
+        verified_by_restore   uuid,
+
+        constraint backup_runs_environment_known
+          check (environment in ('mainnet','testnet','development')),
+        constraint backup_runs_kind_known
+          check (kind in ('full','databases','custody','files')),
+        constraint backup_runs_state_known
+          check (state in ('queued','running','succeeded','failed','pruned')),
+        constraint backup_runs_requester_is_a_principal
+          check (requested_by ~ '^(user|service):[A-Za-z0-9:._-]{1,128}$'),
+
+        -- ══════════════════════════════════════════════════════════════════════════════════════
+        -- A SUCCEEDED BACKUP HAS A CHECKSUM, OR IT IS NOT SUCCEEDED.
+        --
+        -- "A backup whose integrity is unverified is a guess." The state and the evidence for it
+        -- are one fact, so they are one constraint; a run that finished but hashed nothing cannot
+        -- be written down as a success, and the console can therefore trust the word.
+        -- ══════════════════════════════════════════════════════════════════════════════════════
+        constraint backup_runs_success_is_evidenced check (
+          (state = 'succeeded') =
+            (manifest_sha256 is not null and directory is not null
+             and total_bytes is not null and artefact_count is not null)
+        ),
+        constraint backup_runs_failure_is_explained
+          check ((state = 'failed') = (error is not null)),
+        constraint backup_runs_terminal_is_finished check (
+          (state in ('succeeded','failed')) = (finished_at is not null)
+        ),
+        -- Verification names the restore that proved it. "Verified" with nothing to point at is
+        -- the reassuring green tick this whole exercise exists to refuse.
+        constraint backup_runs_verification_is_attributed
+          check ((verified_at is null) = (verified_by_restore is null))
+      );
+
+      create index if not exists backup_runs_recent_idx
+        on backup_runs (environment, queued_at desc);
+      create index if not exists backup_runs_live_idx
+        on backup_runs (state, queued_at desc) where state in ('queued','running');
+
+      -- ── ONE ROW PER FILE. The checksum lives here as well as in the manifest on disk, so an
+      -- operator can be told "this file no longer hashes to what we wrote" without the artefact
+      -- being present, and so a tampered manifest disagrees with the database rather than with
+      -- itself.
+      create table if not exists backup_artefacts (
+        id           uuid        primary key default gen_random_uuid(),
+        run_id       uuid        not null references backup_runs (id) on delete cascade,
+        kind         text        not null,
+        -- The database name, the volume name, or the file-set name.
+        name         text        not null,
+        -- Relative to the run's directory. Never absolute: an absolute path in a manifest is a
+        -- write primitive pointed anywhere on the restoring host.
+        rel_path     text        not null,
+        bytes        bigint      not null,
+        sha256       text        not null,
+        -- Rows for a database, files for a tarball. The count a restore is checked against.
+        entry_count  bigint,
+        -- ══════════════════════════════════════════════════════════════════════════════════════
+        -- A SECRETS ARTEFACT CARRIES A PUBLIC ADDRESS AND NOTHING ELSE IDENTIFYING.
+        --
+        -- \`public_ref\` is how a restore is verified without decrypting: re-derive the address from
+        -- the recovered key and compare it to this. Address equality proves the recovered
+        -- plaintext is genuinely the spending key for that address, and proves it while printing
+        -- nothing secret — which is the same verification \`custody-backup-restore.md\` §5.3 uses.
+        --
+        -- The CHECK is what stops this column ever becoming a place somebody puts the key. An
+        -- 0x-prefixed 40-hex address is 42 characters; a secp256k1 private key is 64 hex. The
+        -- shape refuses the second.
+        -- ══════════════════════════════════════════════════════════════════════════════════════
+        public_ref   text,
+        created_at   timestamptz not null default now(),
+
+        -- 'secrets' is key material and is the ONLY kind written to disk already encrypted, to a
+        -- recipient whose private half never touches this machine. See \`includes_secrets\` on
+        -- backup_runs and the header of src/backups.ts.
+        constraint backup_artefacts_kind_known
+          check (kind in ('database','vault','files','secrets')),
+        constraint backup_artefacts_public_ref_is_an_address
+          check (public_ref is null or public_ref ~ '^0x[0-9a-fA-F]{40}$'),
+        constraint backup_artefacts_secrets_name_their_address
+          check (kind <> 'secrets' or public_ref is not null),
+        constraint backup_artefacts_one_per_name unique (run_id, kind, name),
+        constraint backup_artefacts_bytes_positive check (bytes > 0),
+        constraint backup_artefacts_sha256_shape check (sha256 ~ '^[0-9a-f]{64}$'),
+        constraint backup_artefacts_rel_path_is_relative
+          check (rel_path ~ '^[A-Za-z0-9._/-]{1,255}$' and rel_path !~ '\\.\\.' and left(rel_path, 1) <> '/')
+      );
+
+      create index if not exists backup_artefacts_run_idx on backup_artefacts (run_id, kind, name);
+
+      -- ── THE DANGEROUS HALF.
+      create table if not exists restore_runs (
+        id                 uuid        primary key default gen_random_uuid(),
+        backup_run_id      uuid        not null references backup_runs (id),
+        -- Copied from the backup at insert by the trigger below rather than supplied. A column the
+        -- caller fills is a column the caller can lie in.
+        environment        text        not null,
+        -- 'verify'  restore into a scratch database, drop it afterwards. Non-destructive, always
+        --           allowed, and the ONLY mode the periodic self-check uses.
+        -- 'live'    overwrite the real database. Needs an approval two operators signed.
+        mode               text        not null,
+        -- Which artefacts. A restore that silently did more than it named is the failure this
+        -- column exists to prevent.
+        targets            jsonb       not null default '[]'::jsonb,
+        state              text        not null default 'queued',
+        requested_by       text        not null,
+        reason             text,
+        -- The approval two operators drove to 'approved'. NULL is legal only for mode='verify'.
+        approval_id        uuid        references approvals (id),
+        -- Exactly what the operator typed, kept as evidence of what they were shown and agreed to.
+        confirmation       text,
+        queued_at          timestamptz not null default now(),
+        started_at         timestamptz,
+        finished_at        timestamptz,
+        -- What the runner found when it opened the artefact. The restore stops if either
+        -- disagrees with the backup row — the artefact is the authority, not this table.
+        artefact_environment text,
+        checksums_verified   boolean,
+        -- Per-target outcome: rows restored, addresses re-derived, and so on. Never key material.
+        outcome            jsonb       not null default '{}'::jsonb,
+        error              text,
+        correlation_id     text,
+
+        constraint restore_runs_mode_known check (mode in ('verify','live')),
+        constraint restore_runs_state_known
+          check (state in ('queued','running','succeeded','failed','refused')),
+        constraint restore_runs_requester_is_a_principal
+          check (requested_by ~ '^(user|service):[A-Za-z0-9:._-]{1,128}$'),
+        constraint restore_runs_failure_is_explained
+          check ((state in ('failed','refused')) = (error is not null)),
+        constraint restore_runs_terminal_is_finished check (
+          (state in ('succeeded','failed','refused')) = (finished_at is not null)
+        ),
+
+        -- ══════════════════════════════════════════════════════════════════════════════════════
+        -- A LIVE RESTORE CANNOT EXIST WITHOUT TWO OPERATORS AND A TYPED CONFIRMATION.
+        --
+        -- "A restore must never be a single click. It overwrites live money data." The route asks
+        -- for the typed phrase and refuses without it, with a readable sentence. This is the half
+        -- that holds when the write arrives by any other door — including psql.
+        --
+        -- \`verify\` needs neither, and that asymmetry is the point: the safe operation must be
+        -- cheap or nobody will ever run it, and a system whose only restore is terrifying is a
+        -- system whose restores are never rehearsed.
+        -- ══════════════════════════════════════════════════════════════════════════════════════
+        constraint restore_runs_live_is_confirmed check (
+          mode <> 'live' or (approval_id is not null and confirmation is not null)
+        ),
+        constraint restore_runs_verify_is_unapproved check (
+          mode <> 'verify' or approval_id is null
+        )
+      );
+
+      create index if not exists restore_runs_recent_idx on restore_runs (queued_at desc);
+      create index if not exists restore_runs_backup_idx on restore_runs (backup_run_id, queued_at desc);
+
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+      -- THE ENVIRONMENT REFUSAL, AND WHY IT IS A TRIGGER AND NOT A CHECK.
+      --
+      -- A CHECK sees one row. The fact that decides this lives in three places — the backup's
+      -- environment, THIS estate's claimed identity, and (for a live restore) the approval that
+      -- authorised it — so it needs a trigger that can read them.
+      --
+      -- What it enforces, in order:
+      --
+      --   1. \`environment\` is COPIED from the backup, never accepted from the caller. This is the
+      --      2026-08-05 defect in schema form: the seeder took a target parameter and ignored it,
+      --      so the parameter was never the safe thing to trust.
+      --   2. The backup's environment must equal THIS estate's claimed identity. A testnet backup
+      --      cannot be restored into mainnet, by anyone, through any route, for any reason. There
+      --      is no override flag and adding one would defeat the entire control.
+      --   3. A live restore must name an approval that is APPROVED and is for this exact backup.
+      --      An approval for a different backup is not consent to restore this one.
+      --   4. The backup must have SUCCEEDED. Restoring from a failed run is restoring from a
+      --      partial set, which is worse than not restoring: it half-overwrites live data.
+      -- ══════════════════════════════════════════════════════════════════════════════════════════
+      create or replace function restore_runs_environment_matches() returns trigger
+        language plpgsql
+      as $$
+      declare
+        backup_env  text;
+        backup_state text;
+        estate_env  text;
+        appr        record;
+      begin
+        select environment, state into backup_env, backup_state
+          from backup_runs where id = new.backup_run_id;
+        if backup_env is null then
+          raise exception 'no backup run %', new.backup_run_id using errcode = 'check_violation';
+        end if;
+
+        -- (4) A partial set is not a restore source.
+        if backup_state <> 'succeeded' then
+          raise exception
+            'backup % is in state %, not succeeded — restoring from an incomplete set half-overwrites live data',
+            new.backup_run_id, backup_state using errcode = 'check_violation';
+        end if;
+
+        -- (1) Derived, never accepted.
+        new.environment := backup_env;
+
+        select environment into estate_env from estate_identity where singleton;
+        if estate_env is null then
+          raise exception
+            'this estate has not claimed an identity; a restore cannot be checked for environment confusion'
+            using errcode = 'check_violation';
+        end if;
+
+        -- (2) THE REFUSAL.
+        if backup_env <> estate_env then
+          raise exception
+            'REFUSED: that backup was taken in the % estate and this is the % estate — a cross-environment restore destroys real balances',
+            backup_env, estate_env using errcode = 'check_violation';
+        end if;
+
+        -- (3) Live means two operators, for THIS backup.
+        if new.mode = 'live' then
+          select state, action, subject_id into appr from approvals where id = new.approval_id;
+          if appr.state is distinct from 'approved' or appr.action is distinct from 'estate.restore' then
+            raise exception 'approval % is not an approved estate.restore approval', new.approval_id
+              using errcode = 'check_violation';
+          end if;
+          if appr.subject_id is distinct from new.backup_run_id::text then
+            raise exception
+              'approval % authorises restoring backup %, not backup % — an approval is consent to one restore',
+              new.approval_id, appr.subject_id, new.backup_run_id using errcode = 'check_violation';
+          end if;
+        end if;
+
+        return new;
+      end;
+      $$;
+
+      drop trigger if exists restore_runs_environment_guard on restore_runs;
+      create trigger restore_runs_environment_guard
+        before insert on restore_runs
+        for each row execute function restore_runs_environment_matches();
+
+      -- One live restore of one backup, for ever. The same reason
+      -- \`engagement_transfers_one_per_approval\` exists: an approval authorises ONE act, and a
+      -- retry must replay rather than overwrite live data a second time.
+      create unique index if not exists restore_runs_one_live_per_approval
+        on restore_runs (approval_id) where approval_id is not null;
+    `,
+  },
 ]
 
 /**
@@ -695,6 +1116,11 @@ export const BASELINE_VERSION = 0
 
 /** Every table this service owns, for the test harness's truncate. Order is child-first. */
 export const TABLES: readonly string[] = Object.freeze([
+  'restore_runs',
+  'backup_artefacts',
+  'backup_runs',
+  'backup_settings',
+  'estate_identity',
   'engagement_transfers',
   'engagement_policies',
   'engagement_fee_recycle',

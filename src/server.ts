@@ -111,6 +111,32 @@ import {
   readAudit,
   verifyChain,
 } from './audit.ts'
+import {
+  BACKUP_RESTORE,
+  BACKUP_RUN,
+  BackupError,
+  CEILINGS,
+  EnvironmentMismatchError,
+  artefactToJson,
+  backupToJson,
+  enqueueBackupJob,
+  expectedConfirmation,
+  findBackup,
+  listArtefacts,
+  listBackups,
+  listRestores,
+  listRestoresFor,
+  protectionFor,
+  readEstateIdentity,
+  readSettings,
+  requestBackup,
+  requestRestore,
+  restoreToJson,
+  settingsToJson,
+  updateSettings,
+  type BackupKind,
+  type BackupState,
+} from './backups.ts'
 import { BroadcastError, BroadcastNotFoundError, listBroadcasts, publishBroadcast, retractBroadcast, type Severity } from './broadcasts.ts'
 import { FlagError, listFlags, setFlag } from './flags.ts'
 import { composeEstate, type EstateDeps } from './estate.ts'
@@ -179,6 +205,10 @@ export interface ServerDeps {
    */
   readonly eventAcceptSecrets: readonly string[]
   readonly approvalTtlMinutes: number
+  /** Which estate this is. Checked against the immutable `estate_identity` row at boot. */
+  readonly estateEnvironment: 'mainnet' | 'testnet' | 'development'
+  /** Which compose project's volumes a backup taken here names. Descriptive, not a gate. */
+  readonly composeProject: string
   readonly now?: () => Date
   readonly beforeScrape?: () => Promise<void>
 }
@@ -1281,6 +1311,306 @@ function buildRoutes(): Route[] {
       // header of `estate.ts` for why that matters more here than on a user dashboard.
       return { status: 200, body: view }
     }),
+
+    /* ---------------------------------------------------------------- backup and restore */
+
+    /**
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * **EVERY ROUTE BELOW IS `requireOperator`, INCLUDING THE READS.**
+     *
+     * `requireReader` — which admits a service token holding `admin:read` — is deliberately NOT
+     * used here, and this is the one place in the file that departs from that pattern. A backup
+     * listing names the directory the artefacts are in, the databases they cover and the checksums
+     * that authenticate them; that is a map of where the estate's data is kept, and a read-only
+     * service credential is a credential that lives in a container's environment. An unauthenticated
+     * or under-authenticated restore is a total compromise, and the read is most of the way to one.
+     *
+     * `adminOnly` in `ui/packages/ui/src/surfaces.ts` is a NAVIGATION filter and not a boundary —
+     * `admin-web/src/lib/auth.tsx:4` says so in as many words. This is the boundary.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+    define('GET', '/v1/backups', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      requireOperator(principal)
+      const params = ctx.url.searchParams
+      const state = params.get('state')
+      const settings = await readSettings(deps.sql)
+      const backups = await listBackups(deps.sql, {
+        ...(state ? { state: parseBackupState(state) } : {}),
+        limit: parseLimit(params.get('limit')),
+      })
+      const identity = await readEstateIdentity(deps.sql)
+      return {
+        status: 200,
+        body: {
+          backups: backups.map(backupToJson),
+          settings: settingsToJson(settings),
+          // The honesty block. Two lists rather than a status, because a status invites a green
+          // tick and a green tick is a claim this estate cannot support. See `backups.ts`.
+          protection: protectionFor(settings),
+          estate: {
+            environment: identity?.environment ?? null,
+            composeProject: deps.composeProject,
+          },
+        },
+      }
+    }),
+
+    define('GET', '/v1/backups/settings', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      requireOperator(principal)
+      const settings = await readSettings(deps.sql)
+      return {
+        status: 200,
+        body: {
+          settings: settingsToJson(settings),
+          // The schema's own bounds, so a console renders the range an operator is choosing inside
+          // rather than discovering it as a 400 — the same shape as the engagement ceilings above.
+          ceilings: {
+            retentionCopies: CEILINGS.retentionCopies,
+            ceilingBytes: {
+              min: CEILINGS.ceilingBytes.min.toString(),
+              max: CEILINGS.ceilingBytes.max.toString(),
+            },
+            minFreeBytes: {
+              min: CEILINGS.minFreeBytes.min.toString(),
+              max: CEILINGS.minFreeBytes.max.toString(),
+            },
+            scheduleEveryMinutes: CEILINGS.scheduleEveryMinutes,
+            verifyEveryMinutes: CEILINGS.verifyEveryMinutes,
+          },
+          protection: protectionFor(settings),
+        },
+      }
+    }),
+
+    define('PUT', '/v1/backups/settings', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      const operator = requireOperator(principal)
+      const body = await readJson(ctx.req)
+
+      const change = {
+        ...(typeof body['rootPath'] === 'string' ? { rootPath: body['rootPath'] } : {}),
+        ...(typeof body['retentionCopies'] === 'number'
+          ? { retentionCopies: body['retentionCopies'] }
+          : {}),
+        ...(typeof body['ceilingBytes'] === 'string'
+          ? { ceilingBytes: parseByteCount(body['ceilingBytes'], 'ceilingBytes') }
+          : {}),
+        ...(typeof body['minFreeBytes'] === 'string'
+          ? { minFreeBytes: parseByteCount(body['minFreeBytes'], 'minFreeBytes') }
+          : {}),
+        ...(typeof body['scheduleEnabled'] === 'boolean'
+          ? { scheduleEnabled: body['scheduleEnabled'] }
+          : {}),
+        ...(typeof body['scheduleEveryMinutes'] === 'number'
+          ? { scheduleEveryMinutes: body['scheduleEveryMinutes'] }
+          : {}),
+        ...(typeof body['verifyEnabled'] === 'boolean' ? { verifyEnabled: body['verifyEnabled'] } : {}),
+        ...(typeof body['verifyEveryMinutes'] === 'number'
+          ? { verifyEveryMinutes: body['verifyEveryMinutes'] }
+          : {}),
+      }
+      if (Object.keys(change).length === 0) {
+        throw new BadRequestError('nothing to change')
+      }
+
+      const result = await deps.sql.begin(async (tx) => {
+        const settings = await updateSettings(tx, change, operator)
+        // Changing where the estate's backups are written is an operator action on the estate's
+        // recoverability, so it takes an audit row like any other. The row names the new root and
+        // the old one: "where were the backups going in March" is a question an incident asks.
+        await appendAudit(
+          tx,
+          {
+            actor: operator,
+            action: 'admin.backup.settings.changed',
+            subjectKind: 'backup_settings',
+            subjectId: 'singleton',
+            outcome: 'allowed',
+            correlationId: ctx.requestId,
+            payload: { ...settingsToJson(settings) },
+          },
+          deps.now,
+        )
+        return { value: settings }
+      })
+      deps.metrics.increment('admin_operator_actions_total', {
+        action: 'backup.settings.changed',
+        outcome: 'allowed',
+      })
+      return { status: 200, body: { settings: settingsToJson(result.value) } }
+    }),
+
+    define('GET', '/v1/backups/:id', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      requireOperator(principal)
+      const backup = await findBackup(deps.sql, itemIdOf(ctx))
+      if (!backup) throw new NotFoundError(`no backup run ${ctx.params['id']}`)
+      return {
+        status: 200,
+        body: {
+          backup: backupToJson(backup),
+          // Names and checksums. NEVER contents — see the header of `backups.ts`: the console must
+          // be able to show that a custody backup exists without showing what is in it.
+          artefacts: (await listArtefacts(deps.sql, backup.id)).map(artefactToJson),
+          restores: (await listRestoresFor(deps.sql, backup.id)).map(restoreToJson),
+          // Rendered so the operator can read the phrase before they are asked to type it, and so
+          // the second approver sees exactly the string the first one agreed to.
+          liveConfirmationPhrase: expectedConfirmation(backup),
+        },
+      }
+    }),
+
+    /**
+     * Take a backup now.
+     *
+     * Idempotent by header like every other mutating route here, and for a sharper reason than
+     * usual: a double-clicked button that queued two full dumps of a 300 MB cluster would write two
+     * complete sets to the destination disk, and the retention policy would then evict a genuinely
+     * older set to make room for the duplicate.
+     */
+    define('POST', '/v1/backups', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      const operator = requireOperator(principal)
+      const body = await readJson(ctx.req)
+      const kind = typeof body['kind'] === 'string' ? parseBackupKind(body['kind']) : 'full'
+
+      return withIdempotentRoute(ctx, '/v1/backups', async () => {
+        const outcome = await withIdempotency(deps.sql, {
+          principal: operator,
+          route: '/v1/backups',
+          clientKey: idempotencyKeyOf(ctx),
+          requestHash: requestFingerprint(body),
+          run: async (tx) => {
+            const backup = await requestBackup(tx, {
+              kind,
+              requestedBy: operator,
+              reason: typeof body['reason'] === 'string' ? body['reason'] : null,
+              composeProject: deps.composeProject,
+              correlationId: ctx.requestId,
+            })
+            // The job and the row commit together. See `enqueueBackupJob` for why this cannot go
+            // through `JobQueue`, which holds its own connection.
+            await enqueueBackupJob(tx, BACKUP_RUN, `backup:${backup.id}`, { backupRunId: backup.id })
+            await appendAudit(
+              tx,
+              {
+                actor: operator,
+                action: 'admin.backup.requested',
+                subjectKind: 'backup_run',
+                subjectId: backup.id,
+                outcome: 'allowed',
+                correlationId: ctx.requestId,
+                payload: { kind, environment: backup.environment, rootPath: backup.rootPath },
+              },
+              deps.now,
+            )
+            return { response: { backup: backupToJson(backup) }, artefactId: backup.id }
+          },
+        })
+        deps.metrics.increment('admin_operator_actions_total', {
+          action: 'backup.requested',
+          outcome: 'allowed',
+        })
+        return { status: outcome.replayed ? 200 : 201, body: outcome.result }
+      })
+    }),
+
+    define('GET', '/v1/restores', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      requireOperator(principal)
+      const restores = await listRestores(deps.sql, parseLimit(ctx.url.searchParams.get('limit')))
+      return { status: 200, body: { restores: restores.map(restoreToJson) } }
+    }),
+
+    /**
+     * Request a restore.
+     *
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * **THIS ROUTE ACCEPTS `verify` AND REFUSES `live`. THE ONLY DOOR TO A LIVE RESTORE IS THE
+     * APPROVAL QUEUE.**
+     *
+     * `verify` restores into a throwaway scratch database, checks it, and drops it. It touches
+     * nothing live, so it needs one operator and no ceremony — and that asymmetry is load-bearing
+     * rather than lenient. "A backup nobody has restored is a wish" is this estate's own hard-won
+     * lesson; if the only available restore were the terrifying one, no restore would ever be
+     * rehearsed and every backup would stay a wish. Making the safe one cheap is what makes the
+     * dangerous one rare.
+     *
+     * `live` is refused here with the route to use instead, exactly as a read action is refused by
+     * `POST /v1/approvals` with the GET to call. Two operators, `estate.restore`, and a typed
+     * confirmation the second one can see before signing.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+    define('POST', '/v1/restores', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      const operator = requireOperator(principal)
+      const body = await readJson(ctx.req)
+      const backupRunId = requireString(body, 'backupRunId')
+      if (!UUID.test(backupRunId)) throw new BadRequestError('backupRunId must be a uuid')
+      const mode = requireString(body, 'mode')
+
+      if (mode === 'live') {
+        throw new BadRequestError(
+          'a live restore overwrites live data and cannot be requested directly — raise an ' +
+            'estate.restore approval through POST /v1/approvals, which needs a second operator ' +
+            'and a typed confirmation naming the backup and the environment',
+        )
+      }
+      if (mode !== 'verify') throw new BadRequestError('mode must be "verify" or "live"')
+
+      const rawTargets = body['targets']
+      const targets = Array.isArray(rawTargets)
+        ? rawTargets.filter((t): t is string => typeof t === 'string')
+        : []
+
+      return withIdempotentRoute(ctx, '/v1/restores', async () => {
+        const outcome = await withIdempotency(deps.sql, {
+          principal: operator,
+          route: '/v1/restores',
+          clientKey: idempotencyKeyOf(ctx),
+          requestHash: requestFingerprint(body),
+          run: async (tx) => {
+            const restore = await requestRestore(tx, {
+              backupRunId,
+              mode: 'verify',
+              targets,
+              requestedBy: operator,
+              reason: typeof body['reason'] === 'string' ? body['reason'] : null,
+              // Both null, and `restore_runs_verify_is_unapproved` refuses a verify row that names
+              // an approval — so a caller cannot spend an `estate.restore` approval on a verify and
+              // leave the partial unique index thinking it has been used.
+              approvalId: null,
+              confirmation: null,
+              correlationId: ctx.requestId,
+            })
+            await enqueueBackupJob(tx, BACKUP_RESTORE, `restore:${restore.id}`, {
+              restoreRunId: restore.id,
+            })
+            await appendAudit(
+              tx,
+              {
+                actor: operator,
+                action: 'admin.restore.requested',
+                subjectKind: 'backup_run',
+                subjectId: backupRunId,
+                outcome: 'allowed',
+                correlationId: ctx.requestId,
+                payload: { mode: 'verify', restoreRunId: restore.id, targets },
+              },
+              deps.now,
+            )
+            return { response: { restore: restoreToJson(restore) }, artefactId: restore.id }
+          },
+        })
+        deps.metrics.increment('admin_operator_actions_total', {
+          action: 'restore.verify.requested',
+          outcome: 'allowed',
+        })
+        return { status: outcome.replayed ? 200 : 201, body: outcome.result }
+      })
+    }),
   ]
 }
 
@@ -1407,6 +1737,34 @@ function parseState(value: string): ApprovalState {
 
 function parseCursor(value: string): bigint {
   if (!/^\d{1,19}$/.test(value)) throw new BadRequestError('a cursor is a decimal sequence number')
+  return BigInt(value)
+}
+
+function parseBackupState(value: string): BackupState {
+  const states = ['queued', 'running', 'succeeded', 'failed', 'pruned']
+  if (!states.includes(value)) throw new BadRequestError(`state must be one of ${states.join(', ')}`)
+  return value as BackupState
+}
+
+function parseBackupKind(value: string): BackupKind {
+  const kinds = ['full', 'databases', 'custody', 'files']
+  if (!kinds.includes(value)) throw new BadRequestError(`kind must be one of ${kinds.join(', ')}`)
+  return value as BackupKind
+}
+
+/**
+ * A byte count from the wire.
+ *
+ * A STRING, not a JSON number, and parsed to `bigint`. The ceiling is up to 1 TiB — 2^40 — which is
+ * inside `Number.MAX_SAFE_INTEGER`, so this is not yet a precision bug. It is written as a bigint
+ * anyway because the day somebody raises the ceiling to a petabyte is the day a silent rounding in
+ * a disk-space guard starts letting writes through that should have been refused, and that failure
+ * would look exactly like the guard working.
+ */
+function parseByteCount(value: string, field: string): bigint {
+  if (!/^\d{1,20}$/.test(value)) {
+    throw new BadRequestError(`${field} must be a decimal string of bytes`)
+  }
   return BigInt(value)
 }
 

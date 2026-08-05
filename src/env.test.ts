@@ -25,6 +25,10 @@ const REQUIRED: Record<string, string> = {
   MARKET_URL: 'http://127.0.0.1:4013',
   BILLING_URL: 'http://127.0.0.1:4009',
   ADMIN_API_SERVICE_TOKEN: 'a-real-looking-token-of-sufficient-length',
+  // Required with NO default, deliberately — a default answer to "which estate am I?" is how a
+  // testnet backup gets restored over mainnet balances. `testnet` here, never `mainnet`, so a
+  // fixture can never stand in for the environment where the refusal actually matters.
+  ADMIN_API_ESTATE_ENVIRONMENT: 'testnet',
 }
 
 for (const [key, value] of Object.entries(REQUIRED)) process.env[key] = value
@@ -181,4 +185,37 @@ test('no variable carrying credential vocabulary is a duration or a count', () =
   for (const name of ['OUTBOX_SIGNING_SECRET', 'OUTBOX_ACCEPT_SECRETS', 'ADMIN_API_SERVICE_TOKEN']) {
     assert.ok(/SECRET|TOKEN|KEY/.test(name), `${name} is a credential and should say so`)
   }
+})
+
+/**
+ * The estate environment, which has no default and no safe guess.
+ *
+ * Every other required variable here fails loudly the moment it is used — a missing JWKS URL is a
+ * 503 on the first request. This one would fail SILENTLY and LATE: an estate that guessed its own
+ * environment would stamp every backup it takes with the wrong label, and the artefacts would sit
+ * on disk looking correct until somebody restored one into the wrong estate. That is why it is
+ * `required` rather than `optional`, and why the value is checked against a closed list rather
+ * than merely being non-empty.
+ */
+test('ADMIN_API_ESTATE_ENVIRONMENT is required and closed', () => {
+  const { ADMIN_API_ESTATE_ENVIRONMENT: _dropped, ...without } = REQUIRED
+  assert.throws(() => loadEnv(without), /ADMIN_API_ESTATE_ENVIRONMENT is required/)
+
+  assert.throws(
+    () => loadEnv(withEnv({ ADMIN_API_ESTATE_ENVIRONMENT: 'prod' })),
+    /must be one of mainnet, testnet, development/,
+    'an unrecognised environment must be refused rather than passed through — "prod" is exactly ' +
+      'the plausible-looking value somebody would type for mainnet',
+  )
+
+  for (const environment of ['mainnet', 'testnet', 'development']) {
+    assert.equal(loadEnv(withEnv({ ADMIN_API_ESTATE_ENVIRONMENT: environment })).estateEnvironment, environment)
+  }
+})
+
+/** The compose project IS defaulted, and the asymmetry with the environment is the point. */
+test('the compose project defaults to mainnet’s, because that is the compose default too', () => {
+  const { ADMIN_API_COMPOSE_PROJECT: _unset, ...without } = { ...REQUIRED, ADMIN_API_COMPOSE_PROJECT: 'x' }
+  assert.equal(loadEnv(without).composeProject, 'cloudsforge-estate')
+  assert.equal(loadEnv(withEnv({ ADMIN_API_COMPOSE_PROJECT: 'cf-testnet' })).composeProject, 'cf-testnet')
 })

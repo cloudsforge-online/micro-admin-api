@@ -67,6 +67,7 @@ function deps(overrides: Partial<JobDeps> = {}): JobDeps {
     instanceId: 'replica-a',
     auditVerifyBatch: 5_000,
     idempotencyTtlDays: 14,
+    composeProject: 'cf-testnet',
     ...overrides,
   }
 }
@@ -139,6 +140,10 @@ test('every lease key names a contended resource, not a row', { skip }, async ()
     [
       'approvals.expire:approvals',
       'audit.verify:audit:chain',
+      // The SCHEDULER, keyed on the one backup cadence. The `backup.run`/`backup.restore` jobs it
+      // enqueues are keyed by run id and are deliberately NOT recurring — they are distinct
+      // artefacts, and this service registers no handler for them at all. See `src/backups.ts`.
+      'backup.schedule:backup:schedule',
       'idempotency.reap:idempotency',
       'outbox.relay:outbox',
     ],

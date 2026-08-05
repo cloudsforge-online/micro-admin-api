@@ -73,7 +73,27 @@ export async function migrateTestDb(sql: postgres.Sql): Promise<void> {
 export async function resetAdminApi(sql: postgres.Sql): Promise<void> {
   await sql.unsafe(`truncate ${[...TABLES, 'jobs'].join(', ')} restart identity cascade`)
   for (const sequence of SEQUENCES) await sql.unsafe(`alter sequence ${sequence} restart with 1`)
+  // ── RE-SEEDED AFTER EVERY RESET, because a backup or a restore is REFUSED by an estate that has
+  //    not claimed an identity — that refusal is the control, not an inconvenience. TRUNCATE fires
+  //    no row triggers, so `estate_identity_immutable` does not block the reset the way a DELETE
+  //    would; the row is simply re-established here so each test starts in a bootable estate.
+  //
+  //    `TEST_ENVIRONMENT` is `testnet` ON PURPOSE. Every fixture backup is therefore a testnet
+  //    backup, so a test that accidentally exercised a cross-environment restore against a
+  //    `mainnet` fixture gets the refusal rather than a pass.
+  await sql.unsafe(
+    `insert into estate_identity (singleton, environment, claimed_by)
+     values (true, $1, 'service:admin-api@test') on conflict (singleton) do nothing`,
+    [TEST_ENVIRONMENT],
+  )
+  await sql.unsafe(
+    `insert into backup_settings (singleton, updated_by) values (true, 'test')
+     on conflict (singleton) do nothing`,
+  )
 }
+
+/** The environment every test estate claims. See `resetAdminApi` for why it is not `mainnet`. */
+export const TEST_ENVIRONMENT = 'testnet'
 
 /** Logs are discarded rather than silenced, so a serialisation failure still throws. */
 export function quietLogger(): Logger {
@@ -543,6 +563,8 @@ export async function startHarness(
     billing,
     identity,
     readiness: options.readiness ?? fakeReadiness({ ledger: { ready: true, state: 'ready' } }),
+    estateEnvironment: TEST_ENVIRONMENT,
+    composeProject: 'cf-testnet',
     eventAcceptSecrets: options.acceptSecrets ?? ['a-test-signing-secret-of-sufficient-length'],
     approvalTtlMinutes: options.approvalTtlMinutes ?? 240,
     ...(options.now ? { now: options.now } : {}),

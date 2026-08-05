@@ -148,6 +148,7 @@
  */
 
 import type { Approval } from './approvals.ts'
+import { BACKUP_RESTORE, enqueueBackupJob, requestRestore } from './backups.ts'
 import type { BillingClient, IdentityClient, LedgerClient, MarketClient } from './upstreams.ts'
 import {
   claimTransfer,
@@ -317,6 +318,45 @@ export const ACTIONS: Readonly<Record<string, ActionSpec>> = Object.freeze({
     route: 'PUT /internal/users/:id/roles — identity/src/server.ts:1584, scope identity:admin (SERVICE token only)',
     blockedReason: null,
     requiredParams: ['role'],
+  },
+
+  /**
+   * **A LIVE RESTORE IS THE ONLY ACTION HERE THAT DESTROYS DATA RATHER THAN CHANGING IT.**
+   *
+   * Every other action in this catalogue is a write somebody can argue about afterwards — a
+   * reversal posts a compensating entry, a revocation can be re-granted, a role can be taken back.
+   * A live restore overwrites the databases of every service in the estate with the contents of a
+   * file. What was there is gone, including the audit rows that would say who did it.
+   *
+   * So it is a two-operator action, and the queue is the ONLY door to it. `POST /v1/restores`
+   * accepts `mode: 'verify'` — a restore into a throwaway scratch database that proves the backup
+   * works and touches nothing live — and refuses `mode: 'live'` outright. There is no single-
+   * operator path to a live restore and no flag that creates one.
+   *
+   * **THE TYPED CONFIRMATION IS CAPTURED AT REQUEST TIME, NOT AT EXECUTION TIME**, which is a
+   * deliberate inversion of the usual "confirm the dangerous thing at the last moment". The second
+   * operator must be able to see EXACTLY what the first one agreed to before signing, and a phrase
+   * typed after their approval is a phrase they never saw. `params.confirmation` must equal
+   * `expectedConfirmation(backup)` — `restore <environment> from <timestamp>` — which cannot be
+   * typed correctly without having read which backup was selected and which estate this is.
+   *
+   * The remaining gates are in the schema and in the runner; `src/backups.ts` `requestRestore`
+   * enumerates all four and why one alone is not enough.
+   */
+  'estate.restore': {
+    subjectKind: 'backup_run',
+    upstream: 'admin-api',
+    approval: 'two-operator',
+    summary:
+      'RESTORE THE ESTATE FROM A BACKUP, OVERWRITING LIVE DATA. Two operators, a typed ' +
+      'confirmation naming the backup and the environment, and a schema trigger that refuses a ' +
+      'backup taken in a different environment. A verify-only restore into a scratch database ' +
+      'needs none of this and is POST /v1/restores with mode=verify.',
+    route:
+      'POST /v1/restores (mode=verify) — admin-api/src/backups.ts:601 requestRestore; the live ' +
+      'mode is reachable only through this queue and this executor',
+    blockedReason: null,
+    requiredParams: ['confirmation'],
   },
 })
 
@@ -608,6 +648,68 @@ export const EXECUTORS: Readonly<Record<string, Executor>> = Object.freeze({
       roles: [...change.roles],
       granted: [...change.granted],
       revoked: [...change.revoked],
+    }
+  },
+
+  /**
+   * Queue the live restore that two operators have now authorised.
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * **THIS EXECUTOR QUEUES A RESTORE. IT DOES NOT PERFORM ONE.**
+   *
+   * The restore row and the job that will claim it are written in ONE transaction — see
+   * `enqueueBackupJob` for why that cannot go through `JobQueue`, which holds its own connection.
+   * The bytes are moved by `deploy/backup`, a separate deployable, because this service holds no
+   * credential for any database but its own (Rule 1) and should not.
+   *
+   * The consequence worth stating: a successful execution here means "the restore has been
+   * AUTHORISED AND QUEUED", not "the estate has been restored". `recordExecution` therefore stores
+   * the restore run id, and the console follows that row to its own terminal state. An executor
+   * that reported success on a queued restore as though the data were back would be the single
+   * most dangerous lie this service could tell.
+   *
+   * `restore_runs_one_live_per_approval` — a partial unique index on `approval_id` — is what makes
+   * a retry safe: the second insert fails at the index rather than starting a second restore over
+   * the top of the first. One approval authorises ONE restore, for ever, exactly as
+   * `engagement_transfers_one_per_approval` makes one approval one transfer.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  'estate.restore': async (ctx) => {
+    const confirmation = requireString(ctx.approval.params, 'confirmation')
+    const rawTargets = ctx.approval.params['targets']
+    // An absent `targets` means the whole set. Stated rather than defaulted silently, because
+    // "restore everything" is not a safe thing to arrive at by omission.
+    const targets = Array.isArray(rawTargets) ? rawTargets.filter((t): t is string => typeof t === 'string') : []
+
+    const queued = await ctx.sql.begin(async (tx) => {
+      const restore = await requestRestore(tx, {
+        backupRunId: ctx.approval.subjectId,
+        mode: 'live',
+        targets,
+        // The APPROVER, not the requester — the same principal this service's hash-chained audit
+        // row names as having caused the action.
+        requestedBy: ctx.operator,
+        reason: `${ctx.approval.reasonCode}: ${ctx.approval.reason}`,
+        approvalId: ctx.approval.id,
+        confirmation,
+        correlationId: ctx.correlationId,
+      })
+      await enqueueBackupJob(tx, BACKUP_RESTORE, `restore:${restore.id}`, {
+        restoreRunId: restore.id,
+      })
+      return { value: restore }
+    })
+
+    return {
+      restoreRunId: queued.value.id,
+      backupRunId: queued.value.backupRunId,
+      environment: queued.value.environment,
+      mode: queued.value.mode,
+      // Not 'restored'. See the header: this is an authorisation, and the data plane has not run.
+      state: queued.value.state,
+      note:
+        'The restore is QUEUED, not complete. Follow restore run ' +
+        `${queued.value.id} for the outcome.`,
     }
   },
 })
