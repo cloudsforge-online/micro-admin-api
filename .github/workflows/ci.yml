@@ -38,6 +38,11 @@ jobs:
         LEDGER_URL=http://127.0.0.1:4007
         MARKET_URL=http://127.0.0.1:4013
         BILLING_URL=http://127.0.0.1:4009
+        # Required with no default (src/env.ts): the service refuses to start without it, so the
+        # image smoke test cannot reach /livez without it either. `development` is correct for CI —
+        # it is a throwaway container, and naming `mainnet` here would be a lie in a file that is
+        # copied.
+        ADMIN_API_ESTATE_ENVIRONMENT=development
     secrets:
       # @cloudsforge/* is resolved by link:../runtime, so CI checks out micro-runtime and
       # micro-contracts as siblings — both private, so the workflow needs a contents:read token.
