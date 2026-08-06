@@ -60,7 +60,7 @@ test('THE §3.3h CHOICE: `admin:*` is REFUSED on this service', () => {
 })
 
 test('and the difference is REAL: runtime\'s hasScope would have granted it', () => {
-  // Not a hypothetical. `runtime/packages/auth/src/index.ts:178` honours one wildcard level, and
+  // Not a hypothetical. `runtime/packages/auth/src/index.ts` honours one wildcard level, and
   // that is the package this service imports. Calling `hasScope` here instead of `hasExactScope`
   // would hand `admin:*` the audit mirror and the approval queue.
   const wildcard = servicePrincipal('some-service', ['admin:*'])

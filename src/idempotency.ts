@@ -2,7 +2,7 @@
  * Run a mutating operation at most once per key.
  *
  * **The shape is market's** (`market/src/idempotency.ts`), which is the ledger's, which took it
- * from `repos/forge-pay/services/pay/src/store.ts:153`. It is not reinvented here; it is
+ * from `repos/forge-pay/services/pay/src/store.ts`. It is not reinvented here; it is
  * inherited, because the four properties below are the whole of the correctness and each is easy
  * to lose while writing something that looks equivalent:
  *

@@ -7,11 +7,11 @@ tamper-evident hash-chained audit mirror, feature flags and broadcasts.**
 
 Design authority: [`ecosystem/03-repository-responsibilities.md`](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/03-repository-responsibilities.md)
 
-Per [`03-repository-responsibilities.md:50`](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/03-repository-responsibilities.md),
+Per [`03-repository-responsibilities.md`](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/03-repository-responsibilities.md),
 this supersedes `platform/services/nimbus`'s admin proxies. Nimbus's audit is
 `log.warn({audit: …})` — a log line, which is sampled, expires, and can be lost under load (SD-11)
 — and its two proxies call bare `fetch` with no total-request timeout, so a hung ForgeKeyvault
-pins the identity service indefinitely (`routes/vault.ts:61`, `routes/pay.ts:73`).
+pins the identity service indefinitely (`routes/vault.ts`, `routes/pay.ts`).
 
 ## The one rule
 
@@ -58,9 +58,9 @@ Re-checked here against source, all three claims hold:
 
 | Claim | Verified at |
 | --- | --- |
-| `POST /service-tokens` requires the `admin` role | `identity/src/server.ts:1266`, via `authenticateAdmin` at `:545` |
-| `users.roles` is `text[] not null default '{}'` | `identity/src/migrations.ts:119` |
-| No route in identity grants a platform role | All 36 route definitions enumerated. `POST /auth/register` hard-codes `['player']` (`identity/src/users.ts:104-106`); `POST /organisations/:id/memberships` (`:1229`) grants an **organisation** role, which SD-03 is explicit is not a platform role. |
+| `POST /service-tokens` requires the `admin` role | `identity/src/server.ts`, via `authenticateAdmin` |
+| `users.roles` is `text[] not null default '{}'` | `identity/src/migrations.ts` |
+| No route in identity grants a platform role | All 36 route definitions enumerated. `POST /auth/register` hard-codes `['player']` (`identity/src/users.ts`); `POST /organisations/:id/memberships` grants an **organisation** role, which SD-03 is explicit is not a platform role. |
 
 **The write belongs to identity.** `users.roles` is identity's column in identity's database. Rule
 1 of `03` §2 — one database, and no service reads another's — is enforced by a CI check that greps
@@ -114,7 +114,7 @@ re-run by a partial unique index no client can route around. `bootstrap.test.ts`
 from this side, and its pin was changed deliberately and in the open rather than deleted.
 
 **Still owed by `micro-deploy`:** this service's token does not yet carry `identity:admin`
-(`deploy/compose/docker-compose.estate.yml:301`). Until it does the executor is correct and will
+(`deploy/compose/docker-compose.estate.yml`). Until it does the executor is correct and will
 `403` at identity in a real deployment. It is therefore proven against a fake upstream, as every
 other executor here is, and **not** yet end-to-end against the running estate.
 
@@ -128,8 +128,8 @@ other executor here is, and **not** yet end-to-end against the running estate.
 
 | Package | Line | Semantics |
 | --- | --- | --- |
-| `contracts/packages/auth` | `src/index.ts:209` | `granted.includes(required)` — exact only |
-| `runtime/packages/auth` | `src/index.ts:178` | one wildcard level: `foo:*` grants `foo:bar` |
+| `contracts/packages/auth` | `src/index.ts` | `granted.includes(required)` — exact only |
+| `runtime/packages/auth` | `src/index.ts` | one wildcard level: `foo:*` grants `foo:bar` |
 
 **Neither package is changed by this repository**, per §3.3h's conclusion that changing an
 authorisation matcher is the highest-blast-radius edit available here and wants the owner rather
@@ -215,7 +215,7 @@ SD-16 runs the verifier nightly and calls a break a P0.
 
 ## 4. Four eyes
 
-`13-operational-model.md:757`: self-approval "is refused by the service, not by documentation".
+`13-operational-model.md`: self-approval "is refused by the service, not by documentation".
 Enforced three times, and proved three times with the layer above bypassed each time:
 
 1. `decide()` refuses it with a `SelfApprovalError` → HTTP 403 `self_approval_refused`.
@@ -251,9 +251,9 @@ That is preserved — but only where the upstream can accept it.
 
 | Upstream | Route (cited) | Credential | Why |
 | --- | --- | --- | --- |
-| `market` | `POST /v1/moderation/cases/:id/resolve` — `market/src/server.ts:1086` | **the operator's own bearer** | `requireOperator` admits a user token with `role:admin`, and market derives `resolvedBy` from the principal. Market's own record names the human. |
-| `billing` | `POST /entitlements/:id/revoke` — `billing/src/server.ts:544` | **the operator's own bearer** | same: `isAdmin(principal)` branch, `actor` derived from the principal. |
-| `ledger` | `POST /entries/:id/reverse` — `ledger/src/server.ts:394`, scope `ledger:post` | **this service's service token** | `authorise` refuses a user principal outright, and no route does otherwise. The ledger records `service:admin-api`. |
+| `market` | `POST /v1/moderation/cases/:id/resolve` — `market/src/server.ts` | **the operator's own bearer** | `requireOperator` admits a user token with `role:admin`, and market derives `resolvedBy` from the principal. Market's own record names the human. |
+| `billing` | `POST /entitlements/:id/revoke` — `billing/src/server.ts` | **the operator's own bearer** | same: `isAdmin(principal)` branch, `actor` derived from the principal. |
+| `ledger` | `POST /entries/:id/reverse` — `ledger/src/server.ts`, scope `ledger:post` | **this service's service token** | `authorise` refuses a user principal outright, and no route does otherwise. The ledger records `service:admin-api`. |
 
 For the ledger the human is not lost — the entry's `metadata.operator` names them, this service's
 chain names them, and both carry the same `correlationId` — but the ledger's own record is less
@@ -303,8 +303,8 @@ Shards — and its §8 build order is law: **nothing may move a Shard before the
 service holds the caps because it already owns cross-service operator state (21 §4). The money it
 caps lives elsewhere, and that refusal is the design: `platform:engagement-treasury` and
 `engagement:<service>` are ordinary `micro-ledger` accounts (grammar:
-`contracts/packages/money/src/index.ts:109`; the ledger's own schema is untouched — its `subject`
-column is unconstrained text at `ledger/src/migrations.ts:119`), and an auditor reconstructs the
+`contracts/packages/money/src/index.ts`; the ledger's own schema is untouched — its `subject`
+column is unconstrained text at `ledger/src/migrations.ts`), and an auditor reconstructs the
 whole programme from the ledger alone.
 
 What migration 8 (`src/migrations.ts`, version 8) makes unrepresentable rather than merely checked:
@@ -322,15 +322,15 @@ What migration 8 (`src/migrations.ts`, version 8) makes unrepresentable rather t
 Every row of that table is fire-tested with raw SQL in `src/engagement.test.ts`, connection in
 hand, routes bypassed.
 
-The three actions (21 §6), in the catalogue at `src/actions.ts:161`:
+The three actions (21 §6), in the catalogue at `src/actions.ts`:
 
 - **`engagement.transfer`** — two operators. The executor claims the cap-checked transfer row,
-  posts **one** balanced entry to `POST /entries` (`ledger/src/server.ts:346`) with both accounts
-  inline so the ledger creates them idempotently on first use (`ledger/src/accounts.ts:100`), then
+  posts **one** balanced entry to `POST /entries` (`ledger/src/server.ts`) with both accounts
+  inline so the ledger creates them idempotently on first use (`ledger/src/accounts.ts`), then
   records the pairing. Idempotent end to end on the approval id.
 - **`engagement.policy.set`** — two operators, **required only to raise**. The lowering lane is
   `PUT /v1/engagement/policies/:service`, one operator — `micro-devplatform`'s quota asymmetry
-  (`devplatform/src/server.ts:981`: *the direction is the authority*), with the trigger holding the
+  (`devplatform/src/server.ts`: *the direction is the authority*), with the trigger holding the
   line against any writer that skips the route. `:service` may be `platform`, which addresses the
   fee-recycle percentage; it starts at 0 (21's recorded open decision — pure mined funding until
   revenue exists).
@@ -398,7 +398,7 @@ state.
    publishes, and it is now reachable by the relays that send them: the route speaks
    `contracts-events`' signing scheme (`cf-signature`) and authenticates with the MAC alone. The
    shared `OUTBOX_SIGNING_SECRET` is already configured for this service in
-   `deploy/compose/docker-compose.estate.yml:1175`, with the same value every producer signs with,
+   `deploy/compose/docker-compose.estate.yml`, with the same value every producer signs with,
    so no deploy change is needed to make delivery work.
 
    What `micro-deploy` still owes is the **subscriptions**: a producer only delivers here if a row
@@ -436,7 +436,7 @@ state.
 5. **Found while reading, reported not fixed** (this repository does not edit siblings):
    **the outbox relay's comment overstates what it does, in eighteen repositories.**
 
-   `service-template/src/outbox.ts:205` — and therefore `billing`, `custody`, `devplatform`,
+   `service-template/src/outbox.ts` — and therefore `billing`, `custody`, `devplatform`,
    `emberkin`, `foresight`, `identity`, `indexer`, `ledger`, `market`, `mint`, `nda`, `pricing`,
    `settlement`, `studio`, `trade`, `wallet` and `worlds`, all carrying it verbatim — says:
 

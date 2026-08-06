@@ -12,7 +12,7 @@
  * different trust domain from composing an operator's console, and collapsing the two would mean a
  * compromise of the console is a compromise of every database in the estate.
  *
- * `JobRunner.claim()` filters by REGISTERED kind (`runtime/packages/jobs/src/index.ts:380`), so
+ * `JobRunner.claim()` filters by REGISTERED kind (`runtime/packages/jobs/src/index.ts`), so
  * this service enqueues work it will never claim and the runner claims work nothing else will take.
  * If no runner is deployed the rows sit `queued` for ever — and the console says exactly that,
  * which is the honest reading. A queue that silently discarded unclaimable work would show an

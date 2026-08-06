@@ -260,7 +260,7 @@ test('an ABSENT credential loads as null; a present rubbish one still refuses to
  * audit of record, which looks exactly like "nothing happened".
  *
  * A rolling rotation is therefore only possible if the RECEIVER accepts more than one secret at a
- * time. `verifyDelivery` has taken a list since `contracts/packages/events/src/index.ts:1412`; what
+ * time. `verifyDelivery` has taken a list since `contracts/packages/events/src/index.ts`; what
  * was missing was the env plumbing.
  */
 test('OUTBOX_ACCEPT_SECRETS is absent by default, and the service accepts exactly the signing secret', () => {

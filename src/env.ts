@@ -191,7 +191,7 @@ function integer(source: Source, name: string, fallback: number, min: number, ma
  * refused, and what goes quiet here is the estate's audit of record — which during an incident
  * reads exactly like "nothing happened".
  *
- * Copied from `devplatform/src/env.ts:103`, which took the shape from activity's
+ * Copied from `devplatform/src/env.ts`, which took the shape from activity's
  * `ACTIVITY_INGEST_SECRETS`. Each entry is validated exactly as a single secret is: a list is not a
  * way to smuggle in a value that `requiredSigningSecret` would refuse on its own.
  */
@@ -258,8 +258,8 @@ export interface Env {
    * **THIS IS THE FIX, AND `serviceToken` BELOW IS THE THING IT REPLACES.**
    *
    * A credential is worth nothing on its own. `ServiceTokenProvider` posts it to identity's
-   * `POST /service-tokens/exchange` (`identity/src/server.ts:1615`) and gets back an ordinary
-   * 600-second token (`identity/src/tokens.ts:33`), then re-mints before expiry on traffic. The
+   * `POST /service-tokens/exchange` (`identity/src/server.ts`) and gets back an ordinary
+   * 600-second token (`identity/src/tokens.ts`), then re-mints before expiry on traffic. The
    * exchange consumes nothing, so N replicas boot from one credential and a restart six days later
    * still works. **The 600 seconds is deliberately unchanged**: rotation IS expiry, and a longer
    * TTL only moves the cliff — settlement's was 600 seconds and it still produced 1,315 undelivered

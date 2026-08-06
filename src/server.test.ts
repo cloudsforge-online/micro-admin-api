@@ -354,7 +354,7 @@ test('THE ROLE GRANT REACHES IDENTITY WITH THE APPROVAL ID AND WITHOUT REVOKING 
   // The two silent failure modes of this executor, both asserted on the exact body sent:
   //
   //   1. `roles: ['admin']` would REVOKE `player`, because identity's route replaces the set
-  //      rather than adding to it (identity/src/platformRoles.ts:116-132) and every registered
+  //      rather than adding to it (identity/src/platformRoles.ts) and every registered
   //      user holds `player`. A privilege removal disguised as a grant.
   //   2. A missing `approvalId` would be refused by identity's CHECK — but only there, and only
   //      at execution time, which is the worst moment to find out.
@@ -1155,7 +1155,7 @@ test('a retracted broadcast that does not exist is 404', { skip }, async () => {
 
 /**
  * `identity.user.deleted` as identity actually sends it: `{ userId, tombstoneAt, reason }` with the
- * envelope key set to the bare user id (`identity/src/deletion.ts:113-125`). The actor is the
+ * envelope key set to the bare user id (`identity/src/deletion.ts`). The actor is the
  * operator who raised it, NOT the deleted user — which is the normal case for a support-raised
  * deletion and the case a handler reading `envelope.actor` gets wrong.
  */
@@ -1265,7 +1265,7 @@ test('ERASURE: the read surface withholds the subject and the mirrored payload',
 test('ERASURE: a non-user subject sharing the id is untouched', { skip }, async () => {
   // ════════════════════════════════════════════════════════════════════════════════════════
   // `audit_events.subject_id` is deliberately `text` and may name a ledger entry, a market case
-  // or an on-chain hash (`migrations.ts:39-40`). Matching on the id alone would restrict — from
+  // or an on-chain hash (`migrations.ts`). Matching on the id alone would restrict — from
   // every operator read, during an incident — an audit row about a movement of money that no
   // data subject ever asked about. Only `subject_kind = 'user'` is in scope.
   // ════════════════════════════════════════════════════════════════════════════════════════
@@ -1308,7 +1308,7 @@ test('ERASURE: an approval about the user is anonymised, and four eyes survive',
     token: ONE,
     headers: { 'idempotency-key': freshKey() },
     body: {
-      // The only action in the registry whose subject IS a user (`actions.ts:312`); every other
+      // The only action in the registry whose subject IS a user (`actions.ts`); every other
       // one names a ledger entry, a moderation case or an entitlement. `subject_kind` comes from
       // the action rather than from the body, which is what makes that true rather than hoped.
       action: 'identity.role.grant',

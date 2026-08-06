@@ -4,9 +4,9 @@
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  * ## The defect, as measured rather than as reasoned about
  *
- * `ADMIN_API_SERVICE_TOKEN` held a token that lives **600 seconds** (`identity/src/tokens.ts:33`).
+ * `ADMIN_API_SERVICE_TOKEN` held a token that lives **600 seconds** (`identity/src/tokens.ts`).
  * The composition root read it once, at import — `const serviceToken = () => env.serviceToken`,
- * `index.ts:120` — and handed that to the ledger, market, billing and identity clients. Measured on
+ * `index.ts` — and handed that to the ledger, market, billing and identity clients. Measured on
  * the live estate on 2026-08-05, the value inside the container was a 701-byte JWT that had been
  * **expired for 26 hours**, on a container reporting healthy the entire time.
  *
@@ -16,7 +16,7 @@
  *
  * ## Why a longer expiry is not the fix
  *
- * `settlement/src/index.ts:83` read a 600-second token once at boot. Identity had issued it exactly
+ * `settlement/src/index.ts` read a 600-second token once at boot. Identity had issued it exactly
  * one token, ever — so settlement authenticated for ten minutes after each restart and was dead
  * thereafter, producing **1,315 undelivered withdrawal attempts** and a treasury that read as
  * empty. One 401 presented as two apparently unrelated incidents. A longer-lived JWT moves that
@@ -84,7 +84,7 @@ const BILLING = 'http://billing:4009'
  */
 const CREDENTIAL = 'cfsc_0000000000000000000000000000000000-000test'
 
-/** identity/src/tokens.ts:33. Unchanged by this fix, and it must stay unchanged. */
+/** identity/src/tokens.ts. Unchanged by this fix, and it must stay unchanged. */
 const SERVICE_TTL_SECONDS = 600
 
 /** What this service actually demands of its own bearer — `upstreams.ts`'s cited route guards. */
@@ -521,7 +521,7 @@ test('THE BACKSTOP: a bearer this process believes is fresh, refused anyway, is 
 test('IDENTITY IS ON THE SAME CREDENTIAL — the wiring is not ledger-only', async () => {
   // `buildUpstreams` hands one `serviceToken` and one `fetch` to all four clients, and this says so
   // about the most consequential of them. `PUT /internal/users/:id/roles` is gated on
-  // `authenticateIdentityAdmin` (identity/src/server.ts:626), which requires a SERVICE token with
+  // `authenticateIdentityAdmin` (identity/src/server.ts), which requires a SERVICE token with
   // `identity:admin` and refuses an operator token outright — so there is no fallback path here at
   // all: a dead credential means no operator can be promoted or demoted, ever.
   clockAt(0)

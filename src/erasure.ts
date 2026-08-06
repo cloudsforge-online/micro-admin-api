@@ -80,7 +80,7 @@
  * | audit_events             | RETAIN   | Only rows with `subject_kind = 'user'` are in scope   |
  * |  (other subject_kinds)   |          | AT ALL. `subject_id` is deliberately `text` and may   |
  * |                          |          | name a ledger entry, a market case, an account handle |
- * |                          |          | or an on-chain hash (`migrations.ts:39-40`). A uuid   |
+ * |                          |          | or an on-chain hash (`migrations.ts`). A uuid   |
  * |                          |          | collision between a user id and a ledger entry id     |
  * |                          |          | must not cause a ledger row to be restricted, so the  |
  * |                          |          | register carries the KIND and every read joins on     |
@@ -122,7 +122,7 @@
  * ──────────────────────────────────────────────────────────────────────────────────────────────
  *
  * **THE MIRROR OF THE DELETION EVENT ITSELF IS KEPT, DELIBERATELY.** `identity.user.deleted` is
- * `audited: true` in `TOPIC_AUDIT` (`contracts/packages/events/src/audit.ts:117`), so the event
+ * `audited: true` in `TOPIC_AUDIT` (`contracts/packages/events/src/audit.ts`), so the event
  * that requests the erasure appends its own audit row naming the subject. That row is the evidence
  * that the request was received and acted on, which is the thing Art. 5(2) asks for, and it is
  * restricted on read like every other row about that subject.

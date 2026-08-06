@@ -200,7 +200,7 @@ export function createRelay(deps: RelayDeps): Handler {
       // The signed bytes and the sent bytes must be identical or every subscriber 401s.
       //
       // Stated honestly rather than assumed: `HttpClient.request` takes an object and calls
-      // `JSON.stringify` on it ITSELF (`runtime/packages/http/src/index.ts:352`), so it cannot be
+      // `JSON.stringify` on it ITSELF (`runtime/packages/http/src/index.ts`), so it cannot be
       // handed the pre-serialised string — that would double-encode. What makes this safe is that
       // both sides call the same `JSON.stringify` on the same object, which is deterministic. It
       // is a coupling, not a proof, so `outbox.test.ts` closes it from the other end: it takes the
@@ -224,9 +224,9 @@ export function createRelay(deps: RelayDeps): Handler {
       // and it is never reconsidered.
       //
       // That is the right behaviour (a subscription is not a replay request) but it is NOT what
-      // the comment inherited from `service-template/src/outbox.ts:205` claims, which says flatly
+      // the comment inherited from `service-template/src/outbox.ts` claims, which says flatly
       // that "a subscriber added after the event was written still receives it" — and which is
-      // carried verbatim by eighteen repositories, `market/src/outbox.ts:239-241` among them.
+      // carried verbatim by eighteen repositories, `market/src/outbox.ts` among them.
       // Both directions are pinned in `outbox.test.ts` so this repository's comment matches this
       // repository's code. Reported rather than fixed in the siblings: this repository does not
       // edit them, and the correction belongs in the template first or it keeps propagating.

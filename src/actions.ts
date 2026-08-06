@@ -6,12 +6,12 @@
  *
  * 18-build-status.md §3.3g records, verified against a running deployment rather than reasoned
  * about, that the estate cannot bootstrap itself: `POST /service-tokens` requires the `admin` role
- * (`identity/src/server.ts:1266`, via `authenticateAdmin` at `:545`), `users.roles` is
- * `text[] not null default '{}'` (`identity/src/migrations.ts:119`), and no route in identity
+ * (`identity/src/server.ts`, via `authenticateAdmin`), `users.roles` is
+ * `text[] not null default '{}'` (`identity/src/migrations.ts`), and no route in identity
  * grants a role. All three re-checked here against source; all three are true, and the
  * enumeration was repeated — identity defines 36 routes, `POST /auth/register` hard-codes
- * `['player']` (`identity/src/users.ts:104-106`), and `POST /organisations/:id/memberships`
- * (`identity/src/server.ts:1229`) grants an ORGANISATION role, which SD-03 is explicit is not a
+ * `['player']` (`identity/src/users.ts`), and `POST /organisations/:id/memberships`
+ * (`identity/src/server.ts`) grants an ORGANISATION role, which SD-03 is explicit is not a
  * platform role. Nothing assigns `users.roles`.
  *
  * The decision, in three parts:
@@ -36,14 +36,14 @@
  * approval queue cannot authorise the first grant, because approving requires an operator who
  * already holds the role. Bootstrap therefore stays outside every service: one
  * `update users set roles = array['admin']` under the database owner's credentials, which is what
- * `deploy/scripts/estate-bootstrap.sh:102` already does. That is the correct home for a step that
+ * `deploy/scripts/estate-bootstrap.sh` already does. That is the correct home for a step that
  * should require physical access to the database and should appear in a runbook rather than an
  * API.
  *
  * **BUT THE STATEMENT IS THE WRONG SHAPE, AND THAT IS A SEPARATE DEFECT.** Where it runs is right;
  * what it is is not. It is **repeatable** — nothing makes the second run differ from the first, so
  * it is not a bootstrap but a permanent superuser lever available for ever to anyone who reaches
- * the database. It is **unaudited** — `identity/src/migrations.ts:119` is `roles text[] not null
+ * the database. It is **unaudited** — `identity/src/migrations.ts` is `roles text[] not null
  * default '{}'` and nothing else, so the most consequential write in the estate is the only one
  * with no trail. And it is **unproven** — nothing goes red if identity, or this service, grows a
  * route that does the same thing.
@@ -99,7 +99,7 @@
  * **THE ROUTE LANDED, SO THE 501 IS GONE AND THE ACTION EXECUTES.**
  *
  * `micro-identity` built it in the shape specified below: `PUT /internal/users/:id/roles`
- * (`identity/src/server.ts:1584`), gated on a SERVICE token holding `identity:admin` (`:626`),
+ * (`identity/src/server.ts`), gated on a SERVICE token holding `identity:admin`,
  * writing a `platform_role_grants` row with `source='approval'` in the same transaction as the
  * `users.roles` update, behind a deferred constraint trigger that refuses the update without one
  * and a partial unique index that spends the single `bootstrap` slot for ever.
@@ -114,7 +114,7 @@
  * first still comes from the deploy-time bootstrap. `bootstrap.test.ts` holds that line.
  *
  * **STILL OWED BY `micro-deploy`:** admin-api's service token does not carry `identity:admin`
- * (`deploy/compose/docker-compose.estate.yml:301` grants it `ledger:read`, `market:read`,
+ * (`deploy/compose/docker-compose.estate.yml` grants it `ledger:read`, `market:read`,
  * `market:admin`, `billing:read`). Until it does, this executor is correct and will 403 at
  * identity in the estate. Reported there rather than worked around here.
  * ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -124,7 +124,7 @@
  *     PUT /internal/users/:id/roles      body: { roles: string[], actor: string, reason: string,
  *                                                approvalId: string }
  *     guard: a SERVICE token holding `identity:admin` — not `authenticateAdmin`, which refuses a
- *            service token outright (`identity/src/server.ts:540`) and would therefore make
+ *            service token outright (`identity/src/server.ts`) and would therefore make
  *            the route unreachable from here for the same reason the bootstrap is unreachable now
  *     write: a `platform_role_grants` row with `source = 'approval'` and that `approvalId`, in the
  *            SAME transaction as the `users.roles` update — the deferred trigger above refuses the
@@ -167,7 +167,7 @@ import {
 /**
  * The role every registered user holds, preserved across a grant.
  *
- * `identity/src/platformRoles.ts:52` is `PLATFORM_ROLES = ['player', 'admin']`, and
+ * `identity/src/platformRoles.ts` is `PLATFORM_ROLES = ['player', 'admin']`, and
  * `POST /auth/register` hard-codes `['player']`. Identity's role write REPLACES the set rather
  * than adding to it, so this is unioned into every grant — see `EXECUTORS['identity.role.grant']`
  * for the full argument and for why it is a named constant rather than a literal buried in a call.
@@ -294,7 +294,7 @@ export const ACTIONS: Readonly<Record<string, ActionSpec>> = Object.freeze({
    *
    * `blockedReason` used to describe a route identity did not have. `micro-identity` has since
    * built exactly it — `PUT /internal/users/:id/roles`, gated on a SERVICE token holding
-   * `identity:admin` (`identity/src/server.ts:1584,626`), writing a `platform_role_grants` row
+   * `identity:admin` (`identity/src/server.ts,626`), writing a `platform_role_grants` row
    * with `source = 'approval'` in the same transaction as the `users.roles` update, behind a
    * deferred constraint trigger that refuses the update if that row is missing.
    *
@@ -457,7 +457,7 @@ export const EXECUTORS: Readonly<Record<string, Executor>> = Object.freeze({
    *      makes one approval one transfer for ever.
    *   2. POST the ledger entry, idempotent on the approval id: a crash between 1 and 2 retries
    *      into a replay, never a second entry. The inline account blocks are what create both
-   *      engagement accounts idempotently on first use (ledger ensureAccount, accounts.ts:100).
+   *      engagement accounts idempotently on first use (ledger ensureAccount, accounts.ts).
    *   3. MARK the row posted with the entry id — from here `posted` and the entry id are one
    *      fact (`engagement_transfers_posted_names_entry`), which is 21 §7.4's pairing.
    *
@@ -593,10 +593,10 @@ export const EXECUTORS: Readonly<Record<string, Executor>> = Object.freeze({
    * **THE ROUTE REPLACES THE ROLE SET; THIS ACTION ADDS ONE ROLE. THE MISMATCH IS HANDLED HERE
    * AND IT IS THE REASON THIS IS NOT THE "TEN LINES" THIS FILE'S HEADER PREDICTED.**
    *
-   * `setPlatformRoles` (`identity/src/platformRoles.ts:116`) takes the COMPLETE set the user is to
+   * `setPlatformRoles` (`identity/src/platformRoles.ts`) takes the COMPLETE set the user is to
    * end up with and computes `granted` and `revoked` by diffing against what they hold. So a naive
    * `roles: [role]` would REVOKE every other role the user has. That is not hypothetical:
-   * `PLATFORM_ROLES` is `['player', 'admin']` (`:52`) and `POST /auth/register` hard-codes
+   * `PLATFORM_ROLES` is `['player', 'admin']` and `POST /auth/register` hard-codes
    * `['player']`, so **every** user has `player` — and promoting an operator to `admin` by sending
    * `['admin']` would demote them out of the ordinary user role in the same call. A privilege
    * REMOVAL disguised as a grant, on the estate's most audit-worthy path.

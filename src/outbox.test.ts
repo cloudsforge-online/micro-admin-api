@@ -301,8 +301,8 @@ test('a subscriber added while an event is OUTSTANDING does receive it', { skip 
 test('THE LIMIT: a subscriber added after the event PUBLISHED does not receive it', { skip }, async () => {
   // With zero active subscriptions the outstanding count is zero, so the event publishes on the
   // first pass and is never reconsidered. That is the right behaviour — a subscription is not a
-  // replay request — but it is NOT what the comment inherited from market/src/outbox.ts:239-241
-  // claims — nor what service-template/src/outbox.ts:205 claims, which is where market got it and
+  // replay request — but it is NOT what the comment inherited from market/src/outbox.ts
+  // claims — nor what service-template/src/outbox.ts claims, which is where market got it and
   // where seventeen other repositories got it too. Reported, not fixed: siblings are not ours.
   await seedEvent()
   const [job, ctx] = jobAndCtx()

@@ -1,7 +1,7 @@
 /**
  * Operator broadcasts.
  *
- * 13-operational-model.md:328 routes "scheduled maintenance" to the public status page as
+ * 13-operational-model.md routes "scheduled maintenance" to the public status page as
  * "`admin-api` broadcasts", and :347 is emphatic that "the on-call operator writes them; nobody
  * else publishes to the public page".
  *

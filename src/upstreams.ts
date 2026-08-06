@@ -11,19 +11,19 @@
  * that guard demands. A citation that stops being true is a compile-time-invisible defect, which
  * is why `upstreams.test.ts` also asserts the shape of every request this file builds.
  *
- *   ledger   POST /entries/:id/reverse        ledger/src/server.ts:394
- *            guard: authorise(POST_SCOPE)     ledger/src/server.ts:78 → 'ledger:post'
+ *   ledger   POST /entries/:id/reverse        ledger/src/server.ts
+ *            guard: authorise(POST_SCOPE)     ledger/src/server.ts → 'ledger:post'
  *            SERVICE TOKEN ONLY               ledger/src/server.ts:~250 `authorise` refuses a
  *                                             user principal outright
- *   ledger   GET  /trial-balance              ledger/src/server.ts:513, scope 'ledger:read'
- *   ledger   POST /entries                    ledger/src/server.ts:346, scope 'ledger:post' —
+ *   ledger   GET  /trial-balance              ledger/src/server.ts, scope 'ledger:read'
+ *   ledger   POST /entries                    ledger/src/server.ts, scope 'ledger:post' —
  *                                             body shape from parsePostEntry at :646-707
- *   ledger   GET  /accounts/:subject/balances ledger/src/server.ts:499, scope 'ledger:read'
- *   market   POST /v1/moderation/cases/:id/resolve   market/src/server.ts:1086
+ *   ledger   GET  /accounts/:subject/balances ledger/src/server.ts, scope 'ledger:read'
+ *   market   POST /v1/moderation/cases/:id/resolve   market/src/server.ts
  *            guard: requireOperator           market/src/server.ts:~1155 — a SERVICE token needs
  *                                             'market:admin', a USER token needs role:admin
- *   market   GET  /v1/moderation/cases        market/src/server.ts:1051, same guard
- *   billing  POST /entitlements/:id/revoke    billing/src/server.ts:544
+ *   market   GET  /v1/moderation/cases        market/src/server.ts, same guard
+ *   billing  POST /entitlements/:id/revoke    billing/src/server.ts
  *            guard: 'billing:grant' for a service, role:admin for a user
  *   any      GET  /readyz                     rule 4 of docs/ecosystem/03 §2 — universal
  * ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -57,7 +57,7 @@
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  * **THE SERVICE BEARER IS NOW EXCHANGED, NOT PRESENTED — micro-org #222.**
  *
- * `serviceToken` below used to be `() => string`, and `index.ts:120` filled it with
+ * `serviceToken` below used to be `() => string`, and `index.ts` filled it with
  * `() => env.serviceToken`: one string, read once at import, put verbatim in the `authorization`
  * header of every call this file marks `{ kind: 'service' }`. Measured on the live estate on
  * 2026-08-05, that string was a 701-byte JWT that had **expired 26 hours earlier** on a container
@@ -66,7 +66,7 @@
  * outbound call.
  *
  * That is the ten-minute cliff (#197), and it is not a shape a longer expiry can fix. `settlement`
- * read a 600-second token once at boot (`settlement/src/index.ts:83`), authenticated for ten
+ * read a 600-second token once at boot (`settlement/src/index.ts`), authenticated for ten
  * minutes after each restart, was dead thereafter, and produced **1,315 undelivered withdrawal
  * attempts** against a treasury that read as empty. A longer-lived JWT would have moved that cliff,
  * not removed it.
@@ -243,11 +243,11 @@ export interface TrialBalance {
 
 /**
  * One side of an entry this service posts. Field names are the ledger's, read from
- * `parsePostEntry` at ledger/src/server.ts:646-707: `direction`, `amount` (a DECIMAL STRING —
+ * `parsePostEntry` at ledger/src/server.ts: `direction`, `amount` (a DECIMAL STRING —
  * a JSON number near an 18-decimal amount comes back subtly wrong, not visibly broken),
  * `assetCode`, `sequence`, and an inline `account` block, which is what makes the engagement
  * accounts' creation idempotent on first use: the ledger's `ensureAccount`
- * (ledger/src/accounts.ts:100) is `on conflict do nothing` on the account key.
+ * (ledger/src/accounts.ts) is `on conflict do nothing` on the account key.
  */
 export interface EntryPosting {
   readonly direction: 'debit' | 'credit'
@@ -263,7 +263,7 @@ export interface EntryPosting {
 }
 
 export interface PostEntryRequest {
-  /** One of the ledger's closed `journal_entries_kind_chk` list — ledger/src/migrations.ts:180. */
+  /** One of the ledger's closed `journal_entries_kind_chk` list — ledger/src/migrations.ts. */
   readonly kind: string
   readonly idempotencyKey: string
   readonly description: string
@@ -285,18 +285,18 @@ export interface AccountBalance {
   readonly purpose: string
   readonly type: string
   readonly status: string
-  /** A decimal string in the account's normal direction — ledger/src/accounts.ts:160-172. */
+  /** A decimal string in the account's normal direction — ledger/src/accounts.ts. */
   readonly amount: string
 }
 
 export interface LedgerClient {
-  /** `POST /entries/:id/reverse` — ledger/src/server.ts:394, scope `ledger:post`. */
+  /** `POST /entries/:id/reverse` — ledger/src/server.ts, scope `ledger:post`. */
   reverseEntry(request: ReverseEntryRequest): Promise<ReversedEntry>
-  /** `POST /entries` — ledger/src/server.ts:346, scope `ledger:post`. SERVICE TOKEN ONLY. */
+  /** `POST /entries` — ledger/src/server.ts, scope `ledger:post`. SERVICE TOKEN ONLY. */
   postEntry(request: PostEntryRequest): Promise<PostedEntry>
-  /** `GET /trial-balance` — ledger/src/server.ts:513, scope `ledger:read`. */
+  /** `GET /trial-balance` — ledger/src/server.ts, scope `ledger:read`. */
   trialBalance(): Promise<TrialBalance>
-  /** `GET /accounts/:subject/balances` — ledger/src/server.ts:499, scope `ledger:read`. */
+  /** `GET /accounts/:subject/balances` — ledger/src/server.ts, scope `ledger:read`. */
   balancesForSubject(subject: string): Promise<readonly AccountBalance[]>
 }
 
@@ -305,7 +305,7 @@ export function httpLedgerClient(config: ClientConfig): LedgerClient {
   return {
     async reverseEntry(request) {
       try {
-        // The body's field names are the ledger's, read from its handler at server.ts:394-419:
+        // The body's field names are the ledger's, read from its handler at server.ts:
         // originatingService, actor, correlationId, idempotencyKey, description, kind, metadata.
         // `actor` is typed `service:${string}` there, which is why the operator travels in
         // metadata rather than in the field whose name suggests it.
@@ -333,7 +333,7 @@ export function httpLedgerClient(config: ClientConfig): LedgerClient {
     },
     async postEntry(request) {
       try {
-        // Body fields from `parsePostEntry`, ledger/src/server.ts:646-707. `actor` is typed
+        // Body fields from `parsePostEntry`, ledger/src/server.ts. `actor` is typed
         // `service:${string}` there, so — exactly as in reverseEntry above — the human operator
         // travels in metadata and in this service's hash-chained audit row, joined by the
         // correlation id.
@@ -376,7 +376,7 @@ export function httpLedgerClient(config: ClientConfig): LedgerClient {
     async balancesForSubject(subject) {
       try {
         // The subject is `platform:engagement-treasury` or `engagement:<service>` — both carry a
-        // colon, and the route decodes (`decodeURIComponent`, ledger/src/server.ts:503), so the
+        // colon, and the route decodes (`decodeURIComponent`, ledger/src/server.ts), so the
         // encoding here is what a well-behaved client owes it.
         const answer = await client.get<{ balances: readonly AccountBalance[] }>(
           `/accounts/${encodeURIComponent(subject)}/balances`,
@@ -408,9 +408,9 @@ export interface ModerationCase {
 }
 
 export interface MarketClient {
-  /** `POST /v1/moderation/cases/:id/resolve` — market/src/server.ts:1086. */
+  /** `POST /v1/moderation/cases/:id/resolve` — market/src/server.ts. */
   resolveCase(request: ResolveCaseRequest): Promise<ModerationCase>
-  /** `GET /v1/moderation/cases?state=open` — market/src/server.ts:1051. */
+  /** `GET /v1/moderation/cases?state=open` — market/src/server.ts. */
   openCases(operatorBearer: string): Promise<readonly ModerationCase[]>
 }
 
@@ -419,7 +419,7 @@ export function httpMarketClient(config: ClientConfig): MarketClient {
   return {
     async resolveCase(request) {
       try {
-        // Body fields read from market/src/server.ts:1089-1099: `state` must be 'upheld' or
+        // Body fields read from market/src/server.ts: `state` must be 'upheld' or
         // 'dismissed', `notes` is optional. `resolvedBy` is NOT a body field — market derives it
         // from the principal, which is exactly why the operator's bearer is forwarded.
         const answer = await client.post<{ case: ModerationCase }>(
@@ -465,7 +465,7 @@ export interface RevokeResult {
 }
 
 export interface BillingClient {
-  /** `POST /entitlements/:id/revoke` — billing/src/server.ts:544. */
+  /** `POST /entitlements/:id/revoke` — billing/src/server.ts. */
   revokeEntitlement(request: RevokeEntitlementRequest): Promise<RevokeResult>
 }
 
@@ -474,7 +474,7 @@ export function httpBillingClient(config: ClientConfig): BillingClient {
   return {
     async revokeEntitlement(request) {
       try {
-        // Body fields read from billing/src/server.ts:548-551: `reason` is required and must be
+        // Body fields read from billing/src/server.ts: `reason` is required and must be
         // non-empty, `refund` is a boolean. `actor` is derived from the principal there
         // (`actorOf`), so forwarding the operator's bearer is what makes billing's own audit name
         // the human rather than this service.
@@ -514,7 +514,7 @@ export interface RoleChange {
 }
 
 export interface IdentityClient {
-  /** `PUT /internal/users/:id/roles` — identity/src/server.ts:1584, scope `identity:admin`. */
+  /** `PUT /internal/users/:id/roles` — identity/src/server.ts, scope `identity:admin`. */
   setRoles(request: SetRolesRequest): Promise<RoleChange>
 }
 
@@ -527,7 +527,7 @@ export interface IdentityClient {
  * Every other executor here forwards the operator's own token where the upstream accepts one, so
  * that the upstream's audit names the human. This one cannot: identity gates the route with
  * `authenticateIdentityAdmin`, which requires a SERVICE token holding `identity:admin`
- * (`identity/src/server.ts:626`) and refuses an operator token outright. That is deliberate on
+ * (`identity/src/server.ts`) and refuses an operator token outright. That is deliberate on
  * identity's side and was specified that way by this repository's own `actions.ts` header — a gate
  * built on `authenticateAdmin` would refuse a service token and make the route unreachable from
  * here, which is the exact shape of the defect that left the audit mirror empty all night.
@@ -545,7 +545,7 @@ export function httpIdentityClient(config: ClientConfig): IdentityClient {
   return {
     async setRoles(request) {
       try {
-        // Body fields read from identity/src/server.ts:1589-1598: roles, actor, reason,
+        // Body fields read from identity/src/server.ts: roles, actor, reason,
         // approvalId. All four are required there and `approvalId` must be a uuid.
         return await client.put<RoleChange>(
           `/internal/users/${encodeURIComponent(request.userId)}/roles`,
@@ -578,7 +578,7 @@ export function httpIdentityClient(config: ClientConfig): IdentityClient {
  * job runner and calls `listen()` — importing it from a test starts a server against a database. So
  * the line that was wrong,
  *
- *     const serviceToken = () => env.serviceToken        // index.ts:120, for the life of the
+ *     const serviceToken = () => env.serviceToken        // index.ts, for the life of the
  *                                                        // process and of the container
  *
  * was structurally untestable, and this repository's 311-line `upstreams.test.ts` could not have
@@ -705,7 +705,7 @@ export function buildUpstreams(env: UpstreamEnv, options: UpstreamOptions = {}):
     market: httpMarketClient({ baseUrl: env.marketUrl, ...clientConfig }),
     billing: httpBillingClient({ baseUrl: env.billingUrl, ...clientConfig }),
     // The role-grant upstream. Presents this service's own bearer, never an operator's — identity's
-    // `identity:admin` gate refuses a user principal outright (identity/src/server.ts:626).
+    // `identity:admin` gate refuses a user principal outright (identity/src/server.ts).
     identity: httpIdentityClient({ baseUrl: env.identityUrl, ...clientConfig }),
   }
 }

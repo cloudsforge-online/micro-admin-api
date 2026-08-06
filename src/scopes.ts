@@ -6,8 +6,8 @@
  *
  * 18-build-status.md §3.3h records that the estate ships two scope matchers that disagree:
  *
- *   | `contracts/packages/auth` | `src/index.ts:209` | `granted.includes(required)` — exact only |
- *   | `runtime/packages/auth`   | `src/index.ts:178` | one wildcard level: `foo:*` grants `foo:bar` |
+ *   | `contracts/packages/auth` | `src/index.ts` | `granted.includes(required)` — exact only |
+ *   | `runtime/packages/auth`   | `src/index.ts` | one wildcard level: `foo:*` grants `foo:bar` |
  *
  * Both are shipped, both are CI-green, and neither is wrong on its own terms. **Neither is changed
  * by this repository**, per §3.3h's conclusion that changing an authorisation matcher is the
@@ -65,7 +65,7 @@ export const READ_SCOPE = 'admin:read'
  * does not have — and this file exists to make this service's authority auditable.
  *
  * Two orphans outside this repository follow and are REPORTED, not edited from here:
- * `contracts/packages/auth/src/index.ts:157` still registers `admin:audit:write` in the estate
+ * `contracts/packages/auth/src/index.ts` still registers `admin:audit:write` in the estate
  * scope vocabulary, and `micro-admin-web`'s README and `src/lib/` still describe the mirror as
  * demanding it. Neither is harmful — an unused scope grants nothing — and neither is this
  * repository's to change.

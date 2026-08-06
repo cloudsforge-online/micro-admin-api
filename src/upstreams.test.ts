@@ -12,12 +12,12 @@
  * body field names, and the exact bearer.
  *
  * Field names below were read from the providers' handlers:
- *   ledger   server.ts:394-419 — originatingService, actor, correlationId, idempotencyKey,
+ *   ledger   server.ts — originatingService, actor, correlationId, idempotencyKey,
  *                                description, kind, metadata
- *   market   server.ts:1089-1099 — state ('upheld'|'dismissed'), notes. `resolvedBy` is NOT a body
+ *   market   server.ts — state ('upheld'|'dismissed'), notes. `resolvedBy` is NOT a body
  *                                field: market derives it from the principal, which is why the
  *                                operator's bearer is forwarded rather than this service's.
- *   billing  server.ts:548-551 — reason (required, non-empty), refund (boolean)
+ *   billing  server.ts — reason (required, non-empty), refund (boolean)
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 
@@ -79,7 +79,7 @@ test('the ledger reversal hits the cited path with the cited body', async () => 
   assert.equal(hit.path, '/entries/entry-1/reverse')
   const body = JSON.parse(hit.body)
   assert.equal(body.originatingService, 'admin-api')
-  // `actor` is typed `service:${string}` at ledger/src/server.ts:400, which is why the human
+  // `actor` is typed `service:${string}` at ledger/src/server.ts, which is why the human
   // travels in metadata rather than in the field whose name suggests it.
   assert.equal(body.actor, 'service:admin-api')
   assert.equal(body.idempotencyKey, 'admin-api:approval:abc')
@@ -231,7 +231,7 @@ test('A WEDGED UPSTREAM IS BOUNDED BY THE DEADLINE, not left hanging', async () 
   // The socket is accepted and then nothing is written, which is what a wedged upstream actually
   // looks like — a genuinely different failure from a refused connection, and the one that pins a
   // caller indefinitely if there is no total-request timeout. Nimbus's admin proxies call bare
-  // `fetch` (routes/vault.ts:61, routes/pay.ts:73) and have exactly that hole.
+  // `fetch` (routes/vault.ts, routes/pay.ts) and have exactly that hole.
   target.hang(true)
   const started = Date.now()
   await assert.rejects(async () => httpLedgerClient(config({ deadlineMs: 250 })).trialBalance(), UpstreamError)

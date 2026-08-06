@@ -12,7 +12,7 @@
  *   3. The UPDATE in `decide()` carries `and requested_by <> ${operator}` in its WHERE clause, so
  *      even a transaction that somehow reached the write claims no row.
  *
- * Three is not paranoia about one rule; it is the recognition that 13-operational-model.md:757
+ * Three is not paranoia about one rule; it is the recognition that 13-operational-model.md
  * says self-approval "is refused by the service, not by documentation" about the one control that
  * stands between a single compromised operator credential and a manual ledger adjustment.
  * `approvals.test.ts` proves all three independently, including by going straight at the database

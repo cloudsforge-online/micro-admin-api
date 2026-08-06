@@ -5,7 +5,7 @@
  * **WHAT LIVES HERE AND WHAT DELIBERATELY DOES NOT.**
  *
  * The money is in `micro-ledger`: `platform:engagement-treasury` and `engagement:<service>` are
- * ordinary ledger accounts (the grammar is `contracts/packages/money/src/index.ts:164`, the
+ * ordinary ledger accounts (the grammar is `contracts/packages/money/src/index.ts`, the
  * accounts are rows in the ledger's unchanged chart — 21 §4 requires zero ledger schema change and
  * gets it). This file holds what 21 §4 assigns to admin-api because "it already owns cross-service
  * operator state": the caps, the fee-recycle percentage, and the record that every approved
@@ -16,7 +16,7 @@
  * (`engagement_raise_needs_approval`, migrations.ts version 8). Lowering is one operator on
  * `PUT /v1/engagement/policies/:service`, because a cap the capped programme can quietly raise is
  * not a cap, while an operator narrowing the blast radius is doing the platform's work for it.
- * That is `micro-devplatform`'s quota decision (`devplatform/src/server.ts:981`, "A QUOTA THE
+ * That is `micro-devplatform`'s quota decision (`devplatform/src/server.ts`, "A QUOTA THE
  * QUOTA'D PARTY CAN RAISE IS NOT A QUOTA … THE DIRECTION IS THE AUTHORITY"), applied to the money
  * that funds empty rooms.
  *

@@ -663,7 +663,7 @@ function buildRoutes(): Route[] {
      *      with no `Authorization` answered `401 unauthenticated`.
      *
      * So the mirror for all 26 audited topics received nothing, ever — which
-     * `deploy/README.md:183` had already recorded as making 17 §7 claim 9 unpassable. **An empty
+     * `deploy/README.md` had already recorded as making 17 §7 claim 9 unpassable. **An empty
      * operator timeline during an incident looks like an answer**, and that is the worst failure
      * mode this tool has: an operator asks "where did this user's money go", sees nothing, and
      * concludes nothing happened.
@@ -792,7 +792,7 @@ function buildRoutes(): Route[] {
         // GDPR erasure, on top of the mirror rather than instead of it.
         //
         // `identity.user.deleted` is `audited: true` in `TOPIC_AUDIT`
-        // (`contracts/packages/events/src/audit.ts:117`), so the event that REQUESTS the erasure
+        // (`contracts/packages/events/src/audit.ts`), so the event that REQUESTS the erasure
         // appends its own audit row above naming the subject. That row is kept deliberately: it
         // is the evidence that the request was received and acted on, which is precisely what
         // Art. 5(2) accountability asks for. It is then restricted on read like every other row
@@ -1248,7 +1248,7 @@ function buildRoutes(): Route[] {
 
     /**
      * The LOWERING lane — one operator, no queue. The devplatform asymmetry
-     * (devplatform/src/server.ts:981): lowering a cap narrows what can move and is the operator
+     * (devplatform/src/server.ts): lowering a cap narrows what can move and is the operator
      * doing the platform's work for it; raising is the abuse, goes through `engagement.policy.set`
      * with two operators, and is refused here AND by the `engagement_raise_needs_approval`
      * trigger for any writer that skips this route. `:service` may be 'platform', which addresses
@@ -1380,7 +1380,7 @@ function buildRoutes(): Route[] {
      * or under-authenticated restore is a total compromise, and the read is most of the way to one.
      *
      * `adminOnly` in `ui/packages/ui/src/surfaces.ts` is a NAVIGATION filter and not a boundary —
-     * `admin-web/src/lib/auth.tsx:4` says so in as many words. This is the boundary.
+     * `admin-web/src/lib/auth.tsx` says so in as many words. This is the boundary.
      * ══════════════════════════════════════════════════════════════════════════════════════════
      */
     define('GET', '/v1/backups', async (ctx, deps) => {
