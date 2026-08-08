@@ -1091,6 +1091,105 @@ export const MIGRATIONS: readonly Migration[] = [
         on restore_runs (approval_id) where approval_id is not null;
     `,
   },
+
+  {
+    version: 11,
+    name: 'actor-kinds',
+    up: `
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+      -- THE MIRROR WAS NARROWER THAN THE CONTRACT IT MIRRORS. micro-org#265.
+      --
+      -- Version 5 wrote \`audit_events_actor_is_a_principal\` as
+      --
+      --     check (actor ~ '^(user|service):[A-Za-z0-9:._-]{1,128}$')
+      --
+      -- against the two kinds THIS service originates. It was then reused unchanged for the rows
+      -- this service MIRRORS, which come from the whole estate, and the estate has four:
+      -- \`ActorKind\` in contracts/packages/events/src/index.ts:70 is
+      -- 'user' | 'service' | 'operator' | 'system', and \`parseActor\` beside it admits the BARE
+      -- string 'system' with no subject at all.
+      --
+      -- Nothing converted between the two. \`auditRowFor\` takes the envelope's actor verbatim
+      -- (contracts/packages/events/src/audit.ts:434) and POST /v1/events passes it straight into
+      -- the insert (src/server.ts:777), so a legal envelope met a CHECK that refused it, the route
+      -- answered 500 because there is no branch for "the database disagrees with the contract",
+      -- and the producer's relay read that as transient and retried until its breaker opened.
+      --
+      -- MEASURED ON MAINNET, 2026-08-08, while verifying the 2.5.5 deploy: ledger had emitted 863
+      -- \`ledger.reconciliation.completed\` — a leased job with no actor, so ledger/src/outbox.ts:201
+      -- substitutes 'system' — and 10 \`ledger.entry.posted\` carrying 'operator:drift-correction'.
+      -- Both topics are \`audited: true\`. \`audit_events\` held 205 rows, of which 4 came from
+      -- ledger, none from an operator and none from the system. All 873 were refused; 20 were
+      -- still retrying and the rest had been given up on and marked published.
+      --
+      -- The shape of it is the part worth keeping: this failed ONLY for the two actor kinds whose
+      -- actions are hardest to reconstruct from anywhere else — a scheduled job and a human
+      -- operator adjusting the ledger by hand, which is the act SD-10 requires two operators and a
+      -- reason code for — and it presented as a producer's circuit breaker, which says nothing
+      -- about audit to whoever reads it.
+      --
+      -- ledger is where it BIT, not where it ends. Two more producers emit an audited topic with
+      -- the bare 'system' actor and have simply not fired yet on mainnet:
+      -- tessera/src/kiln.ts:448 (\`tessera.object.anchored\`) and billing/src/entitlements.ts:441
+      -- (\`billing.entitlement.revoked\`, from the entitlement-expiry leased job). Both outboxes are
+      -- empty of those topics today. Fixing this only where it was observed would have left two
+      -- services that break the estate's audit trail the first time a kiln anchors or an
+      -- entitlement lapses.
+      --
+      -- And the estate already had the right predicate written down, once: tessera's own outbox
+      -- CHECK (tessera/src/migrations.ts:1258) is
+      --
+      --     check (actor = 'system' or actor ~ '^(user|service|operator):.+$')
+      --
+      -- which is the contract's full vocabulary. This service was the outlier, not the pioneer.
+      --
+      -- ── WHAT THE NEW PREDICATE IS, AND WHY EACH PIECE OF IT ──
+      --
+      -- It mirrors \`parseActor\` and nothing else. A second definition of "principal" that is
+      -- merely wider is how this recurs in the other direction; the only defensible width is the
+      -- contract's exact one.
+      --
+      --   \`actor = 'system'\`   Bare, no subject. \`parseActor('system')\` returns
+      --                        { kind: 'system', id: null } and every producer's envelope builder
+      --                        defaults to this string for work no principal asked for. A
+      --                        'system:something' form is NOT admitted, because the contract does
+      --                        not produce one and a kind with an optional subject is a kind you
+      --                        cannot group by.
+      --   \`operator:\`          Added. An operator acting as themselves is the case the original
+      --                        comment on this column was written about.
+      --   \`@\` still absent     from the character class, so \`service:admin-api@replica\` is still
+      --                        refused. That is not incidental: src/approvals.ts:409 and
+      --                        src/jobs.ts:56 both cite THIS constraint for that refusal, on the
+      --                        argument that an actor is an identity and two replicas are one
+      --                        identity. Widening the kinds must not widen the subject, and this
+      --                        does not.
+      --   a bare uuid          still refused — src/audit.test.ts asserts it by constraint name.
+      --
+      -- The character class stays \`[A-Za-z0-9:._-]{1,128}\`, which IS narrower than \`parseActor\` —
+      -- that accepts any non-empty subject, so a subject containing a space would be legal on the
+      -- wire and refused here. That divergence is kept ON PURPOSE and is the one place this
+      -- constraint may legitimately be stricter than the contract, because widening the class to
+      -- \`.+\` is exactly what would readmit \`service:x@replica\`. Narrower in the SUBJECT is a
+      -- deliberate bound on a free-text field; narrower in the KIND was the bug, because a kind is
+      -- a closed set the contract enumerates and this service does not get a different one.
+      --
+      -- The column comment in version 5 ("A principal — 'user:<uuid>' or 'service:<name>' — never
+      -- a bare id") is superseded by this block and is deliberately left standing: a released
+      -- migration is hash-pinned and \`migrations.test.ts\` refuses a set in which one was edited
+      -- after it applied, so correcting the prose there would make every existing database refuse
+      -- to boot. Read the two together, newest last, which is the order they are in.
+      --
+      -- Existing rows are unaffected: every one of them already satisfies the narrower predicate,
+      -- so the ALTER validates without a rewrite. Nothing is back-filled here. The 853 events that
+      -- were refused and then marked published are still in ledger's outbox and are recoverable by
+      -- replay, but whether the log of record should gain rows whose \`recorded_at\` is weeks after
+      -- their \`occurred_at\` is a decision about what that table means, not a migration.
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+      alter table audit_events drop constraint if exists audit_events_actor_is_a_principal;
+      alter table audit_events add constraint audit_events_actor_is_a_principal
+        check (actor = 'system' or actor ~ '^(user|service|operator):[A-Za-z0-9:._-]{1,128}$');
+    `,
+  },
 ]
 
 /**
