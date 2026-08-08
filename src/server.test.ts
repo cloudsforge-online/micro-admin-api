@@ -908,6 +908,60 @@ test('a mirror row with no principal actor is 400', { skip }, async () => {
   assert.equal((await sql!`select seq from audit_events`).length, 0)
 })
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// THE OTHER TWO ACTOR KINDS, AT THE ROUTE. micro-org#265.
+//
+// The comment three tests above already says it: `validateEnvelope` refuses an actor that is not
+// `system` or `<kind>:<id>`. It has said so the whole time, and every mirror case in this file
+// nonetheless used `OPERATOR_ONE`, which is `user:<uuid>` — so `system` and `operator:` were
+// documented as legal here and exercised nowhere, while `audit_events_actor_is_a_principal`
+// admitted only `user:` and `service:`. The two halves disagreed and no test could see it.
+//
+// What that cost, measured on mainnet on 2026-08-08: 863 `ledger.reconciliation.completed` (a
+// leased job, so `ledger/src/outbox.ts:201` substitutes `system`) and 10 `ledger.entry.posted`
+// carrying `operator:drift-correction` — both audited topics — met a CHECK violation, an
+// unhandled 500, and a producer breaker that opened. None of the 873 is in the log of record.
+//
+// So the acceptance is asserted here, at the intake, and not only against the constraint: the
+// path that failed was route → `auditRowFor` → insert, and a constraint test alone would not have
+// caught a route that answers 500 rather than recording the row.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+test('THE MIRROR RECORDS A SYSTEM ACTOR — a leased job is a principal', { skip }, async () => {
+  const signed = sign(
+    mirrorEnvelope({
+      id: '88888888-8888-4888-8888-888888888888',
+      topic: 'ledger.reconciliation.completed',
+      key: 'ethereum:mainnet',
+      actor: 'system',
+    }),
+  )
+  const res = await h().request('POST', '/v1/events', {
+    headers: { [SIGNATURE_HEADER]: signed.signature, 'content-type': 'application/json' },
+    body: signed.raw,
+  })
+  assert.equal(res.status, 201, 'against the previous build this was a 500 and the row was lost')
+  const rows = await sql!<{ actor: string; action: string }[]>`select actor, action from audit_events`
+  assert.deepEqual(
+    rows.map((r) => ({ actor: r.actor, action: r.action })),
+    [{ actor: 'system', action: 'ledger.reconciliation.completed' }],
+  )
+})
+
+test('THE MIRROR RECORDS AN OPERATOR ACTOR — the drift corrections that were lost', { skip }, async () => {
+  const signed = sign(mirrorEnvelope({ actor: 'operator:drift-correction' }))
+  const res = await h().request('POST', '/v1/events', {
+    headers: { [SIGNATURE_HEADER]: signed.signature, 'content-type': 'application/json' },
+    body: signed.raw,
+  })
+  assert.equal(res.status, 201)
+  const rows = await sql!<{ actor: string }[]>`select actor from audit_events`
+  assert.deepEqual(
+    rows.map((r) => r.actor),
+    ['operator:drift-correction'],
+  )
+})
+
 test('a mirror row with no correlation id is 400 — an investigation stops there', { skip }, async () => {
   const signed = sign(mirrorEnvelope({ correlationId: '' }))
   const res = await h().request('POST', '/v1/events', {

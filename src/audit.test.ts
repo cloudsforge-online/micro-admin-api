@@ -494,6 +494,82 @@ test('an actor must be a principal, not a bare id', { skip }, async () => {
 })
 const ALICE_BARE = '11111111-1111-4111-8111-111111111111'
 
+/**
+ * The other three quarters of that constraint, and the reason this block is four tests rather
+ * than one.
+ *
+ * `audit_events_actor_is_a_principal` used to admit `user:` and `service:` only, while
+ * `ActorKind` in `@cloudsforge/contracts-events` has four kinds and `parseActor` also admits the
+ * bare string `system`. The mirror takes the envelope's actor verbatim, so a legal envelope from a
+ * leased job or an operator met a CHECK that refused it, `POST /v1/events` answered 500, and the
+ * producer's relay retried until its breaker opened. On mainnet that silently kept 873 audited
+ * ledger events — every reconciliation and every hand-made drift correction — out of the log of
+ * record for four days. micro-org#265.
+ *
+ * The test that was here asserted only the refusal, which is why the gap survived: a constraint
+ * test that checks what is rejected and never what is accepted cannot tell "correctly narrow"
+ * from "too narrow". So the acceptances are asserted individually, by kind, and the one refusal
+ * that must SURVIVE the widening is asserted beside them.
+ */
+test('a system actor is accepted — a leased job is a principal with no subject', { skip }, async () => {
+  await sql!.begin(async (tx) => {
+    await appendAudit(tx, input({ actor: 'system' }))
+    return { value: null }
+  })
+  const rows = await sql!<{ actor: string }[]>`select actor from audit_events`
+  assert.deepEqual(
+    rows.map((r) => r.actor),
+    ['system'],
+  )
+})
+
+test('an operator actor is accepted', { skip }, async () => {
+  await sql!.begin(async (tx) => {
+    await appendAudit(tx, input({ actor: 'operator:drift-correction' }))
+    return { value: null }
+  })
+  const rows = await sql!<{ actor: string }[]>`select actor from audit_events`
+  assert.deepEqual(
+    rows.map((r) => r.actor),
+    ['operator:drift-correction'],
+  )
+})
+
+test('a replica is still refused — widening the kinds did not widen the subject', { skip }, async () => {
+  // src/approvals.ts:409 and src/jobs.ts:56 both cite this constraint for refusing the replica
+  // form, on the argument that an actor is an IDENTITY and two replicas are one identity. It
+  // survives because `@` is absent from the character class, not because anything re-states it —
+  // so it is asserted here, where a future widening of that class would trip over it.
+  await assert.rejects(
+    async () =>
+      sql!.begin(async (tx) => {
+        await appendAudit(tx, input({ actor: 'service:admin-api@replica-2' }))
+        return { value: null }
+      }),
+    (err: { constraint_name?: string }) => {
+      assert.equal(err.constraint_name, 'audit_events_actor_is_a_principal')
+      return true
+    },
+  )
+})
+
+test('a system actor with a subject is refused — the contract does not produce one', { skip }, async () => {
+  // `parseActor` returns id `null` for `system` and there is no `system:<id>` form anywhere in the
+  // estate. Admitting one would make the kind's subject optional, and a kind whose subject is
+  // sometimes present is a kind an operator cannot group by.
+  await assert.rejects(
+    async () =>
+      sql!.begin(async (tx) => {
+        await appendAudit(tx, input({ actor: 'system:reconciler' }))
+        return { value: null }
+      }),
+    (err: { constraint_name?: string }) => {
+      assert.equal(err.constraint_name, 'audit_events_actor_is_a_principal')
+      return true
+    },
+  )
+})
+
 test('an unknown outcome is refused', { skip }, async () => {
   await assert.rejects(
     async () =>

@@ -66,7 +66,15 @@ export const CHAIN_LOCK_KEY = 8_140_251_099_723_001n
 export type AuditOutcome = 'allowed' | 'refused' | 'failed'
 
 export interface AuditInput {
-  /** `user:<uuid>` or `service:<name>`. Derived from the token; never supplied by a caller. */
+  /**
+   * A principal, in the estate's four kinds and no others: `user:<uuid>`, `service:<name>`,
+   * `operator:<id>`, or the bare string `system`. This is `ActorKind` /`parseActor` in
+   * `@cloudsforge/contracts-events`, and `audit_events_actor_is_a_principal` enforces exactly that
+   * set — it used to enforce the first two only, which is micro-org#265 and cost the log of record
+   * every event a leased job or an operator produced. For a locally originated row this is derived
+   * from the token and never supplied by a caller; for a mirrored row it is the envelope's actor
+   * verbatim, which is why the two definitions have to agree.
+   */
   readonly actor: string
   /** `<service>.<aggregate>.<past-tense-verb>`, e.g. `admin.approval.granted`. */
   readonly action: string
