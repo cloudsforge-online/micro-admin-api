@@ -40,11 +40,43 @@ against this repository's own source.
 | `PUT /v1/engagement/policies/:service` | **Lower** a cap, one operator. A raise is refused here with 403 and the name of the action that does it. |
 | `GET /v1/engagement/report` | Treasury and per-service balances read off the ledger, spend, and the transfer records. |
 | `GET /v1/estate` | One call, one 200, six tiles, per-tile degradation. |
+| `GET /v1/backups` | Every backup run, newest first, `?state=` and `?limit=` (default 50, hard max 200). Carries the settings, the estate's own environment, and `protection` — two lists of what the backups do and do not cover, rather than a status, because a status invites a green tick this estate cannot support. |
+| `POST /v1/backups` | Take a backup now. Body is `kind` (`full` default, or `databases`, `custody`, `files`) and an optional `reason` — **no `requestedBy`**, which is derived from the bearer. **No confirmation string:** taking a backup is additive. 201, or 200 on an idempotent replay. |
+| `GET /v1/backups/:id` | One run with its artefacts — **names and checksums, never contents** — every restore attempted from it, and `liveConfirmationPhrase`: the exact string a live restore will demand, served so the operator reads it before being asked to type it. |
+| `GET /v1/backups/settings` `PUT /v1/backups/settings` | Destination, retention, size ceilings and the two schedules. The GET also serves `ceilings`, the schema's own `{min, max}` bounds, so a console renders the range rather than discovering it as a 400. The PUT takes an audit row naming the new root **and the old one**. |
+| `GET /v1/restores` | Every restore ever attempted, verify and live alike. `?limit=`. |
+| `POST /v1/restores` | **`mode: "verify"` only** — into a throwaway scratch database, one operator, no ceremony. `mode: "live"` is refused with a 400 that names the way in: an `estate.restore` approval, two operators, and a typed confirmation. Only one restore may be in flight estate-wide; a second is refused loudly rather than queued. |
 | `GET /livez` `GET /readyz` `GET /metrics` | Rule 4. |
 
 Every mutating route requires an `Idempotency-Key`. `routeidempotency.test.ts` enumerates them
 from `server.ts`'s source and fails on one that neither wraps the guard nor states why it need
 not — the guard `micro-market` gained after two routes were found with none.
+
+**Every backup and restore route above is `requireOperator`, including the reads**, and that is the
+one place in `server.ts` that departs from `requireReader`. A backup listing names the directory
+the artefacts sit in, the databases they cover and the checksums that authenticate them — a map of
+where the estate's data is kept — and `requireReader` admits a service token holding `admin:read`,
+which is a credential that lives in a container's environment. `adminOnly` in
+`ui/packages/ui/src/surfaces.ts` is a navigation filter and says so; this is the boundary.
+
+**The confirmation phrase, because it is the thing most likely to cost somebody an afternoon.**
+`POST /v1/backups` does **not** take one — a backup is additive and needs no ceremony beyond the
+`Idempotency-Key`. The typed confirmation belongs to the **live restore**, which this service will
+not accept on `POST /v1/restores` at all: it is a `confirmation` parameter on an
+`estate.restore` approval (`src/actions.ts`, `requiredParams: ['confirmation']`), and
+`requestRestore` compares it with `!==` against `expectedConfirmation(backup)`, which is
+
+```
+restore <environment> from <YYYY-MM-DDTHH:MM:SS>Z
+```
+
+— the backup's own environment and its `queued_at` truncated to the second, e.g.
+`restore mainnet from 2026-08-07T02:15:00Z`. It cannot be typed correctly without having read
+which backup was selected and which estate this is, which is the entire point. An integrator does
+not have to derive it: `GET /v1/backups/:id` serves the live string as `liveConfirmationPhrase`,
+and a mismatch is refused with the expected phrase in the message — deliberately, because
+withholding punctuation from a legitimate operator during an incident buys nothing, and typing it
+still requires having read it.
 
 ---
 
@@ -113,10 +145,26 @@ already exist; the first still comes from identity's one-shot deploy-time bootst
 re-run by a partial unique index no client can route around. `bootstrap.test.ts` holds that line
 from this side, and its pin was changed deliberately and in the open rather than deleted.
 
-**Still owed by `micro-deploy`:** this service's token does not yet carry `identity:admin`
-(`deploy/compose/docker-compose.estate.yml`). Until it does the executor is correct and will
-`403` at identity in a real deployment. It is therefore proven against a fake upstream, as every
-other executor here is, and **not** yet end-to-end against the running estate.
+**`micro-deploy` has landed the grant, so the last link is closed.**
+`deploy/compose/docker-compose.estate.yml` carries `IDENTITY_SERVICE_TOKEN_GRANTS` on the
+`identity` service — the allowlist identity mints against — and its first entry reads
+`"admin-api":["identity:admin","ledger:post","ledger:read"]`. It is a literal YAML block scalar,
+not a `${…}` interpolation, so there is no host-side `.env` value that can be missing and no
+untracked file that has to agree with it: what the file says is what identity mints. The executor
+therefore no longer `403`s at identity in a real deployment.
+
+The same change narrowed this service in the other direction, and that is worth reading before
+somebody reports it as a regression. `admin-api` **lost** `market:read`, `market:admin` and
+`billing:read` from the map, because the grants were derived from the services' own declared
+scopes rather than hand-written. That is correct and is exactly §5's design: those two calls
+forward **the operator's own bearer** so the upstream records which administrator acted (SD-11),
+and no service token ever carried them. A map that still granted them would be granting a
+capability this service deliberately does not use.
+
+What remains is a matter of proof rather than of configuration. The executor is still exercised
+against a fake upstream, as every other executor here is, because this repository's suite does not
+stand up identity; the end-to-end run belongs to `deploy/scripts/estate-verify.sh` and is not
+claimed here.
 
 ---
 
@@ -390,10 +438,32 @@ Each is a place where the honest behaviour today is a 501, a degraded tile, or a
 does not offer. None is worked around, because working around a missing route is how a BFF acquires
 state.
 
-1. **`PUT /internal/users/:id/roles` on identity.** Section 1. Until it exists the estate cannot
-   issue its first service token without a hand-written `UPDATE`, and this service refuses to
-   pretend otherwise.
-2. **The mirror now receives events, and what remains is a deploy question.** `POST /v1/events`
+An entry that closes is **struck through and kept, with what closed it**, rather than deleted. A
+list that only ever shrinks silently teaches a reader that its absences mean nothing was ever
+there, and the two entries below that closed are the two most likely to be re-reported by somebody
+reading an older copy of this file.
+
+1. ~~**`PUT /internal/users/:id/roles` on identity.**~~ **CLOSED.** The numeral is kept rather than
+   deleted, because a corrected finding is more useful than a vanished one, and because this list
+   used to contradict §1 four hundred lines above it — §1 records that `identity.role.grant`
+   stopped answering 501, while this entry still said the route did not exist. Both halves cannot
+   be true, and this was the stale half.
+
+   Closed by **`micro-identity`**, which built the route in the shape §1 specified:
+   `identity/src/server.ts` defines `PUT /internal/users/:id/roles`, guarded by a service token
+   holding `identity:admin` rather than `authenticateAdmin`, writing a `platform_role_grants` row
+   with `source='approval'` in the same transaction as the `users.roles` update. The read side
+   landed with it — `GET /internal/users/:id/role-grants`, the promotion trail for one user — and
+   `identity/README.md` documents both. Closed by **`micro-deploy`** on this side of the wire: the
+   token now carries `identity:admin`, per §1.
+
+   What did **not** close, and is the reason the sentence about the first `UPDATE` was only half
+   wrong: **the bootstrap is still not a route, deliberately.** Executing an `identity.role.grant`
+   needs an approval two distinct operators signed, which needs an administrator to already exist.
+   The first one still comes from identity's one-shot deploy-time bootstrap, refused on re-run by a
+   partial unique index. That is not a gap; §1 argues at length that it is the correct home for it.
+2. ~~**The mirror needs a deploy change to receive anything.**~~ **CLOSED, apart from the residual
+   risk recorded at the end of this entry.** `POST /v1/events`
    reads the domain topics that already exist rather than a `*.audit.recorded` stream nobody
    publishes, and it is now reachable by the relays that send them: the route speaks
    `contracts-events`' signing scheme (`cf-signature`) and authenticates with the MAC alone. The
@@ -401,10 +471,35 @@ state.
    `deploy/compose/docker-compose.estate.yml`, with the same value every producer signs with,
    so no deploy change is needed to make delivery work.
 
-   What `micro-deploy` still owes is the **subscriptions**: a producer only delivers here if a row
-   in its `event_subscriptions` names this service's `/v1/events` for that topic. That is
-   per-producer configuration and is reported to the owners of those repositories rather than
-   changed from here.
+   **The subscriptions are seeded, and `micro-deploy` owes nothing further.** A producer only
+   delivers here if a row in its `event_subscriptions` names this service's `/v1/events` for that
+   topic, and `deploy/scripts/estate-bootstrap.sh` step **5d — the audit mirror** writes exactly
+   those rows: `subscribe_all admin-api http://admin-api:4000/v1/events $audited`, one insert per
+   topic into the **producer's own** database, because that is where the outbox and its relay live.
+   The producer is the topic's first segment, which contracts already guarantees by requiring
+   `<service>.<aggregate>.<past-tense-verb>`.
+
+   The list is not written down in the deploy repository either — it is derived from
+   `contracts/packages/events/src/audit.ts` by reading every topic whose `TOPIC_AUDIT` entry has
+   `audited: true`, so a topic that becomes audited is mirrored without a second edit anywhere.
+   That is the same class of second copy the grant map was, and it is refused for the same reason.
+
+   **What that step learned the hard way is worth knowing before trusting it.** Measured on mainnet
+   on 2026-08-08: `micro-contracts` is a build-time dependency and is not checked out on the deploy
+   host, so `AUDIT_CONTRACT` pointed at a path that did not exist, the parser returned nothing, and
+   `admin-api` was subscribed to **none** of the thirty audited topics — while the step printed a
+   cheerful green `subscribed to 0 topic(s)` and every later check agreed the estate was
+   bootstrapped. `ledger.entry.posted` published forty-eight times with zero subscribers and the
+   estate's audit of record never saw one. The mirror looked alive throughout, because identity's
+   subscriptions are written by a different step and its rows kept arriving. Two guards now stop
+   rather than report: a floor that fails unless at least twenty-six topics parse, naming a missing
+   checkout separately from a broken parser because the fixes differ, and a refusal in
+   `subscribe_all` itself when it is handed an empty topic list.
+
+   So the genuinely residual item is not configuration but an **operational precondition**: the
+   deploy host needs a `micro-contracts` checkout beside `micro-deploy`, or `AUDIT_CONTRACT` has to
+   point at one. Topics whose producer is not deployed in a given estate are named as skipped
+   rather than silently dropped, which is the honest answer for a partial estate rather than a gap.
 
    **Rotating the shared secret.** `OUTBOX_SIGNING_SECRET` is one key held by 24 services, and its
    current value is a placeholder committed to a public file, so it has to be rotated. It signs the
