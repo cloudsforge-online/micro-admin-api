@@ -1283,6 +1283,216 @@ export const MIGRATIONS: readonly Migration[] = [
         );
     `,
   },
+
+  {
+    version: 13,
+    name: 'engagement-in-ember-wei',
+    up: `
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+      -- THE ENGAGEMENT TREASURY STOPS MOVING A RETIRED ASSET. micro-org#226.
+      --
+      -- Version 8 built this programme's caps in SHARD: 'transfer_cap_shards' bigint, and
+      -- 'amount_shards' bigint on the transfer record. The executor in src/actions.ts posted both
+      -- legs of every transfer with assetCode 'SHARD'. SHARD was retired on 2026-08-04
+      -- (contracts/packages/chain, RETIRED_ASSETS; assertIssuable refuses it by name), and the
+      -- programme it funds spends EMBER: docs/ecosystem/21 §2 has read "bounded, disclosed, and
+      -- denominated in EMBER" since 2026-08-07, and §3 DELETED the "→ conversion to Shards"
+      -- funding step so the treasury balance is one a chain can be asked about.
+      --
+      -- ── WHY EMBER AND NOT USD CENTS, WHICH IS WHAT mint AND billing CHOSE ──────────────────
+      --
+      -- Those two retired SHARD from PRICES. A price is quoted to a customer, is durable, and
+      -- must not restate itself when an operator edits EMBER's administered rate — USD cents is
+      -- right there and both migrations say so.
+      --
+      -- These columns are not prices. 'transfer_cap_shards' bounds a LEDGER MOVEMENT between two
+      -- ledger accounts, and 'amount_shards' records one that happened. A ledger balance has to be
+      -- denominated in something the ledger actually holds and reconciles, and the account these
+      -- rows bound is already funded in EMBER by the only code that funds it: billing's
+      -- feeRecyclePostings credits (platform:engagement-treasury, <settlementAsset>, treasury) and
+      -- billing's settlementAsset is EMBER, typed IssuableAssetCode (billing/src/env.ts). Capping
+      -- an EMBER account in cents would put the mismatch back one layer down, and a cap is a
+      -- number the trigger below compares against the amount — the two must share a unit.
+      --
+      -- It also settles the payout question a USD cap cannot: the credit leg of a grant reaches a
+      -- user, and no user in this estate can hold USD. 27 accounts already hold EMBER and the
+      -- withdrawal path already pays it out.
+      --
+      -- ── NOTHING IS RESTATED, MEASURED RATHER THAN ASSUMED ─────────────────────────────────
+      --
+      -- Live mainnet, 2026-08-10, read off cloudsforge-estate-postgres-1:
+      --
+      --     engagement_policies                                        0 rows
+      --     engagement_transfers                                       0 rows
+      --     ledger accounts whose subject matches 'engagement'         0, in any asset
+      --
+      -- Not one unit has ever moved through this programme, which is why these are RENAMES rather
+      -- than new columns beside the old ones: expand/contract protects data in flight, and there
+      -- is none. Two spellings of one cap would be worse — the ledger keys an account on
+      -- (subject, asset_code, purpose), so a half-migrated programme runs two treasuries that
+      -- neither reconcile against each other nor report as broken.
+      --
+      -- ── THE CONVERSION, FOR ANY DATABASE THAT IS NOT MAINNET ──────────────────────────────
+      --
+      -- SHARD has 0 decimals and EMBER has 18, so this is a conversion and not a relabelling —
+      -- the same integer means two things eighteen orders of magnitude apart. Two recorded facts
+      -- compose the rate, and both are frozen here because a migration runs once and is
+      -- checksummed afterwards, while EMBER's price is one operator-editable row:
+      --
+      --     1 Shard = 1 US cent      SHARDS_PER_USD = 100, contracts/packages/chain
+      --     1 EMBER = 0.25 USD       pricing.administered_prices, usd_scaled 250000 against
+      --                              RATE_SCALE 1e6, set_by null, unchanged since
+      --                              2026-08-04 15:05 UTC — read again on 2026-08-10
+      --
+      -- so 1 Shard = 0.04 EMBER = 40000000000000000 wei. micro-worlds' own migration 11 freezes
+      -- the identical constant for the identical reason.
+      --
+      -- ── THE TYPE HAS TO CHANGE, AND THAT IS THE ARITHMETIC TALKING ────────────────────────
+      --
+      -- bigint tops out at 9.2e18. The converted ceiling is 1e9 Shards × 4e16 = 4e25 wei, which
+      -- is 40,000,000 EMBER and still exactly the USD 10,000,000 per transfer version 8 chose.
+      -- numeric(78,0) is what seed_per_market_wei and seed_per_day_wei in this same table already
+      -- use, so the table ends up internally consistent rather than half-converted — which is
+      -- point 3 of #226.
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+
+      -- ── BOTH TRIGGERS COME OFF FIRST, AND THAT IS NOT TIDINESS ──────────────────────────────
+      --
+      -- plpgsql resolves record fields at EXECUTION time, not at CREATE time. A function body
+      -- still naming new.transfer_cap_shards survives every statement below and then raises
+      -- 'record "new" has no field "transfer_cap_shards"' on the first policy write somebody
+      -- makes — a schema error dressed as a runtime one, arriving whenever the next raise
+      -- happens rather than at deploy. Recreating them is only proven by running them.
+      --
+      -- The second reason is arithmetic: the conversion multiplies every cap by 4e16, which IS a
+      -- raise as far as engagement_raise_needs_approval is concerned, and it would refuse this
+      -- migration's own UPDATE for naming no approval. The window is inside one migration, which
+      -- is inside one transaction.
+      drop trigger if exists engagement_policies_raise_needs_approval on engagement_policies;
+      drop trigger if exists engagement_fee_recycle_raise_needs_approval on engagement_fee_recycle;
+      drop trigger if exists engagement_transfers_within_cap on engagement_transfers;
+
+      -- The ceiling CHECK is dropped rather than renamed: its BOUND changes with the unit, so
+      -- there is nothing to carry across. Every other constraint on these tables keeps its rule.
+      alter table engagement_policies drop constraint if exists engagement_policies_cap_within_ceiling;
+
+      alter table engagement_policies
+        alter column transfer_cap_shards drop default,
+        alter column transfer_cap_shards type numeric(78,0)
+          using transfer_cap_shards::numeric * 40000000000000000,
+        alter column transfer_cap_shards set default 0;
+      alter table engagement_policies rename column transfer_cap_shards to transfer_cap_wei;
+
+      alter table engagement_transfers
+        alter column amount_shards type numeric(78,0)
+          using amount_shards::numeric * 40000000000000000;
+      alter table engagement_transfers rename column amount_shards to amount_wei;
+
+      -- Postgres carries a CHECK across a column rename, so this one is renamed for the reader:
+      -- a constraint called '..._shards' on a column called '..._wei' is a refusal message that
+      -- names the wrong unit at the moment somebody is debugging money.
+      alter table engagement_transfers
+        rename constraint engagement_transfers_amount_positive
+                       to engagement_transfers_amount_wei_positive;
+
+      -- 4e25 wei = 40,000,000 EMBER = USD 10M per transfer at the administered 0.25, which is the
+      -- SAME money version 8's 1,000,000,000 Shards meant. The ceiling on the CAP, not the cap.
+      alter table engagement_policies add constraint engagement_policies_cap_within_ceiling check (
+        transfer_cap_wei >= 0 and transfer_cap_wei <= 40000000000000000000000000
+      );
+
+      -- ── THE TWO FUNCTIONS, REBUILT ON THE NEW COLUMN NAMES ─────────────────────────────────
+      --
+      -- Restated in full because 'create or replace function' has no partial form. Every rule is
+      -- version 8's, unchanged: raising needs a FRESH approved approval and lowering needs none
+      -- (21 §7.7), a transfer above the cap is refused, a service with no policy row is refused,
+      -- and the approval must be an approved approval for exactly that action.
+      create or replace function engagement_raise_needs_approval() returns trigger
+        language plpgsql
+      as $$
+      declare
+        raised boolean;
+        approved boolean;
+      begin
+        if tg_table_name = 'engagement_policies' then
+          if tg_op = 'INSERT' then
+            raised := new.transfer_cap_wei > 0 or new.seed_per_market_wei is not null;
+          else
+            raised := new.transfer_cap_wei > old.transfer_cap_wei
+              or (new.seed_per_market_wei is not null and (old.seed_per_market_wei is null or new.seed_per_market_wei > old.seed_per_market_wei))
+              or (new.seed_per_day_wei is not null and (old.seed_per_day_wei is null or new.seed_per_day_wei > old.seed_per_day_wei));
+          end if;
+        else
+          if tg_op = 'INSERT' then
+            raised := new.recycle_bps > 0;
+          else
+            raised := new.recycle_bps > old.recycle_bps;
+          end if;
+        end if;
+
+        if not raised then
+          return new;
+        end if;
+
+        if new.last_change_approval_id is null
+           or (tg_op = 'UPDATE' and new.last_change_approval_id is not distinct from old.last_change_approval_id) then
+          raise exception 'raising an engagement cap requires a fresh approved engagement.policy.set approval; lowering does not (21 §7.7)'
+            using errcode = 'check_violation';
+        end if;
+
+        select (state = 'approved' and action = 'engagement.policy.set')
+          into approved
+          from approvals where id = new.last_change_approval_id;
+        if approved is distinct from true then
+          raise exception 'approval % is not an approved engagement.policy.set approval', new.last_change_approval_id
+            using errcode = 'check_violation';
+        end if;
+        return new;
+      end;
+      $$;
+
+      create or replace function engagement_transfer_within_cap() returns trigger
+        language plpgsql
+      as $$
+      declare
+        cap numeric(78,0);
+        ok boolean;
+      begin
+        select transfer_cap_wei into cap from engagement_policies where service = new.service;
+        if cap is null then
+          raise exception 'no engagement policy exists for %; the caps must exist before anything moves (21 §8)', new.service
+            using errcode = 'check_violation';
+        end if;
+        if new.amount_wei > cap then
+          raise exception 'transfer of % wei of EMBER to engagement:% exceeds the policy cap of % (21 §7.3)',
+            new.amount_wei, new.service, cap
+            using errcode = 'check_violation';
+        end if;
+        select (state = 'approved' and action = 'engagement.transfer')
+          into ok
+          from approvals where id = new.approval_id;
+        if ok is distinct from true then
+          raise exception 'approval % is not an approved engagement.transfer approval', new.approval_id
+            using errcode = 'check_violation';
+        end if;
+        return new;
+      end;
+      $$;
+
+      -- Back on, with the timing and the rule version 8 gave them.
+      create trigger engagement_policies_raise_needs_approval
+        before insert or update on engagement_policies
+        for each row execute function engagement_raise_needs_approval();
+
+      create trigger engagement_fee_recycle_raise_needs_approval
+        before insert or update on engagement_fee_recycle
+        for each row execute function engagement_raise_needs_approval();
+
+      create trigger engagement_transfers_within_cap
+        before insert on engagement_transfers
+        for each row execute function engagement_transfer_within_cap();
+    `,
+  },
 ]
 
 /**

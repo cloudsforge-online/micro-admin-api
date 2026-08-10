@@ -78,8 +78,8 @@ import {
   findPolicy,
   listPolicies,
   listTransfers,
-  parseCapShards,
-  parseShards,
+  parseCapWei,
+  parseTransferWei,
   parseWei,
   RaiseNeedsApprovalError,
   readFeeRecycle,
@@ -89,7 +89,7 @@ import {
   FEE_RECYCLE_CEILING_BPS,
   SEED_PER_DAY_CEILING_WEI,
   SEED_PER_MARKET_CEILING_WEI,
-  TRANSFER_CAP_CEILING_SHARDS,
+  TRANSFER_CAP_CEILING_WEI,
 } from './engagement.ts'
 import {
   ApprovalError,
@@ -1012,17 +1012,17 @@ function buildRoutes(): Route[] {
         if (!ENGAGEMENT_SERVICES.includes(service)) {
           throw new BadRequestError(`params.service must be one of ${ENGAGEMENT_SERVICES.join(', ')}`)
         }
-        const amount = parseShards(String(params['amountShards']))
+        const amount = parseTransferWei(String(params['amountWei']))
         const policy = await findPolicy(deps.sql, service)
         if (!policy) {
           throw new BadRequestError(
-            `no engagement policy exists for ${service} — the caps must exist before a Shard moves (21 §8); ` +
+            `no engagement policy exists for ${service} — the caps must exist before anything moves (21 §8); ` +
               'raise one through engagement.policy.set first',
           )
         }
-        if (amount > BigInt(policy.transferCapShards)) {
+        if (amount > BigInt(policy.transferCapWei)) {
           throw new BadRequestError(
-            `a transfer of ${amount} Shards exceeds engagement:${service}'s policy cap of ${policy.transferCapShards}`,
+            `a transfer of ${amount} wei of EMBER exceeds engagement:${service}'s policy cap of ${policy.transferCapWei}`,
           )
         }
       }
@@ -1048,7 +1048,7 @@ function buildRoutes(): Route[] {
         }
         // Shape checks only — the ceilings and the raise/lower asymmetry live in engagement.ts
         // and the schema, and the executor goes through both.
-        if (typeof params['transferCapShards'] === 'string') parseCapShards(params['transferCapShards'])
+        if (typeof params['transferCapWei'] === 'string') parseCapWei(params['transferCapWei'])
         if (typeof params['seedPerMarketWei'] === 'string') parseWei(params['seedPerMarketWei'])
         if (typeof params['seedPerDayWei'] === 'string') parseWei(params['seedPerDayWei'])
         if (service === 'platform' && typeof params['recycleBps'] !== 'string') {
@@ -1300,7 +1300,7 @@ function buildRoutes(): Route[] {
           // The schema ceilings, served so a console can render the bounds an operator is
           // choosing inside — the same numbers migrations.ts version 8 CHECKs.
           ceilings: {
-            transferCapShards: TRANSFER_CAP_CEILING_SHARDS.toString(),
+            transferCapWei: TRANSFER_CAP_CEILING_WEI.toString(),
             seedPerMarketWei: SEED_PER_MARKET_CEILING_WEI.toString(),
             seedPerDayWei: SEED_PER_DAY_CEILING_WEI.toString(),
             feeRecycleBps: FEE_RECYCLE_CEILING_BPS,
@@ -1341,8 +1341,8 @@ function buildRoutes(): Route[] {
       }
 
       const change = {
-        ...(typeof body['transferCapShards'] === 'string'
-          ? { transferCapShards: parseCapShards(body['transferCapShards']) }
+        ...(typeof body['transferCapWei'] === 'string'
+          ? { transferCapWei: parseCapWei(body['transferCapWei']) }
           : {}),
         ...(typeof body['seedPerMarketWei'] === 'string'
           ? { seedPerMarketWei: parseWei(body['seedPerMarketWei']) }
@@ -1355,7 +1355,7 @@ function buildRoutes(): Route[] {
       }
       if (Object.keys(change).length === 0) {
         throw new BadRequestError(
-          'nothing to change — send transferCapShards, or seedPerMarketWei and seedPerDayWei (null clears the pair)',
+          'nothing to change — send transferCapWei, or seedPerMarketWei and seedPerDayWei (null clears the pair)',
         )
       }
       const result = await deps.sql.begin(async (tx) => ({
@@ -1398,7 +1398,7 @@ function buildRoutes(): Route[] {
         body: {
           treasury: { subject: ENGAGEMENT_TREASURY_SUBJECT, balances: treasury },
           services,
-          spendShardsByService: await transferTotals(deps.sql),
+          spendWeiByService: await transferTotals(deps.sql),
           transfers: await listTransfers(deps.sql),
           policies,
           feeRecycle: await readFeeRecycle(deps.sql),

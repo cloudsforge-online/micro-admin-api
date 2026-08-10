@@ -21,17 +21,38 @@
  * that funds empty rooms.
  *
  * **THE CEILINGS ARE IN THE SCHEMA AND MIRRORED HERE AS CONSTANTS** so a route can refuse with a
- * sentence before the constraint refuses with an errcode. The numbers must match migrations.ts
- * version 8 exactly; `engagement.test.ts` proves each constant against the live constraint by
- * writing ceiling-plus-one through a raw connection and watching it refuse.
+ * sentence before the constraint refuses with an errcode. The numbers must match migrations.ts —
+ * version 8 as amended by version 13 — exactly; `engagement.test.ts` proves each constant against
+ * the live constraint by writing ceiling-plus-one through a raw connection and watching it refuse.
+ *
+ * **THE UNIT IS EMBER WEI, AND IT WAS SHARD UNTIL 2026-08-10** — micro-org#226, migration 13. The
+ * cap and the transfer record bound a movement between two LEDGER accounts, and the account they
+ * bound is funded in EMBER by the only code that funds it (`feeRecyclePostings` in
+ * `billing/src/ledger.ts`, whose asset is billing's `settlementAsset: 'EMBER'`). A cap in a unit
+ * the account cannot hold is a cap that cannot be compared with the balance it governs; docs 21 §2
+ * has said "denominated in EMBER" since 2026-08-07 and this file now agrees with it.
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 
 import type { Sql, TransactionSql } from 'postgres'
+import type { IssuableAssetCode } from '@cloudsforge/contracts-chain'
 import { appendAudit } from './audit.ts'
 
 export type Db = Sql
 export type Tx = TransactionSql
+
+/**
+ * The asset every engagement posting is denominated in, spelled once — micro-org#226.
+ *
+ * `IssuableAssetCode` — `Exclude<AssetCode, 'SHARD'>` in contracts-chain — and not a string. Both
+ * legs of `engagement.transfer` read `'SHARD'` until 2026-08-10, which executed cleanly because
+ * `micro-ledger`'s retired-asset gate is scoped to `ACQUISITION_KINDS` and deliberately leaves
+ * `transfer` legal so the 13 live SHARD balances can be drained (ledger/src/entries.ts). Nothing
+ * would have failed; the programme would simply have moved a retired asset while the treasury it
+ * spends is funded in EMBER. The type is what stops that returning: a build that named SHARD here
+ * would not compile.
+ */
+export const ENGAGEMENT_ASSET: IssuableAssetCode = 'EMBER'
 
 /** The services 21 §1 names. The schema pins the same list; this is the route's copy. */
 export const ENGAGEMENT_SERVICES: readonly string[] = Object.freeze([
@@ -52,7 +73,10 @@ export const ENGAGEMENT_TREASURY_SUBJECT = 'platform:engagement-treasury'
 
 /* The schema ceilings, mirrored. migrations.ts version 8 is the authority; these are the copies
  * the routes use to refuse with a sentence. Each is proven against its constraint by test. */
-export const TRANSFER_CAP_CEILING_SHARDS = 1_000_000_000n // USD 10M at 100 Shards/USD
+// 4e25 wei = 40,000,000 EMBER = USD 10M per transfer at EMBER's administered 0.25 — the SAME
+// money the 1,000,000,000 Shards this read until 2026-08-10 meant (micro-org#226). Converted at
+// migration 13's frozen rate, not relabelled: SHARD has 0 decimals and EMBER has 18.
+export const TRANSFER_CAP_CEILING_WEI = 40_000_000_000_000_000_000_000_000n
 export const SEED_PER_MARKET_CEILING_WEI = 1_000_000_000_000_000_000_000n // 1,000 EMBER
 export const SEED_PER_DAY_CEILING_WEI = 10_000_000_000_000_000_000_000n // 10,000 EMBER
 export const FEE_RECYCLE_CEILING_BPS = 2_500 // 25% of platform fee revenue
@@ -77,7 +101,7 @@ export class RaiseNeedsApprovalError extends EngagementError {
 
 export interface EngagementPolicy {
   readonly service: string
-  readonly transferCapShards: string
+  readonly transferCapWei: string
   readonly seedPerMarketWei: string | null
   readonly seedPerDayWei: string | null
   readonly lastChangeApprovalId: string | null
@@ -94,7 +118,7 @@ export interface FeeRecyclePolicy {
 
 interface PolicyRow {
   readonly service: string
-  readonly transfer_cap_shards: string
+  readonly transfer_cap_wei: string
   readonly seed_per_market_wei: string | null
   readonly seed_per_day_wei: string | null
   readonly last_change_approval_id: string | null
@@ -105,7 +129,7 @@ interface PolicyRow {
 function toPolicy(row: PolicyRow): EngagementPolicy {
   return {
     service: row.service,
-    transferCapShards: row.transfer_cap_shards,
+    transferCapWei: row.transfer_cap_wei,
     seedPerMarketWei: row.seed_per_market_wei,
     seedPerDayWei: row.seed_per_day_wei,
     lastChangeApprovalId: row.last_change_approval_id,
@@ -116,7 +140,7 @@ function toPolicy(row: PolicyRow): EngagementPolicy {
 
 export async function listPolicies(sql: Db | Tx): Promise<readonly EngagementPolicy[]> {
   const rows = await sql<PolicyRow[]>`
-    select service, transfer_cap_shards::text, seed_per_market_wei::text, seed_per_day_wei::text,
+    select service, transfer_cap_wei::text, seed_per_market_wei::text, seed_per_day_wei::text,
            last_change_approval_id, updated_at, updated_by
       from engagement_policies order by service
   `
@@ -125,7 +149,7 @@ export async function listPolicies(sql: Db | Tx): Promise<readonly EngagementPol
 
 export async function findPolicy(sql: Db | Tx, service: string): Promise<EngagementPolicy | null> {
   const rows = await sql<PolicyRow[]>`
-    select service, transfer_cap_shards::text, seed_per_market_wei::text, seed_per_day_wei::text,
+    select service, transfer_cap_wei::text, seed_per_market_wei::text, seed_per_day_wei::text,
            last_change_approval_id, updated_at, updated_by
       from engagement_policies where service = ${service}
   `
@@ -154,16 +178,16 @@ export async function readFeeRecycle(sql: Db | Tx): Promise<FeeRecyclePolicy> {
 
 /** The values a policy write may carry. Absent fields keep their current value. */
 export interface PolicyChange {
-  readonly transferCapShards?: bigint
+  readonly transferCapWei?: bigint
   readonly seedPerMarketWei?: bigint | null
   readonly seedPerDayWei?: bigint | null
 }
 
 function requireWithinCeilings(change: PolicyChange): void {
-  if (change.transferCapShards !== undefined) {
-    if (change.transferCapShards < 0n || change.transferCapShards > TRANSFER_CAP_CEILING_SHARDS) {
+  if (change.transferCapWei !== undefined) {
+    if (change.transferCapWei < 0n || change.transferCapWei > TRANSFER_CAP_CEILING_WEI) {
       throw new EngagementError(
-        `transferCapShards must be between 0 and ${TRANSFER_CAP_CEILING_SHARDS} — the schema ceiling refuses more`,
+        `transferCapWei must be between 0 and ${TRANSFER_CAP_CEILING_WEI} — the schema ceiling refuses more`,
       )
     }
   }
@@ -189,8 +213,8 @@ function requireWithinCeilings(change: PolicyChange): void {
 }
 
 function isRaise(current: EngagementPolicy | null, change: PolicyChange): boolean {
-  const currentCap = current ? BigInt(current.transferCapShards) : 0n
-  if (change.transferCapShards !== undefined && change.transferCapShards > currentCap) return true
+  const currentCap = current ? BigInt(current.transferCapWei) : 0n
+  if (change.transferCapWei !== undefined && change.transferCapWei > currentCap) return true
   const currentPerMarket = current?.seedPerMarketWei ? BigInt(current.seedPerMarketWei) : null
   const currentPerDay = current?.seedPerDayWei ? BigInt(current.seedPerDayWei) : null
   const nextPerMarket = change.seedPerMarketWei
@@ -240,7 +264,7 @@ export async function setPolicy(tx: Tx, input: SetPolicyInput, now: () => Date =
     )
   }
 
-  const nextCap = input.change.transferCapShards ?? (current ? BigInt(current.transferCapShards) : 0n)
+  const nextCap = input.change.transferCapWei ?? (current ? BigInt(current.transferCapWei) : 0n)
   const nextPerMarket =
     input.change.seedPerMarketWei !== undefined
       ? input.change.seedPerMarketWei
@@ -260,7 +284,7 @@ export async function setPolicy(tx: Tx, input: SetPolicyInput, now: () => Date =
 
   const rows = await tx<PolicyRow[]>`
     insert into engagement_policies (
-      service, transfer_cap_shards, seed_per_market_wei, seed_per_day_wei,
+      service, transfer_cap_wei, seed_per_market_wei, seed_per_day_wei,
       last_change_approval_id, updated_at, updated_by
     ) values (
       ${input.service}, ${nextCap.toString()},
@@ -269,13 +293,13 @@ export async function setPolicy(tx: Tx, input: SetPolicyInput, now: () => Date =
       ${approvalId}, ${now().toISOString()}::timestamptz, ${input.operator}
     )
     on conflict (service) do update set
-      transfer_cap_shards = excluded.transfer_cap_shards,
+      transfer_cap_wei = excluded.transfer_cap_wei,
       seed_per_market_wei = excluded.seed_per_market_wei,
       seed_per_day_wei = excluded.seed_per_day_wei,
       last_change_approval_id = excluded.last_change_approval_id,
       updated_at = excluded.updated_at,
       updated_by = excluded.updated_by
-    returning service, transfer_cap_shards::text, seed_per_market_wei::text, seed_per_day_wei::text,
+    returning service, transfer_cap_wei::text, seed_per_market_wei::text, seed_per_day_wei::text,
               last_change_approval_id, updated_at, updated_by
   `
   const policy = toPolicy(rows[0]!)
@@ -357,7 +381,7 @@ export async function setFeeRecycle(
 export interface EngagementTransfer {
   readonly id: string
   readonly service: string
-  readonly amountShards: string
+  readonly amountWei: string
   readonly approvalId: string
   readonly ledgerEntryId: string | null
   readonly state: 'posting' | 'posted'
@@ -368,7 +392,7 @@ export interface EngagementTransfer {
 interface TransferRow {
   readonly id: string
   readonly service: string
-  readonly amount_shards: string
+  readonly amount_wei: string
   readonly approval_id: string
   readonly ledger_entry_id: string | null
   readonly state: 'posting' | 'posted'
@@ -380,7 +404,7 @@ function toTransfer(row: TransferRow): EngagementTransfer {
   return {
     id: row.id,
     service: row.service,
-    amountShards: row.amount_shards,
+    amountWei: row.amount_wei,
     approvalId: row.approval_id,
     ledgerEntryId: row.ledger_entry_id,
     state: row.state,
@@ -389,7 +413,7 @@ function toTransfer(row: TransferRow): EngagementTransfer {
   }
 }
 
-const TRANSFER_COLUMNS = `id, service, amount_shards::text, approval_id, ledger_entry_id, state,
+const TRANSFER_COLUMNS = `id, service, amount_wei::text, approval_id, ledger_entry_id, state,
                           created_at, posted_at`
 
 /**
@@ -402,11 +426,11 @@ const TRANSFER_COLUMNS = `id, service, amount_shards::text, approval_id, ledger_
  */
 export async function claimTransfer(
   tx: Tx,
-  input: { readonly service: string; readonly amountShards: bigint; readonly approvalId: string },
+  input: { readonly service: string; readonly amountWei: bigint; readonly approvalId: string },
 ): Promise<EngagementTransfer> {
   await tx`
-    insert into engagement_transfers (service, amount_shards, approval_id)
-    values (${input.service}, ${input.amountShards.toString()}, ${input.approvalId})
+    insert into engagement_transfers (service, amount_wei, approval_id)
+    values (${input.service}, ${input.amountWei.toString()}, ${input.approvalId})
     on conflict (approval_id) do nothing
   `
   const rows = await tx<TransferRow[]>`
@@ -447,27 +471,37 @@ export async function listTransfers(sql: Db | Tx, limit = 100): Promise<readonly
 /** Spend per service, summed in the database in exact integer arithmetic. */
 export async function transferTotals(sql: Db | Tx): Promise<Readonly<Record<string, string>>> {
   const rows = await sql<{ service: string; total: string }[]>`
-    select service, coalesce(sum(amount_shards), 0)::text as total
+    select service, coalesce(sum(amount_wei), 0)::text as total
       from engagement_transfers where state = 'posted'
      group by service
   `
   return Object.fromEntries(rows.map((r) => [r.service, r.total]))
 }
 
-/** A positive whole-Shard amount from a decimal string. Never a JSON number near money. */
-export function parseShards(value: string): bigint {
-  if (!/^[0-9]{1,19}$/.test(value)) {
-    throw new EngagementError('an amount is a positive decimal string of whole Shards, not a number')
+/**
+ * A positive amount of EMBER wei from a decimal string. Never a JSON number near money.
+ *
+ * 78 digits, not the 19 this allowed while the column was a bigint of Shards. That is not a
+ * loosened guard, it is the same guard against the widened column: `numeric(78,0)` holds any
+ * uint256, and at 18 decimals every transfer worth approving is already past
+ * `Number.MAX_SAFE_INTEGER` — so a JSON number here would not merely risk the low bits, it would
+ * routinely lose them. The ceiling is what bounds the value; the length only bounds the parse.
+ */
+export function parseTransferWei(value: string): bigint {
+  if (!/^[0-9]{1,78}$/.test(value)) {
+    throw new EngagementError(
+      'an amount is a positive decimal string of EMBER wei, not a number',
+    )
   }
   const amount = BigInt(value)
-  if (amount <= 0n) throw new EngagementError('an amount must be at least one Shard')
+  if (amount <= 0n) throw new EngagementError('an amount must be at least one wei')
   return amount
 }
 
 /** A cap, which unlike a transfer may legitimately be zero — zero is "nothing may move". */
-export function parseCapShards(value: string): bigint {
-  if (!/^[0-9]{1,19}$/.test(value)) {
-    throw new EngagementError('a cap is a decimal string of whole Shards, not a number')
+export function parseCapWei(value: string): bigint {
+  if (!/^[0-9]{1,78}$/.test(value)) {
+    throw new EngagementError('a cap is a decimal string of EMBER wei, not a number')
   }
   return BigInt(value)
 }
