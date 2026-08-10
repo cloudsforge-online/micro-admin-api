@@ -113,10 +113,37 @@
  * approval two DISTINCT operators signed, which requires an administrator to already exist. The
  * first still comes from the deploy-time bootstrap. `bootstrap.test.ts` holds that line.
  *
- * **STILL OWED BY `micro-deploy`:** admin-api's service token does not carry `identity:admin`
- * (`deploy/compose/docker-compose.estate.yml` grants it `ledger:read`, `market:read`,
- * `market:admin`, `billing:read`). Until it does, this executor is correct and will 403 at
- * identity in the estate. Reported there rather than worked around here.
+ * **NOTHING IS OWED BY `micro-deploy` ANY MORE, AND THE NOTE THAT SAID SO WAS WRONG IN BOTH
+ * DIRECTIONS.** A boxed paragraph stood here claiming admin-api's service token did not carry
+ * `identity:admin` and did carry `ledger:read`, `market:read`, `market:admin` and `billing:read`,
+ * and concluding that this executor "will 403 at identity in the estate". Read against the running
+ * mainnet estate on 2026-08-10 — `IDENTITY_SERVICE_TOKEN_GRANTS` in
+ * `cloudsforge-estate-identity-1`, which is the map identity actually mints from — admin-api's
+ * entry is exactly:
+ *
+ *     ["identity:admin", "ledger:post", "ledger:read"]
+ *
+ * So the scope the note said was missing is granted, and three of the four it said were granted are
+ * not. `market:read`, `market:admin` and `billing:read` were dropped when micro-deploy stopped
+ * hand-maintaining that map and started DERIVING it, because no service token ever carried them:
+ * `market.moderation.case.resolve` and `billing.entitlement.revoke` forward the OPERATOR'S OWN
+ * bearer (`upstreams.ts`), which is SD-11's one good decision and not a gap. Nothing regressed when
+ * they went.
+ *
+ * **THE CONSEQUENCE OF THE STALE NOTE WAS NOT COSMETIC**, which is why it is written up rather than
+ * quietly deleted: `identity.role.grant` is the privilege-escalation action in this catalogue, and
+ * a reader of this file was told the estate's most sensitive executor was inert when it was wired
+ * and working. A reader who believed it would look for the promotion path somewhere else — and the
+ * only other place to look is a hand-run `UPDATE users SET roles`, which is the exact route the
+ * platform-roles work was built to close.
+ *
+ * **SO THE GRANT IS NO LONGER RECORDED BY HAND HERE.** A second copy of a fact that lives in the
+ * estate is what rotted the first time; writing a corrected copy would only reset its clock. The
+ * demand is now DECLARED at the module that presents the credential — `IDENTITY_SCOPES` and
+ * `LEDGER_SCOPES` in `upstreams.ts`, with `MARKET_SCOPES` and `BILLING_SCOPES` empty on purpose —
+ * which is the seam `deploy/scripts/derive-grants.mjs` reads to BUILD the map, so the compose file
+ * and this repository can no longer disagree without the derivation saying so. `upstreams.test.ts`
+ * holds the declaration to the call sites at this end.
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  *
  * The route as it was specified, kept because the shape it names is the shape that was built:
@@ -173,6 +200,40 @@ import {
  * for the full argument and for why it is a named constant rather than a literal buried in a call.
  */
 export const BASE_PLATFORM_ROLE = 'player'
+
+/**
+ * The roles `identity.role.revoke` may take away, as a CLOSED list.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THIS LIST IS A SAFETY INTERLOCK, NOT A CONVENIENCE, AND IT WILL GO STALE ON PURPOSE.**
+ *
+ * Identity's write is a REPLACEMENT: `setPlatformRoles` takes the complete set the user is to end
+ * up with and derives `granted`/`revoked` by diffing. There is no route that reads another user's
+ * live role set — `GET /internal/users/:id/role-grants` returns the grant HISTORY, and a history
+ * cannot be replayed into a set because the bootstrap grant and any direct write are not in it.
+ * The full argument is in `EXECUTORS['identity.role.grant']`; nothing about it has changed.
+ *
+ * So "revoke role X" can only be expressed here as "set the role list to what remains", and the
+ * executor computes what remains WITHOUT knowing what the user holds. Reducing to
+ * `[BASE_PLATFORM_ROLE]` is correct only while `admin` is the sole non-base role in identity's
+ * vocabulary — measured on 2026-08-10, `identity/src/platformRoles.ts` has
+ * `PLATFORM_ROLES = ['player', 'admin']` and `PRIVILEGED_ROLES = ['admin']`, so it is correct
+ * today and the two phrasings coincide exactly.
+ *
+ * The day identity adds a third role that coincidence ends, and a revoke of `admin` would silently
+ * strip the new role from anyone holding both — a privilege removal nobody asked for, which is the
+ * mirror image of the bug the grant executor's union exists to prevent. A comment asking a future
+ * reader to remember that is precisely the kind of comment #317 was filed about.
+ *
+ * Hence a closed list the executor REFUSES to go outside, and `actions.test.ts` pins both its
+ * contents and the refusal. Adding a role to identity does not silently change what this does; it
+ * makes a revoke of the new role fail loudly here, with a message naming what has to happen
+ * instead. **What has to happen instead belongs to `micro-identity`:** a delta write
+ * (`grant`/`revoke`) or a live read of the current set. It is named in #317's closing comment and
+ * is not worked around further from this side.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export const REVOCABLE_ROLES: readonly string[] = Object.freeze(['admin'])
 
 export interface ExecutionContext {
   readonly approval: Approval
@@ -315,7 +376,50 @@ export const ACTIONS: Readonly<Record<string, ActionSpec>> = Object.freeze({
     upstream: 'identity',
     approval: 'two-operator',
     summary: 'Grant a platform role. THE MOST AUDIT-WORTHY ACTION IN THE ESTATE — see the header.',
-    route: 'PUT /internal/users/:id/roles — identity/src/server.ts:1584, scope identity:admin (SERVICE token only)',
+    // Re-read on 2026-08-10: the define is at identity/src/server.ts:1783. The citation said :1584,
+    // which is now the middle of an unrelated handler — the same drift that produced the boxed
+    // claim at the head of this file, in miniature, and the reason `routeidempotency.test.ts`
+    // checks the SHAPE of these citations while only a human re-reading the file can check the
+    // number.
+    route: 'PUT /internal/users/:id/roles — identity/src/server.ts:1783, scope identity:admin (SERVICE token only)',
+    blockedReason: null,
+    requiredParams: ['role'],
+  },
+
+  /**
+   * **THE OTHER HALF OF THE PROMOTION, WHICH THIS CATALOGUE DID NOT HAVE — micro-org #317.**
+   *
+   * `identity.role.grant` has existed since identity built the route. There was no way to UNDO it
+   * through this service, and the omission was not a decision anybody recorded — it is simply what
+   * happens when a catalogue grows one action at a time. The consequence is worth naming, because
+   * it is the opposite of the one people expect: the missing action is not the dangerous one.
+   *
+   *   * A promotion two operators signed for could be reversed only by a hand-run `UPDATE users SET
+   *     roles` against identity's database. That write leaves NO `platform_role_grants` row (the
+   *     trigger only guards promotions), no `identity.role.changed` event, and no row in this
+   *     service's hash-chained audit — so the estate's record would show an administrator being
+   *     created and never show them being removed.
+   *   * De-escalation would therefore have been the one privileged operation with a WORSE audit
+   *     trail than escalation, and the only one that could be done by one person. An operator
+   *     leaving the company is a routine event; a control that makes the routine path the
+   *     unaudited one is a control that will be walked around.
+   *
+   * So revocation goes through the same queue, the same two signatures, the same upstream route and
+   * the same audit chain as the grant. It is deliberately NOT single-operator: SD-11's asymmetry
+   * (one to freeze, two to unfreeze) applies to an EMERGENCY control, where acting fast is the
+   * safety property. Removing an administrator is not an emergency freeze — `policy/src/freezes.ts`
+   * is where the estate keeps those — and a one-operator route to "remove an administrator" is a
+   * one-operator route to removing every OTHER administrator, which is how a lone actor clears the
+   * room before doing something that needs two signatures.
+   */
+  'identity.role.revoke': {
+    subjectKind: 'user',
+    upstream: 'identity',
+    approval: 'two-operator',
+    summary:
+      'Revoke a platform role, returning the user to the base role. Two operators, the same ' +
+      'audited route as the grant — see the executor for why the role list is closed.',
+    route: 'PUT /internal/users/:id/roles — identity/src/server.ts:1783, scope identity:admin (SERVICE token only)',
     blockedReason: null,
     requiredParams: ['role'],
   },
@@ -652,6 +756,67 @@ export const EXECUTORS: Readonly<Record<string, Executor>> = Object.freeze({
   },
 
   /**
+   * Take a platform role away. The same route, the same two signatures, the same audit chain.
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * **WHAT IS SENT IS `[BASE_PLATFORM_ROLE]`, AND THE GUARD ABOVE IT IS WHY THAT IS HONEST.**
+   *
+   * Identity's write replaces the set, so a revoke is expressed as the set that should remain. This
+   * executor cannot read what the user holds — see `REVOCABLE_ROLES` for the full account and for
+   * what `micro-identity` owes — so it sends the base role, which is "revoke the named role" and
+   * "reduce to the base role" at the same time only while `admin` is the only other role there is.
+   * The `REVOCABLE_ROLES` check is what stops that coincidence from being an assumption: a role
+   * outside the list is refused here rather than turned into a set-replacement nobody reviewed.
+   *
+   * **THE RETURN VALUE IS WHERE THE TRUTH ABOUT A NO-OP LIVES.** Identity computes `revoked` by
+   * diffing, so revoking a role the user never held is a 200 with an empty `revoked` — not an
+   * error. That is deliberate on both sides and is surfaced rather than smoothed over: the audit
+   * row this service writes carries `revoked: []`, which reads as "two operators authorised the
+   * removal of a role this user did not have". An executor that threw instead would leave the
+   * approval `approved` and un-executed, and a queue full of approvals that can never complete is
+   * worse than a truthful no-op.
+   *
+   * **NO GRANT ROW IS WRITTEN, AND NONE SHOULD BE.** `platform_role_grants` is an append-only trail
+   * of PROMOTIONS and identity's deferred trigger only guards the granting direction. The removal
+   * is recorded in identity's `identity.role.changed` event (`revoked` is in the payload), in its
+   * `platform_roles_changed` warn line, and in this service's hash-chained `audit_events` row with
+   * the approval that authorised it. That the trail lives in three places rather than one is
+   * exactly why this action exists instead of a hand-run `UPDATE`, which would be in none of them.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  'identity.role.revoke': async (ctx) => {
+    const role = requireString(ctx.approval.params, 'role')
+    if (!REVOCABLE_ROLES.includes(role)) {
+      throw new Error(
+        `params.role must be one of ${REVOCABLE_ROLES.join(', ')} — revoking "${role}" would mean ` +
+          'replacing the whole role set, and identity exposes no read of what this user currently ' +
+          'holds. See REVOCABLE_ROLES.',
+      )
+    }
+
+    const change = await ctx.identity.setRoles({
+      userId: ctx.approval.subjectId,
+      // Everything BUT the revoked role — which is the base role alone, for exactly as long as the
+      // vocabulary is two roles wide. The guard above is what keeps that a checked claim.
+      roles: [BASE_PLATFORM_ROLE],
+      actor: ctx.operator,
+      reason: `${ctx.approval.reasonCode}: ${ctx.approval.reason}`,
+      approvalId: ctx.approval.id,
+      correlationId: ctx.correlationId,
+    })
+
+    return {
+      userId: ctx.approval.subjectId,
+      roles: [...change.roles],
+      granted: [...change.granted],
+      revoked: [...change.revoked],
+      // Named, because an empty `revoked` is a 200 and a reader of the audit row should not have to
+      // infer that the role was never held.
+      alreadyAbsent: change.revoked.length === 0,
+    }
+  },
+
+  /**
    * Queue the live restore that two operators have now authorised.
    *
    * ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -672,6 +837,33 @@ export const EXECUTORS: Readonly<Record<string, Executor>> = Object.freeze({
    * a retry safe: the second insert fails at the index rather than starting a second restore over
    * the top of the first. One approval authorises ONE restore, for ever, exactly as
    * `engagement_transfers_one_per_approval` makes one approval one transfer.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * **THE `queued` STATE IS THIS SERVICE'S ONLY REVIEW WINDOW, AND IT CANNOT YET BE USED — #317.**
+   *
+   * #317 observes that approving and executing are one HTTP call here, so the approver is always
+   * the executor and no action has an approved-but-unrun window to be inspected in. `server.ts`'s
+   * decision route argues why that is right for the other six executable actions. It is NOT right
+   * for a live restore, and the reason this executor queues rather than performs is that the
+   * queued row is meant to be exactly that missing window: the last moment before an irreversible
+   * act, held open by a different deployable than the one that authorised it.
+   *
+   * **The window is real and currently has no door.** `restore_runs_state_known` (migrations.ts
+   * version 10) is `('queued','running','succeeded','failed','refused')` — there is no
+   * `withdrawn`, no `cancelled`, and no route in this service that writes one. Between the second
+   * signature and `deploy/backup` claiming the row there is a genuine interval in which somebody
+   * could realise the estate is about to be overwritten, and nothing they can do with it except
+   * stop the runner by hand.
+   *
+   * **THIS IS NOT HALF-FIXED HERE ON PURPOSE.** A `withdrawn` state added to this schema alone
+   * would be a state the DATA PLANE DOES NOT READ: `deploy/backup`'s runner claims a `queued` row
+   * and starts moving bytes, and a row this service had marked withdrawn would be restored anyway
+   * while the console showed it cancelled. That is strictly worse than no withdrawal at all,
+   * because it is a control that reports success and does nothing — the precise failure shape
+   * #317 was filed about. A real withdrawal needs the runner to honour the state at claim time,
+   * under a conditional claim, and that is `micro-deploy`'s to build. Named in #317's closing
+   * comment and left open rather than approximated.
    * ══════════════════════════════════════════════════════════════════════════════════════════════
    */
   'estate.restore': async (ctx) => {

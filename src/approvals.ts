@@ -19,6 +19,42 @@
  * with the route bypassed.
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **AND THE APPROVER MAY NOT BE THE SUBJECT — micro-org#317, ADDED SECOND AND FOR A REASON.**
+ *
+ * Everything above counts SIGNATURES. It proves two different operators touched the row and says
+ * nothing about who the row is FOR. That was enough while every action in the catalogue named a
+ * ledger entry, a moderation case or an entitlement — none of which is a person — and stopped
+ * being enough the moment `identity.role.grant` landed, which was the day the catalogue gained an
+ * action whose subject IS an operator.
+ *
+ * The hole: A raises `identity.role.grant` naming B, and B approves it. `requested_by <>
+ * decided_by` holds, all three layers above pass, the audit row names two operators, and B has
+ * just granted themselves `admin`. Nobody acted alone and the control still failed, because "two
+ * operators" was chosen so that the person who BENEFITS is not the person who DECIDES. The
+ * requester/decider split is how that property is usually spelled; it is not what it means.
+ *
+ * So the beneficiary is checked in the same three places, deliberately mirroring the shape above
+ * rather than inventing a second one:
+ *
+ *   1. `decide()` refuses it with `SubjectApprovalError` — its own class, its own sentence, its own
+ *      counter, because "you cannot decide your own request" would be a lie here.
+ *   2. `approvals_decider_is_not_the_subject` (migrations.ts version 12) refuses it as a CHECK, so
+ *      a future code path that has not read this file cannot get past it.
+ *   3. The UPDATE carries the same predicate in its WHERE clause, so a concurrent decision cannot
+ *      slip between the read and the write.
+ *
+ * **THE REQUESTER IS NOT COVERED, AND THAT IS THE DECISION RATHER THAN THE OVERSIGHT.** Raising a
+ * request that names yourself is ASKING. Somebody else still signs it, and forbidding it would only
+ * mean asking a colleague to type the request for you — which hides who wanted the role while
+ * changing nothing about who authorised it, and makes the audit row less true.
+ *
+ * **WHAT THIS STILL DOES NOT DO.** It is any two admins. There is no role split, no N-of-M, and no
+ * rule that a more sensitive action needs a differently-qualified second signature. #317 names that
+ * separately and it is a bigger change than a predicate — it needs a notion of operator ROLES that
+ * this service does not have and, per #316, should not grow ahead of the #165 capability inventory.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ *
  * **AN APPROVAL IS CONSENT TO AN ACTION IN A CONTEXT, AND THE CONTEXT DOES NOT KEEP.** A pending
  * request expires. Without expiry, a request raised during one incident is approved during the
  * next, by somebody who was not in the room for either — and the audit row would say two
@@ -72,6 +108,26 @@ export class SelfApprovalError extends ApprovalError {
   constructor() {
     super('an approval request cannot be decided by the operator who raised it')
     this.name = 'SelfApprovalError'
+  }
+}
+
+/**
+ * The four-eyes refusal that counts the BENEFICIARY rather than the signatures — micro-org#317.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **ITS OWN CLASS, NOT A SECOND MESSAGE ON `SelfApprovalError`.** The two refusals answer the same
+ * HTTP status and mean different things, and an operator who reads "you cannot approve your own
+ * request" when they have in fact approved somebody else's will conclude the service is broken and
+ * find another way. The sentence has to name what actually happened, and a metric that counts the
+ * two together would hide the more interesting one: an operator deciding on a request that names
+ * them is worth a look even when it is innocent, which self-approval attempts mostly are not.
+ * `server.ts` maps this to its own error code and its own counter.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export class SubjectApprovalError extends ApprovalError {
+  constructor() {
+    super('an approval request that names an operator as its subject cannot be decided by that operator')
+    this.name = 'SubjectApprovalError'
   }
 }
 
@@ -157,6 +213,29 @@ function toApproval(row: ApprovalRow): Approval {
     executionDetail: row.execution_detail,
     correlationId: row.correlation_id,
   }
+}
+
+/**
+ * The estate principal an approval's subject names, or `null` when it names no person at all.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE TWO COLUMNS ARE IN DIFFERENT VOCABULARIES ON PURPOSE, AND THIS IS THE CONVERSION.**
+ *
+ * `subject_id` is whatever identifier the UPSTREAM uses — a ledger entry id, a moderation case id,
+ * a bare uuid for identity's `PUT /internal/users/:id/roles`. `decided_by` is an estate PRINCIPAL,
+ * pinned to `^user:…` by `approvals_decider_is_a_principal`. Comparing them directly would be
+ * comparing a uuid to `user:<uuid>` and would silently never match — which is the failure mode
+ * where a security check exists, passes every test somebody thought to write, and enforces nothing.
+ *
+ * Exported so the check can be read by the tests that prove it, and written as a function rather
+ * than a template literal at the call site so that the day a second subject kind names a person
+ * there is exactly one place that has to learn about it. `subject_kind` is the discriminator
+ * because it is the column the catalogue sets from `ActionSpec.subjectKind`, so a new action
+ * naming a person cannot arrive without passing through it.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export function principalForSubject(subjectKind: string, subjectId: string): string | null {
+  return subjectKind === 'user' ? `user:${subjectId}` : null
 }
 
 export interface RequestInput {
@@ -260,6 +339,11 @@ export async function decide(
   }
   // ── FOUR EYES, first of three. See the file header.
   if (row.requested_by === input.operator) throw new SelfApprovalError()
+  // ── THE BENEFICIARY, first of three. Same three-layer shape, a different question. See the
+  //    file header, and `principalForSubject` for why the conversion is a function.
+  if (principalForSubject(row.subject_kind, row.subject_id) === input.operator) {
+    throw new SubjectApprovalError()
+  }
   if (row.expires_at.getTime() <= now().getTime()) {
     throw new ApprovalStateError(`approval ${input.id} expired at ${row.expires_at.toISOString()}`)
   }
@@ -275,6 +359,11 @@ export async function decide(
        and state = 'pending'
        -- ── FOUR EYES, second of three. A concurrent decision cannot slip past the read above.
        and requested_by <> ${input.operator}
+       -- ── THE BENEFICIARY, second of three. Written in SQL rather than reusing the value the
+       --    pre-check computed, so it binds the row AS IT IS AT WRITE TIME. The subject columns
+       --    are immutable today and this costs nothing; the day something makes them mutable,
+       --    this is the layer that does not have to be remembered.
+       and (subject_kind <> 'user' or 'user:' || subject_id <> ${input.operator})
     returning ${tx.unsafe(COLUMNS)}
   `
   const after = updated[0]

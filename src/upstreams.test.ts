@@ -24,6 +24,10 @@
 import { test, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  BILLING_SCOPES,
+  IDENTITY_SCOPES,
+  LEDGER_SCOPES,
+  MARKET_SCOPES,
   UpstreamError,
   httpBillingClient,
   httpLedgerClient,
@@ -58,6 +62,86 @@ function config(overrides: Partial<ClientConfig> = {}): ClientConfig {
     ...overrides,
   }
 }
+
+/* --------------------------------------------- the declared grant, and the call sites it covers */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THESE FOUR CASES ARE THE TEETH ON `*_SCOPES` — micro-org #317.**
+ *
+ * `upstreams.ts` now exports `LEDGER_SCOPES`, `IDENTITY_SCOPES`, `MARKET_SCOPES` and
+ * `BILLING_SCOPES` for `deploy/scripts/derive-grants.mjs` to read. Nothing in this repository
+ * imports them at runtime, and a constant no code reads is exactly the kind of thing that drifts
+ * away from the calls it describes without a single test going red — which is how the boxed claim
+ * in `actions.ts` came to assert for months that this service's token lacked `identity:admin`.
+ * Replacing a stale hand-written note in one repository with a stale hand-written constant in
+ * another would be no improvement at all.
+ *
+ * So the declaration is checked against the CALL SITES rather than against the estate. The
+ * discriminator is the one `derive-grants.mjs` itself uses: a method that reaches an upstream with
+ * `{ kind: 'service' }` is presenting THIS service's token and its scope must be declared; a method
+ * that reaches one with `{ kind: 'operator', bearer }` is presenting the human's and no scope of
+ * ours makes it stronger. The first two cases assert that both service-token clients send our
+ * bearer; the third asserts, from the source, that the clients declaring nothing have no
+ * `{ kind: 'service' }` call site to justify one.
+ *
+ * The estate half was measured rather than asserted here, because a unit test cannot reach it:
+ * with the `admin-api/src/upstreams.ts` entry removed from `grant-gaps.json`,
+ * `derive-grants.mjs --json` produced `admin-api -> identity:admin ledger:post ledger:read` on
+ * 2026-08-10 — the same three scopes `IDENTITY_SERVICE_TOKEN_GRANTS` already carries in the
+ * running estate, so `--check` passes with the compose block BYTE-IDENTICAL. That is the proof
+ * standard `grant-gaps.json` sets for its own deletions, and it is what makes the entry stale
+ * rather than merely deletable.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+test('EVERY SCOPE THIS SERVICE DECLARES IS ONE A SERVICE-TOKEN CALL SITE NEEDS', () => {
+  // Not an alphabetised copy of the compose file: these are the two clients that pass
+  // `{ kind: 'service' }`, and each scope below has a method under it in this same suite.
+  assert.deepEqual([...LEDGER_SCOPES].sort(), ['ledger:post', 'ledger:read'])
+  assert.deepEqual([...IDENTITY_SCOPES], ['identity:admin'])
+  // Least privilege runs both ways. An operator-bearer client granted a scope would be a real
+  // capability on a real token that no receiving gate ever consults — AD-05's failure shape.
+  assert.deepEqual([...MARKET_SCOPES], [])
+  assert.deepEqual([...BILLING_SCOPES], [])
+})
+
+test('A CLIENT THAT DECLARES NO SCOPE MAY NOT PRESENT THE SERVICE TOKEN', async () => {
+  // Source-level, deliberately. A behavioural test can only catch a method somebody remembered to
+  // exercise; this catches the NEXT method — one added to the market or billing client with
+  // `{ kind: 'service' }` copied from its neighbour, which would silently need a grant nobody has
+  // declared and would fail in the estate as a 403 rather than here.
+  const { readFileSync } = await import('node:fs')
+  const { fileURLToPath } = await import('node:url')
+  const source = readFileSync(fileURLToPath(new URL('./upstreams.ts', import.meta.url)), 'utf8')
+
+  // Each client's body runs from its factory to the next top-level `export`, which is how this
+  // file is laid out: one `httpXClient` per upstream, nothing interleaved.
+  const bodyOf = (factory: string): string => {
+    const from = source.indexOf(`export function ${factory}(`)
+    assert.ok(from >= 0, `${factory} is gone — this test is reading a file that no longer exists`)
+    const next = source.indexOf('\nexport ', from + 1)
+    return source.slice(from, next < 0 ? source.length : next)
+  }
+
+  for (const [factory, scopes] of [
+    ['httpMarketClient', MARKET_SCOPES],
+    ['httpBillingClient', BILLING_SCOPES],
+  ] as const) {
+    assert.equal(scopes.length, 0, `${factory}'s constant changed — update this case deliberately`)
+    assert.equal(
+      /kind: 'service'/.test(bodyOf(factory)),
+      false,
+      `${factory} presents this service's token but declares no scope: either forward the operator's bearer, or declare what identity must mint`,
+    )
+  }
+
+  // And the converse, so the check cannot pass by reading nothing: the two clients that DO declare
+  // are the two that do present it.
+  for (const factory of ['httpLedgerClient', 'httpIdentityClient']) {
+    assert.ok(/kind: 'service'/.test(bodyOf(factory)), `${factory} no longer presents the service token`)
+  }
+})
 
 /* ------------------------------------------------------------------ ledger */
 

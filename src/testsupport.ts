@@ -334,20 +334,33 @@ export interface FakeIdentity extends IdentityClient {
     approvalId: string
   }>
   failWith(err: Error | null): void
+  /** What the subject holds BEFORE the call, which is what `granted`/`revoked` are diffed against. */
+  setPreviousRoles(roles: readonly string[]): void
   reset(): void
 }
 
 export function fakeIdentity(): FakeIdentity {
   const grants: FakeIdentity['grants'] = []
   let failure: Error | null = null
+  // Identity diffs against what the user holds, and every registered user holds `player` — so this
+  // is the default. It is SETTABLE because the revoke executor's whole behaviour is in the diff:
+  // with a fixed `['player']` the fake can only ever answer `revoked: []`, which would let a
+  // revoke that removed nothing pass a test written to prove it removed something. See
+  // `setPreviousRoles`. Deliberately not a full user store — identity owns that, and a second
+  // model of it here would be a copy that drifts.
+  let previous: readonly string[] = ['player']
   return {
     grants,
     failWith(err) {
       failure = err
     },
+    setPreviousRoles(roles) {
+      previous = [...roles]
+    },
     reset() {
       grants.length = 0
       failure = null
+      previous = ['player']
     },
     async setRoles(request) {
       if (failure) throw failure
@@ -358,8 +371,6 @@ export function fakeIdentity(): FakeIdentity {
         reason: request.reason,
         approvalId: request.approvalId,
       })
-      // Identity diffs against what the user holds; every registered user holds `player`.
-      const previous = ['player']
       return {
         roles: [...request.roles],
         granted: request.roles.filter((r) => !previous.includes(r)),

@@ -27,6 +27,33 @@
  *                                    of eyes is the single failure this table exists to prevent,
  *                                    and it cannot be written down.
  *
+ *   `approvals_decider_is_not_the_subject`  Version 12, and the fifth. `decided_by` may not be
+ *                                    the principal the row is ABOUT. The four above count
+ *                                    signatures; this one is the only constraint here that asks
+ *                                    who benefits. See version 12's own block, and the header of
+ *                                    `src/approvals.ts`, for the hole it closes.
+ *
+ * ---------------------------------------------------------------------------------------------
+ * **A NOTE ON VERSION 6's SD-11 CITATION, WHICH CANNOT BE CORRECTED WHERE IT STANDS — #317.**
+ *
+ * Version 6's SQL says "SD-11 requires an emergency freeze to be cleared by two". #317 read that,
+ * together with the matching line in `src/flags.ts`, as citing a requirement nothing in the estate
+ * implements — a rule named in the schema, no freeze action in `ACTIONS`, and `flags.ts` ruling
+ * out the nearest mechanism. That reading is wrong, and the correction belongs here rather than
+ * there for a mechanical reason: a released migration is hash-pinned by `@cloudsforge/db`, and
+ * `migrations.test.ts` refuses a set in which an applied migration's text changed, so editing that
+ * comment would make every existing database refuse to boot. Same rule as version 11's note about
+ * version 5's column comment: read them together, newest last.
+ *
+ * The citation is accurate and the freeze is BUILT — in `policy/src/freezes.ts`, where
+ * `REQUIRED_CLEARANCES` is 2, the same operator cannot clear twice because `freeze_clearances`
+ * has `(freeze_id, operator)` as its primary key, and `DELETE /freezes/:id` answers 202 rather
+ * than 200 until a second distinct operator arrives. Measured on mainnet 2026-08-10, both tables
+ * exist in the estate's `policy` database and hold 0 rows: never exercised, which is what an
+ * estate with no real users looks like, and not the same thing as missing. `src/flags.ts` carries
+ * the longer argument for why the freeze must stay in policy and not migrate here.
+ * ---------------------------------------------------------------------------------------------
+ *
  *   `audit_events_source_event_uniq` The mirror's dedupe key. 17 §2 requires every service's
  *                                    audit rows to be "mirrored to admin-api", delivery is
  *                                    at-least-once, and a redelivered mirror row that appended a
@@ -1188,6 +1215,72 @@ export const MIGRATIONS: readonly Migration[] = [
       alter table audit_events drop constraint if exists audit_events_actor_is_a_principal;
       alter table audit_events add constraint audit_events_actor_is_a_principal
         check (actor = 'system' or actor ~ '^(user|service|operator):[A-Za-z0-9:._-]{1,128}$');
+    `,
+  },
+  {
+    version: 12,
+    name: 'decider-is-not-the-subject',
+    up: `
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+      -- FOUR EYES COUNTED THE SIGNATURES AND NEVER LOOKED AT WHO BENEFITED. micro-org#317.
+      --
+      -- Version 6 added \`approvals_no_self_approval\` — \`decided_by <> requested_by\` — and
+      -- src/approvals.ts enforces the same rule twice more, in the pre-read and in the UPDATE's
+      -- WHERE. Three layers, and all three guard the same fact: that two DIFFERENT operators
+      -- touched the row. None of them looks at \`subject_id\`.
+      --
+      -- So this passed every layer: operator A raises \`identity.role.grant\` naming operator B as
+      -- the subject, and B approves it. Two humans, two distinct principals, one of whom has just
+      -- awarded themselves \`admin\`. 13-operational-model.md §16 is quoted in version 6's own SQL
+      -- as the governing rule and it is about the PERSON WHO BENEFITS not being the person who
+      -- decides — the requester/decider split is how that is usually spelled, not what it means.
+      --
+      -- The gap is narrower than "any escalation" and that is precisely why it survived a review:
+      -- B cannot act alone, an audit row names both of them, and the request is visible in the
+      -- queue the whole time. It is a control that reads as intact from every angle except the one
+      -- that matters, which is the angle from which somebody stands to gain.
+      --
+      -- ── WHAT THE PREDICATE IS, AND WHY IT IS SHAPED THIS WAY ──
+      --
+      --   \`decided_by is null\`      A pending or expired row has no decider and cannot violate
+      --                             this. Same first clause as \`approvals_no_self_approval\`, for
+      --                             the same reason: the constraint is about a DECISION, and rows
+      --                             that carry none must stay insertable.
+      --   \`subject_kind <> 'user'\`  A subject that is a ledger entry, a moderation case, an
+      --                             entitlement, an engagement account or a backup run is not a
+      --                             principal and can never equal one. Only \`identity.role.grant\`
+      --                             and \`identity.role.revoke\` carry \`subject_kind = 'user'\`
+      --                             today, and scoping the check to them is what keeps it from
+      --                             comparing strings that are not comparable.
+      --   \`'user:' || subject_id\`   The two columns are in DIFFERENT vocabularies and that is not
+      --                             an accident to be tidied away: \`subject_id\` is the identifier
+      --                             the UPSTREAM uses, a bare uuid for identity's route, while
+      --                             \`decided_by\` is an estate PRINCIPAL and
+      --                             \`approvals_decider_is_a_principal\` pins it to '^user:...'.
+      --                             The concatenation is the conversion between them, written
+      --                             here rather than assumed, and it is why this cannot be a
+      --                             plain column comparison.
+      --
+      -- The REQUESTER is deliberately NOT covered. Raising a request naming yourself is asking,
+      -- and asking is not authority: some other operator still has to sign, and forcing a colleague
+      -- to type the request on your behalf would hide who wanted it while changing nothing about
+      -- who authorised it. The audit row would then be less true, not more.
+      --
+      -- MEASURED ON MAINNET BEFORE WRITING THIS, 2026-08-10: \`approvals\` in the estate's
+      -- \`admin_api\` database holds 3 rows, all 3 with \`subject_kind = 'user'\`, and 0 of them
+      -- with a non-null \`decided_by\` — so no row violates the new predicate, the ALTER validates
+      -- without a rewrite, and nothing is back-filled. Worth reading twice: every approval this
+      -- estate has ever raised names a USER as its subject, so the case this constraint covers is
+      -- not an exotic corner of the catalogue, it is the only case anyone has used. It has simply
+      -- never been decided. Had a violating row existed the answer would have been to add the
+      -- constraint NOT VALID and investigate the row, not to soften the predicate.
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+      alter table approvals add constraint approvals_decider_is_not_the_subject
+        check (
+          decided_by is null
+          or subject_kind <> 'user'
+          or decided_by <> 'user:' || subject_id
+        );
     `,
   },
 ]
