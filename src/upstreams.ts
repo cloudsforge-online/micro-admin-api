@@ -146,6 +146,59 @@ function clientFor(name: string, config: ClientConfig): HttpClient {
  */
 export type Credential = { readonly kind: 'service' } | { readonly kind: 'operator'; readonly bearer: string }
 
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+ * WHAT THIS SERVICE'S SERVICE TOKEN MUST CARRY, DECLARED WHERE THE CALL SITES ARE — micro-org #317
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * These four constants are not read by anything inside this repository at runtime. They are read
+ * by `deploy/scripts/derive-grants.mjs`, which walks every service's `src` for modules that
+ * construct an `HttpClient` and name a bearer, and BUILDS `IDENTITY_SERVICE_TOKEN_GRANTS` — the
+ * map identity mints from — out of their exported `*_SCOPES`. Declaring here is what makes the
+ * estate's copy a derivative of this file rather than a second opinion about it.
+ *
+ * **WHY THIS FILE WAS ONE OF THE HOLDOUTS, AND WHAT IT COST.** Until now `admin-api/src/upstreams.ts`
+ * was a hand-written entry in `deploy/compose/estate/grant-gaps.json`: a module micro-deploy knew
+ * presented a credential and could not read a demand from, so somebody in another repository wrote
+ * this service's authority down for it. That is the arrangement that produced the boxed claim in
+ * `actions.ts` — read it, it is the headline of #317 — asserting for months that this service's
+ * token lacked `identity:admin` and held `market:read`, `market:admin` and `billing:read`. Measured
+ * against `cloudsforge-estate-identity-1` on 2026-08-10 the real entry was
+ * `["identity:admin","ledger:post","ledger:read"]`: the scope said to be missing was present, and
+ * three of the four said to be present did not exist. Nobody was careless. A fact copied into a
+ * repository that cannot verify it has no mechanism to stay true, and the copy that rots is
+ * always the one furthest from the call site.
+ *
+ * So the demand is asserted from the module that makes the calls, and the assertion has teeth:
+ * `upstreams.test.ts` walks the source of this file and fails if a `{ kind: 'service' }` call site
+ * appears in a client whose constant says it needs nothing. A future method that quietly starts
+ * presenting the service bearer cannot slip past the declaration and re-open the same gap.
+ *
+ * **THE EMPTY ONES ARE DECLARATIONS, NOT OMISSIONS.** `market` and `billing` forward the OPERATOR'S
+ * OWN bearer — see the file header — so no scope on this service's token makes those calls
+ * stronger, and granting one would be a live capability on a live token that nothing consults.
+ * `derive-grants.mjs` reads a bare `Object.freeze([])` as exactly that statement and, since it does,
+ * a gaps entry for this file is now stale and fails. Deleting it is micro-deploy's, and it is named
+ * in #317's closing comment rather than done from here.
+ *
+ * `derive-grants.mjs` prefers `NO_SCOPES_REQUIRED` from `@cloudsforge/contracts-auth` for the empty
+ * form, and it is the better spelling. It is not used here because this repository deliberately
+ * depends on runtime `@cloudsforge/auth` and not on contracts-auth — `scopes.ts` explains why at
+ * length — and taking on a package dependency to change how an empty list is spelled is a larger
+ * decision than this declaration is. The two are identical at runtime and both are read.
+ */
+
+/** `reverse`, `postEntry`, `trialBalance` and `balances`, all `{ kind: 'service' }`. */
+export const LEDGER_SCOPES: readonly string[] = Object.freeze(['ledger:post', 'ledger:read'])
+
+/** `setRoles` → `PUT /internal/users/:id/roles`, which identity refuses to any non-service principal. */
+export const IDENTITY_SCOPES: readonly string[] = Object.freeze(['identity:admin'])
+
+/** Nothing: `resolveCase` and `listCases` present the operator's bearer, per SD-11. */
+export const MARKET_SCOPES: readonly string[] = Object.freeze([])
+
+/** Nothing: `revokeEntitlement` presents the operator's bearer, per SD-11. */
+export const BILLING_SCOPES: readonly string[] = Object.freeze([])
+
 /**
  * ASYNC, and the `await` at each of the eight call sites is the fix rather than a cost.
  *

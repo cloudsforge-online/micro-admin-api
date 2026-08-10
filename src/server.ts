@@ -66,6 +66,7 @@ import { READ_SCOPE, requireExactScope } from './scopes.ts'
 import {
   ACTIONS,
   EXECUTORS,
+  REVOCABLE_ROLES,
   isKnownAction,
   type ExecutionContext,
 } from './actions.ts'
@@ -96,6 +97,7 @@ import {
   ApprovalStateError,
   REASON_CODES,
   SelfApprovalError,
+  SubjectApprovalError,
   decide,
   findApproval,
   listApprovals,
@@ -237,6 +239,14 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
     .register({
       name: 'admin_self_approvals_refused_total',
       help: 'Attempts by a requester to decide their own request. Never expected to be non-zero.',
+      kind: 'counter',
+      labels: [],
+    })
+    .register({
+      name: 'admin_subject_approvals_refused_total',
+      help:
+        'Attempts by an operator to decide a request that names them as its subject. Separate ' +
+        'from the self-approval counter because the two say different things about who tried.',
       kind: 'counter',
       labels: [],
     })
@@ -498,6 +508,17 @@ async function handle(route: Route | undefined, ctx: RequestContext, deps: Serve
       // operator trying to route around the control. Both are worth seeing.
       ctx.log.warn('self-approval refused')
       return errorReply(403, 'self_approval_refused', err.message, ctx.requestId)
+    }
+    if (err instanceof SubjectApprovalError) {
+      deps.metrics.increment('admin_subject_approvals_refused_total')
+      // Warn, and a DIFFERENT code from `self_approval_refused` — micro-org#317. An operator who
+      // is told "you cannot approve your own request" after approving somebody else's concludes
+      // the service is broken and goes looking for another route, which is the opposite of what a
+      // refusal is for. The two are also worth counting apart: a self-approval attempt is nearly
+      // always a UI offering a button it should not have, while a decision on a request that names
+      // the decider is a person who has read the queue and picked that row.
+      ctx.log.warn('subject-approval refused')
+      return errorReply(403, 'subject_approval_refused', err.message, ctx.requestId)
     }
     if (err instanceof ActionUnavailableError) {
       return {
@@ -1005,6 +1026,19 @@ function buildRoutes(): Route[] {
           )
         }
       }
+      // ── Same reasoning, one action along — micro-org#317. `identity.role.revoke` may only name
+      // a role in `REVOCABLE_ROLES`, because identity's write REPLACES the role set and the
+      // executor cannot read what the subject currently holds, so anything outside that list would
+      // be a set-replacement nobody reviewed. The executor refuses it too and remains the
+      // enforcement of record; this is here so the refusal arrives BEFORE two operators sign,
+      // rather than as a failed execution on an approval that can never complete.
+      if (action === 'identity.role.revoke' && !REVOCABLE_ROLES.includes(String(params['role']))) {
+        throw new BadRequestError(
+          `params.role must be one of ${REVOCABLE_ROLES.join(', ')} for ${action} — revoking anything ` +
+            'else would mean replacing the whole role set, and identity exposes no read of what ' +
+            'this user currently holds',
+        )
+      }
       if (action === 'engagement.policy.set') {
         const service = String(params['service'])
         if (service !== 'platform' && !ENGAGEMENT_SERVICES.includes(service)) {
@@ -1113,6 +1147,35 @@ function buildRoutes(): Route[] {
         // record that two operators agreed, and retrying would then need a third signature for
         // something already authorised twice. `recordExecution` is at-most-once, and every
         // executor is idempotent at its upstream, so a retry is safe.
+        //
+        // ── AND THERE IS NO SEPARATE EXECUTE STEP. THAT IS A DECISION — micro-org#317. ──
+        //
+        // The second signature and the trigger are ONE HTTP call. The approver is therefore always
+        // the executor, and there is no window in which an approved-but-unrun action sits waiting
+        // to be inspected, delayed or withdrawn. #317 asked whether that was chosen or inherited.
+        // It is chosen, and the argument is this:
+        //
+        //   * A separate execute step adds a THIRD moment a human must show up, and it is the
+        //     moment with the least information attached — the decision has already been made and
+        //     recorded, so whoever presses it is either re-litigating a signed approval or is a
+        //     rubber stamp. This estate has one control that depends entirely on operators not
+        //     signing reflexively, and adding a step that teaches them to is how it is lost.
+        //     `ActionSpec.approval = 'read'` exists for the same reason, one layer up.
+        //   * The window would not be a review window unless something WATCHED it, and nothing
+        //     does: there is no notification on any action here (#165's gap), so an approved row
+        //     would sit unread until the person who approved it came back for it.
+        //   * The delay is not free. Six of the seven executable actions reverse a bad ledger
+        //     entry, resolve a moderation case, revoke an entitlement or fund an engagement
+        //     account — all of them things somebody is waiting on during an incident, and all of
+        //     them reversible afterwards.
+        //
+        // **THE ONE ACTION THIS ARGUMENT DOES NOT COVER IS `estate.restore`**, which overwrites
+        // every database in the estate including the audit rows that would say who did it. The
+        // coupling is deliberately NOT the last checkpoint there, and that is why the executor
+        // only QUEUES the restore rather than performing it: the queued row is a real window, held
+        // by `deploy/backup`'s runner rather than by this route. See `EXECUTORS['estate.restore']`
+        // in actions.ts for what that window can and cannot currently do — it is not yet possible
+        // to withdraw a queued restore, and closing that is named in #317 as micro-deploy's.
         // ══════════════════════════════════════════════════════════════════════════════════
         const execution = await execute(deps, approval, operator, bearer, ctx)
         return { status: 201, body: { approval: execution.approval, execution: execution.detail } }
@@ -1775,12 +1838,25 @@ function idempotencyKeyOf(ctx: RequestContext): string {
 }
 
 /**
- * Read the mirrored audit claim out of an inbound envelope.
+ * Validate an approval `state` query parameter against the closed set the queue can be in.
  *
- * **The `source` is taken from the authenticated sender, not from the payload.** A service that
- * holds `admin:audit:write` can mirror its own rows; it may not mirror somebody else's. Trusting a
- * payload field there would let any one compromised service write audit rows attributed to every
- * other, which is the same act-as-anyone defect as a `userId` parameter, one layer up.
+ * **THE COMMENT THAT WAS HERE DESCRIBED A DIFFERENT FUNCTION ENTIRELY — micro-org#317.** It said
+ * this reads "the mirrored audit claim out of an inbound envelope" and argued about taking the
+ * `source` from the authenticated sender rather than the payload, on a route gated by
+ * `admin:audit:write`. None of that is this function, and two thirds of it no longer describes
+ * anything: `admin:audit:write` was deleted (`scopes.ts` records why — no relay could ever present
+ * it, so it named a capability exercised zero times) and `POST /v1/events` is MAC-only now. The
+ * argument itself is sound and still lives where it belongs, beside that route.
+ *
+ * How it got here is worth a line, because it is the same defect as #317's headline in miniature:
+ * a doc comment was left attached to the helper that used to follow it when the code between them
+ * moved. Nothing failed. A comment cannot be typechecked, and there is no test that can be written
+ * for "this paragraph is about the function under it" — which is why the rest of this repository
+ * spends its comments on measurements and reasons rather than on restating what the code does.
+ *
+ * The list below is the same closed set as `approvals_state_known` in migrations.ts version 6. It
+ * is written out rather than derived from the type so that an unknown value is a 400 naming the
+ * four legal ones, not a query that silently matches nothing.
  */
 function parseState(value: string): ApprovalState {
   if (value !== 'pending' && value !== 'approved' && value !== 'rejected' && value !== 'expired') {

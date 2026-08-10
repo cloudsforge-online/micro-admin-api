@@ -16,8 +16,44 @@
  *
  * **A flag is not a kill switch and must not be used as one.** A kill switch is an emergency
  * freeze, SD-11 makes it asymmetric — set by one operator, cleared by two — and that asymmetry
- * cannot be expressed by a boolean anybody with the write scope can flip back. If an emergency
- * freeze lands here it goes through the approval queue, not through this table.
+ * cannot be expressed by a boolean anybody with the write scope can flip back.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE SENTENCE THAT USED TO FOLLOW WAS "IF AN EMERGENCY FREEZE LANDS HERE IT GOES THROUGH THE
+ * APPROVAL QUEUE, NOT THROUGH THIS TABLE." IT HAS BEEN REPLACED, BECAUSE IT WAS THE WRONG KIND OF
+ * TRUE — micro-org#317.**
+ *
+ * #317 read that line, and the matching SD-11 citation inside `migrations.ts` version 6, as citing
+ * a requirement the estate does not meet: an asymmetric freeze named in two files, no such action
+ * in `ACTIONS`, and `flags.ts` explicitly ruling out the nearest mechanism. That is #316's
+ * `users.status` shape — a reader concludes the capability exists — and it was a reasonable
+ * reading of these two files alone. **It is wrong about the estate.** The freeze exists, it is
+ * built, and it is not here:
+ *
+ *   `policy/src/freezes.ts` — `applyFreeze` sets one with a single operator, `requestClearance`
+ *   collects them, and `REQUIRED_CLEARANCES` is 2. The asymmetry is enforced by a PRIMARY KEY:
+ *   `freeze_clearances (freeze_id, operator)`, so the same operator asking twice is one row, not
+ *   two. `DELETE /freezes/:id` answers **202** on the first clearance and only clears on the
+ *   second — a status code chosen so a console cannot render "unfrozen" for a freeze that is still
+ *   on. That is SD-11's asymmetry, implemented, in the service that owns the decision surface.
+ *
+ * So the conclusion "either build it or record the scope decision" resolves to neither: nothing is
+ * owed and nothing is missing. What these two files were guilty of is citing a rule without saying
+ * where it is honoured, which is how a correct comment turns into evidence of a gap.
+ *
+ * **AND IT MUST NOT COME HERE, WHICH IS THE PART WORTH KEEPING.** Not merely "not through this
+ * table" — not through this SERVICE. A freeze has to be readable by whatever enforces it on the
+ * hot path, and that is policy's `POST /v1/decisions`, which wallet and custody already call on
+ * every movement. Rebuilding it behind this service's approval queue would put a second freeze
+ * mechanism in the estate, in the one service `ServerDeps` gives no wallet or custody client at
+ * all, and two disagreeing answers to "is this subject frozen" is worse than either answer alone.
+ * Rule 1 says the same thing from the other direction: policy owns those tables.
+ *
+ * MEASURED ON MAINNET, 2026-08-10: `freezes` and `freeze_clearances` in the estate's `policy`
+ * database hold 0 rows each. The mechanism has never been exercised — consistent with an estate
+ * that has no real users yet, and the reason nobody has noticed it from this side. Untested in
+ * production is a different problem from absent, and only one of them is admin-api's to solve.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
  *
  * ## Broadcasts
  *

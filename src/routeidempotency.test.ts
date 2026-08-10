@@ -183,9 +183,20 @@ test('every action names a subject kind, and none of them is a user costume', ()
       assert.ok(spec.requiredParams.length > 0, `${name} requires no parameters, which is unlikely to be right`)
     }
   }
-  // The one action whose subject IS a user is the blocked one, and it is a SUBJECT — the thing
-  // acted upon — never an identity the operator borrows.
-  assert.equal(ACTIONS['identity.role.grant']!.subjectKind, 'user')
+  // The actions whose subject IS a user, as a CLOSED set. This comment used to say "the one
+  // action whose subject IS a user is the blocked one" and was wrong twice over by the time
+  // micro-org#317 read it — the grant stopped being blocked when identity built the route, and it
+  // is no longer alone. Pinned as a set rather than as one equality because `subject_kind = 'user'`
+  // is now load-bearing: `approvals_decider_is_not_the_subject` and `principalForSubject` are both
+  // scoped to it, so an action that started naming a person without appearing here would be an
+  // action outside the beneficiary check with nothing to say so.
+  const userSubjects = Object.entries(ACTIONS)
+    .filter(([, spec]) => spec.subjectKind === 'user')
+    .map(([name]) => name)
+    .sort()
+  assert.deepEqual(userSubjects, ['identity.role.grant', 'identity.role.revoke'])
+  // And in every case it is a SUBJECT — the thing acted upon — never an identity the operator
+  // borrows. `server.test.ts` asserts no route reads a user id from the request at all.
 })
 
 test('the engagement catalogue is exactly 21 §6, with the schema behind each promise', () => {

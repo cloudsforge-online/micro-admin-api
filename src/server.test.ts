@@ -425,6 +425,141 @@ test('a self-approval attempt is counted, so it can be alerted on', { skip }, as
   assert.match(h().metrics.render(), /admin_self_approvals_refused_total \d+/)
 })
 
+test('THE BENEFICIARY REFUSAL over HTTP: 403, with a code of its own', { skip }, async () => {
+  // micro-org#317. ALICE raises a promotion for BOB; BOB approves it. Four eyes are satisfied —
+  // two distinct operators, `approvals_no_self_approval` untouched — and BOB has granted himself
+  // `admin`. This is the case that passed every layer before the fix.
+  const raised = await h().request('POST', '/v1/approvals', {
+    token: ONE,
+    headers: { 'idempotency-key': freshKey() },
+    body: {
+      action: 'identity.role.grant',
+      subjectId: BOB,
+      params: { role: 'admin' },
+      reasonCode: 'security_response',
+      reason: 'promoting the second operator',
+    },
+  })
+  assert.equal(raised.status, 201)
+  const id = raised.body.approval.id
+
+  const self = await answer(TWO, id)
+  assert.equal(self.status, 403, JSON.stringify(self.body))
+  // NOT `self_approval_refused`. An operator told they cannot approve their own request, having
+  // just approved somebody else's, concludes the service is broken and looks for another route.
+  assert.equal(self.body.error.code, 'subject_approval_refused')
+  // Nothing executed and nothing was decided: identity must not have been called at all.
+  assert.equal(h().identity.grants.length, 0)
+
+  // ── The other direction, and it is the whole point: a THIRD operator can sign it, so the rule
+  //    narrows who may decide rather than making the promotion impossible.
+  const other = await answer(THREE, id)
+  assert.equal(other.status, 201, JSON.stringify(other.body))
+  assert.equal(other.body.approval.state, 'approved')
+  assert.equal(h().identity.grants.length, 1)
+  assert.equal(h().identity.grants[0]?.userId, BOB)
+})
+
+test('a beneficiary refusal is counted separately from a self-approval', { skip }, async () => {
+  // Two counters, because the two say different things about who tried: a self-approval is nearly
+  // always a console offering a button it should not have, while a decision on a request naming
+  // the decider is somebody who read the queue and chose that row.
+  const raised = await h().request('POST', '/v1/approvals', {
+    token: ONE,
+    headers: { 'idempotency-key': freshKey() },
+    body: {
+      action: 'identity.role.grant',
+      subjectId: BOB,
+      params: { role: 'admin' },
+      reasonCode: 'security_response',
+      reason: 'promoting the second operator',
+    },
+  })
+  await answer(TWO, raised.body.approval.id)
+  assert.match(h().metrics.render(), /admin_subject_approvals_refused_total \d+/)
+})
+
+/* ---------------------------------------------------- the de-escalation path, micro-org#317 */
+
+test('A ROLE REVOKE COSTS TWO OPERATORS AND REACHES IDENTITY WITH THE APPROVAL ID', { skip }, async () => {
+  // Before #317 there was no way to take a role back through this service at all, so the only
+  // route was a hand-run UPDATE against identity's database — which writes no grant row, emits no
+  // event and appears in no audit chain. An escalation path with dual control and a de-escalation
+  // path without one is the wrong way round, and this is the assertion that it is no longer so.
+  const raised = await h().request('POST', '/v1/approvals', {
+    token: ONE,
+    headers: { 'idempotency-key': freshKey() },
+    body: {
+      action: 'identity.role.revoke',
+      subjectId: CAROL,
+      params: { role: 'admin' },
+      reasonCode: 'security_response',
+      reason: 'the operator has left; removing their platform role',
+    },
+  })
+  assert.equal(raised.status, 201)
+  // PENDING. Removing an administrator is not an emergency freeze and does not get SD-11's
+  // one-operator asymmetry — see the ACTIONS entry for why a single-operator revoke is a
+  // single-operator way to clear the room.
+  assert.equal(raised.body.approval.state, 'pending')
+
+  const granted = await answer(TWO, raised.body.approval.id)
+  assert.equal(granted.status, 201, JSON.stringify(granted.body))
+  assert.equal(granted.body.approval.executionOutcome, 'succeeded')
+
+  assert.equal(h().identity.grants.length, 1)
+  const sent = h().identity.grants[0]!
+  assert.equal(sent.userId, CAROL)
+  // The BASE role alone. Identity's write replaces the set, so this is "revoke admin" and "reduce
+  // to the base role" at once — correct only while `admin` is the sole other role, which is what
+  // `REVOCABLE_ROLES` closes over.
+  assert.deepEqual([...sent.roles], ['player'])
+  assert.equal(sent.approvalId, raised.body.approval.id)
+  assert.equal(sent.actor, OPERATOR_TWO, 'the APPROVER is the recorded actor')
+})
+
+test('a revoke may not be turned into a set-replacement by naming another role', { skip }, async () => {
+  // `role: 'player'` would send `roles: ['player']` and read as a successful revoke while removing
+  // nothing — and any role identity adds later would be silently stripped by an executor that
+  // cannot read what the user holds. Refused at REQUEST time, before two operators spend their
+  // signatures on an approval that could only ever fail: the same shape as the engagement cap
+  // pre-check, and for the same reason.
+  const raised = await h().request('POST', '/v1/approvals', {
+    token: ONE,
+    headers: { 'idempotency-key': freshKey() },
+    body: {
+      action: 'identity.role.revoke',
+      subjectId: CAROL,
+      params: { role: 'player' },
+      reasonCode: 'data_correction',
+      reason: 'attempting to revoke the base role',
+    },
+  })
+  assert.equal(raised.status, 400, JSON.stringify(raised.body))
+  assert.match(raised.body.error.message, /params\.role must be one of admin/)
+  assert.equal((await sql!`select id from approvals`).length, 0, 'nothing may have been queued')
+})
+
+test('a revoke naming the deciding operator is refused like a grant naming them', { skip }, async () => {
+  // The beneficiary rule is about the SUBJECT, not about the direction of the change. A revoke is
+  // where this matters most in practice: an operator who could decide a revoke naming themselves
+  // could not escalate, but they could veto their own removal, which is the same control failing.
+  const raised = await h().request('POST', '/v1/approvals', {
+    token: ONE,
+    headers: { 'idempotency-key': freshKey() },
+    body: {
+      action: 'identity.role.revoke',
+      subjectId: BOB,
+      params: { role: 'admin' },
+      reasonCode: 'security_response',
+      reason: 'removing the second operator',
+    },
+  })
+  const self = await answer(TWO, raised.body.approval.id)
+  assert.equal(self.status, 403)
+  assert.equal(self.body.error.code, 'subject_approval_refused')
+})
+
 test('a granted approval EXECUTES against the upstream, with the operator recorded', { skip }, async () => {
   const approval = (await raise(ONE)).body.approval
   const granted = await answer(TWO, approval.id)
@@ -1362,9 +1497,11 @@ test('ERASURE: an approval about the user is anonymised, and four eyes survive',
     token: ONE,
     headers: { 'idempotency-key': freshKey() },
     body: {
-      // The only action in the registry whose subject IS a user (`actions.ts`); every other
-      // one names a ledger entry, a moderation case or an entitlement. `subject_kind` comes from
-      // the action rather than from the body, which is what makes that true rather than hoped.
+      // One of the two actions in the registry whose subject IS a user (`actions.ts` — the grant
+      // and, since micro-org#317, the revoke); every other one names a ledger entry, a moderation
+      // case, an entitlement, an engagement account or a backup run. `subject_kind` comes from the
+      // action rather than from the body, which is what makes that true rather than hoped, and
+      // `routeidempotency.test.ts` pins the pair as a closed set.
       action: 'identity.role.grant',
       subjectId: ERASED_USER,
       params: { role: 'admin' },

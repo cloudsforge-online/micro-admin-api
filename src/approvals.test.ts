@@ -24,7 +24,9 @@ import {
   ApprovalStateError,
   REASON_CODES,
   SelfApprovalError,
+  SubjectApprovalError,
   decide,
+  principalForSubject,
   expirePending,
   findApproval,
   listApprovals,
@@ -35,6 +37,7 @@ import {
 } from './approvals.ts'
 import { verifyChain } from './audit.ts'
 import {
+  BOB,
   OPERATOR_ONE,
   OPERATOR_TWO,
   CAROL,
@@ -205,6 +208,129 @@ test('a self-approval attempt writes no audit row', { skip }, async () => {
   const before = (await sql!`select seq from audit_events`).length
   await assert.rejects(async () => answer(approval.id, OPERATOR_ONE), SelfApprovalError)
   assert.equal((await sql!`select seq from audit_events`).length, before)
+})
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+   THE BENEFICIARY — micro-org#317.
+
+   The same three layers, asking the other half of the question. Every case below PASSES the four
+   eyes rules above — a different operator raised it every time — which is the whole point: the
+   control this repairs was invisible precisely because everything else about the row looked right.
+   ══════════════════════════════════════════════════════════════════════════════════════════════ */
+
+/** A grant naming BOB as its subject, raised by ALICE. Four eyes are satisfied by construction. */
+function grantFor(subject: string): Partial<RequestInput> {
+  return {
+    action: 'identity.role.grant',
+    subjectKind: 'user',
+    // The bare uuid, which is what identity's route takes — NOT the `user:` principal. The
+    // mismatch between the two vocabularies is the thing `principalForSubject` exists to bridge,
+    // and writing the subject the way the catalogue really writes it is what makes this a test of
+    // the bridge rather than of a string comparison somebody set up to succeed.
+    subjectId: subject,
+    params: { role: 'admin' },
+    requestedBy: OPERATOR_ONE,
+  }
+}
+
+test('BENEFICIARY 1/3: decide() refuses the subject, and admits a third operator', { skip }, async () => {
+  const approval = await raise(grantFor(BOB))
+
+  // BOB did not raise it — `approvals_no_self_approval` and every four-eyes layer above is happy.
+  // He is the person who would end up with `admin`.
+  await assert.rejects(async () => answer(approval.id, OPERATOR_TWO), SubjectApprovalError)
+  assert.equal((await findApproval(sql!, approval.id))?.state, 'pending')
+
+  // ── The other direction, twice over. A rule that refused everybody would pass the half above.
+  const granted = await answer(approval.id, OPERATOR_THREE)
+  assert.equal(granted.state, 'approved')
+  assert.equal(granted.decidedBy, OPERATOR_THREE)
+})
+
+test('BENEFICIARY: a rejection by the subject is refused too', { skip }, async () => {
+  // Rejecting your own promotion is harmless in outcome and still wrong in record, for the same
+  // reason a self-rejection is: the queue would show two operators having weighed a request when
+  // one of them was its subject.
+  const approval = await raise(grantFor(BOB))
+  await assert.rejects(async () => answer(approval.id, OPERATOR_TWO, false), SubjectApprovalError)
+})
+
+test('BENEFICIARY: a refused decision writes no audit row', { skip }, async () => {
+  const approval = await raise(grantFor(BOB))
+  const before = (await sql!`select seq from audit_events`).length
+  await assert.rejects(async () => answer(approval.id, OPERATOR_TWO), SubjectApprovalError)
+  assert.equal((await sql!`select seq from audit_events`).length, before)
+})
+
+test('BENEFICIARY 2/3: the UPDATE refuses it with the pre-check bypassed', { skip }, async () => {
+  const approval = await raise(grantFor(BOB))
+  // The exact predicate `decide()` carries, run directly. If the WHERE clause lost its subject
+  // term this would claim a row.
+  const claimed = await sql!`
+    update approvals
+       set state = 'approved', decided_by = ${OPERATOR_TWO}, decided_at = now()
+     where id = ${approval.id} and state = 'pending'
+       and (subject_kind <> 'user' or 'user:' || subject_id <> ${OPERATOR_TWO})
+    returning id
+  `
+  assert.equal(claimed.length, 0)
+  assert.equal((await findApproval(sql!, approval.id))?.state, 'pending')
+
+  const other = await sql!`
+    update approvals
+       set state = 'approved', decided_by = ${OPERATOR_THREE}, decided_at = now()
+     where id = ${approval.id} and state = 'pending'
+       and (subject_kind <> 'user' or 'user:' || subject_id <> ${OPERATOR_THREE})
+    returning id
+  `
+  assert.equal(other.length, 1)
+})
+
+test('BENEFICIARY 3/3: the CHECK refuses it with the whole module bypassed', { skip }, async () => {
+  const approval = await raise(grantFor(BOB))
+  await assert.rejects(
+    async () =>
+      sql!`update approvals set state = 'approved', decided_by = ${OPERATOR_TWO}, decided_at = now()
+            where id = ${approval.id}`,
+    (err: { code?: string; constraint_name?: string }) => {
+      assert.equal(err.code, '23514', 'expected a check violation')
+      assert.equal(err.constraint_name, 'approvals_decider_is_not_the_subject')
+      return true
+    },
+  )
+  const ok = await sql!`update approvals set state = 'approved', decided_by = ${OPERATOR_THREE},
+                                             decided_at = now()
+                         where id = ${approval.id} returning id`
+  assert.equal(ok.length, 1)
+})
+
+test('BENEFICIARY: a subject that is not a person is not compared at all', { skip }, async () => {
+  // The check is scoped to `subject_kind = 'user'` on purpose. A ledger entry id is not in the
+  // principal vocabulary and a rule that tried to compare them would either never fire or fire on
+  // a coincidence. Every one of the six non-user actions must stay decidable by anybody.
+  const approval = await raise({ subjectKind: 'ledger_entry', subjectId: BOB })
+  const granted = await answer(approval.id, OPERATOR_TWO)
+  assert.equal(granted.state, 'approved')
+})
+
+test('BENEFICIARY: raising a request that names yourself is still allowed', { skip }, async () => {
+  // Asking is not authority — see the header of approvals.ts. BOB may ask for `admin`; what he may
+  // not do is sign for it. Pinned because the opposite is the intuitive reading and would make the
+  // audit row LESS true by pushing operators to have a colleague type the request for them.
+  const approval = await raise({ ...grantFor(BOB), requestedBy: OPERATOR_TWO })
+  assert.equal(approval.state, 'pending')
+  // And the person who is both requester and subject is refused for the first reason encountered.
+  await assert.rejects(async () => answer(approval.id, OPERATOR_TWO), SelfApprovalError)
+  assert.equal((await answer(approval.id, OPERATOR_THREE)).state, 'approved')
+})
+
+test('principalForSubject converts only the kind that names a person', { skip: false }, () => {
+  // A unit, because the whole control rests on this conversion and a version of it that returned
+  // the bare uuid would compare a uuid to `user:<uuid>`, never match, and leave three layers of
+  // security check silently enforcing nothing.
+  assert.equal(principalForSubject('user', BOB), OPERATOR_TWO)
+  assert.equal(principalForSubject('ledger_entry', BOB), null)
+  assert.equal(principalForSubject('backup_run', BOB), null)
 })
 
 /* ------------------------------------------------------------------ the state machine */
