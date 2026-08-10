@@ -182,9 +182,10 @@ import {
   engagementSubjectOf,
   ENGAGEMENT_SERVICES,
   ENGAGEMENT_TREASURY_SUBJECT,
+  ENGAGEMENT_ASSET,
   markTransferPosted,
-  parseCapShards,
-  parseShards,
+  parseCapWei,
+  parseTransferWei,
   parseWei,
   setFeeRecycle,
   setPolicy,
@@ -313,7 +314,8 @@ export const ACTIONS: Readonly<Record<string, ActionSpec>> = Object.freeze({
   },
   // ── The engagement treasury, docs/ecosystem/21 §6. Three actions, one table there, one table
   //    row here. §8's build order is why these exist before any grant machinery does: nothing may
-  //    move a Shard before the caps exist, and the caps are migrations.ts version 8.
+  //    move anything before the caps exist, and the caps are migrations.ts version 8 (unit
+  //    corrected to EMBER wei by version 13, micro-org#226).
   'engagement.transfer': {
     subjectKind: 'engagement_account',
     upstream: 'ledger',
@@ -324,7 +326,7 @@ export const ACTIONS: Readonly<Record<string, ActionSpec>> = Object.freeze({
       'micro-ledger entry whose accounts are created idempotently on first use.',
     route: 'POST /entries — ledger/src/server.ts:346, scope ledger:post',
     blockedReason: null,
-    requiredParams: ['service', 'amountShards'],
+    requiredParams: ['service', 'amountWei'],
   },
   'engagement.policy.set': {
     subjectKind: 'engagement_policy',
@@ -568,23 +570,44 @@ export const EXECUTORS: Readonly<Record<string, Executor>> = Object.freeze({
    * Both accounts are `equity` under purpose `treasury`: the programme is the platform's own
    * money earmarked, not revenue and not a user liability, and an empty treasury refuses the
    * debit at the ledger's overdraft trigger rather than going negative — funding must have
-   * arrived through the front door (mined-EMBER conversions, 21 §3) first.
+   * arrived through the front door (mined EMBER, 21 §3) first.
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * **BOTH LEGS ARE EMBER, AND THEY WERE SHARD UNTIL 2026-08-10.** micro-org#226, migration 13.
+   *
+   * This is the posting the issue quotes. It would not have failed: `micro-ledger`'s retired-asset
+   * gate is scoped to `ACQUISITION_KINDS` — purchase, subscription_charge, deposit_credited — and
+   * leaves `transfer` legal on purpose, because a rule refusing those kinds would strand the 13
+   * live SHARD balances (13,000 Shards across 13 liability accounts, measured 2026-08-10). So it
+   * posted cleanly and moved a retired asset.
+   *
+   * What made it wrong rather than merely mislabelled is the OTHER end of the same account.
+   * `platform:engagement-treasury` is credited in EMBER by `feeRecyclePostings`
+   * (billing/src/ledger.ts, asset = billing's `settlementAsset: 'EMBER'`), and 21 §3 funds it with
+   * mined EMBER arriving as an ordinary deposit — the "→ conversion to Shards" step that bullet
+   * used to carry was deleted on 2026-08-07. Funding one asset and spending another is exactly
+   * what 21 §4's reconstruction promise cannot survive; the ledger's account key is
+   * `(subject, asset_code, purpose)`, so the two spellings were not one account disagreeing with
+   * itself, they were two accounts.
+   *
+   * `ENGAGEMENT_ASSET` is `IssuableAssetCode`, so the retired spelling cannot come back by edit.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
    */
   'engagement.transfer': async (ctx) => {
     const service = requireString(ctx.approval.params, 'service')
     if (!ENGAGEMENT_SERVICES.includes(service)) {
       throw new Error(`params.service must be one of ${ENGAGEMENT_SERVICES.join(', ')}`)
     }
-    const amount = parseShards(requireString(ctx.approval.params, 'amountShards'))
+    const amount = parseTransferWei(requireString(ctx.approval.params, 'amountWei'))
 
     const claimed = await ctx.sql.begin(async (tx) => ({
-      value: await claimTransfer(tx, { service, amountShards: amount, approvalId: ctx.approval.id }),
+      value: await claimTransfer(tx, { service, amountWei: amount, approvalId: ctx.approval.id }),
     }))
     if (claimed.value.state === 'posted') {
       return {
         transferId: claimed.value.id,
         service,
-        amountShards: claimed.value.amountShards,
+        amountWei: claimed.value.amountWei,
         ledgerEntryId: claimed.value.ledgerEntryId,
         replayed: true,
       }
@@ -601,11 +624,11 @@ export const EXECUTORS: Readonly<Record<string, Executor>> = Object.freeze({
         {
           direction: 'debit',
           amount: amount.toString(),
-          assetCode: 'SHARD',
+          assetCode: ENGAGEMENT_ASSET,
           sequence: 0,
           account: {
             subject: ENGAGEMENT_TREASURY_SUBJECT,
-            assetCode: 'SHARD',
+            assetCode: ENGAGEMENT_ASSET,
             purpose: 'treasury',
             type: 'equity',
           },
@@ -613,11 +636,11 @@ export const EXECUTORS: Readonly<Record<string, Executor>> = Object.freeze({
         {
           direction: 'credit',
           amount: amount.toString(),
-          assetCode: 'SHARD',
+          assetCode: ENGAGEMENT_ASSET,
           sequence: 1,
           account: {
             subject: engagementSubjectOf(service),
-            assetCode: 'SHARD',
+            assetCode: ENGAGEMENT_ASSET,
             purpose: 'treasury',
             type: 'equity',
           },
@@ -631,7 +654,7 @@ export const EXECUTORS: Readonly<Record<string, Executor>> = Object.freeze({
     return {
       transferId: posted.value?.id ?? claimed.value.id,
       service,
-      amountShards: amount.toString(),
+      amountWei: amount.toString(),
       ledgerEntryId: entry.id,
       replayed: entry.replayed,
     }
@@ -663,8 +686,8 @@ export const EXECUTORS: Readonly<Record<string, Executor>> = Object.freeze({
     }
 
     const change = {
-      ...(typeof params['transferCapShards'] === 'string'
-        ? { transferCapShards: parseCapShards(params['transferCapShards']) }
+      ...(typeof params['transferCapWei'] === 'string'
+        ? { transferCapWei: parseCapWei(params['transferCapWei']) }
         : {}),
       ...(typeof params['seedPerMarketWei'] === 'string'
         ? { seedPerMarketWei: parseWei(params['seedPerMarketWei']) }
@@ -675,7 +698,7 @@ export const EXECUTORS: Readonly<Record<string, Executor>> = Object.freeze({
     }
     if (Object.keys(change).length === 0) {
       throw new Error(
-        'engagement.policy.set needs at least one of transferCapShards, seedPerMarketWei+seedPerDayWei',
+        'engagement.policy.set needs at least one of transferCapWei, seedPerMarketWei+seedPerDayWei',
       )
     }
     const result = await ctx.sql.begin(async (tx) => ({

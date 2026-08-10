@@ -344,10 +344,10 @@ Also not built, deliberately:
 
 ---
 
-## 7. The engagement treasury: the caps, before a single Shard moves
+## 7. The engagement treasury: the caps, before a single unit moves
 
 `docs/ecosystem/21` decides the platform may fund empty rooms — bounded, disclosed, denominated in
-Shards — and its §8 build order is law: **nothing may move a Shard before the caps exist.** This
+**EMBER** — and its §8 build order is law: **nothing may move before the caps exist.** This
 service holds the caps because it already owns cross-service operator state (21 §4). The money it
 caps lives elsewhere, and that refusal is the design: `platform:engagement-treasury` and
 `engagement:<service>` are ordinary `micro-ledger` accounts (grammar:
@@ -355,17 +355,29 @@ caps lives elsewhere, and that refusal is the design: `platform:engagement-treas
 column is unconstrained text at `ledger/src/migrations.ts`), and an auditor reconstructs the
 whole programme from the ledger alone.
 
-What migration 8 (`src/migrations.ts`, version 8) makes unrepresentable rather than merely checked:
+The unit is EMBER wei, and it was Shards until 2026-08-10. 21 §2 said "denominated in Shards"
+until 2026-08-07; `SHARD` has been retired since 2026-08-04 (`RETIRED_ASSETS`,
+`contracts/packages/chain`), and the only code that funds `platform:engagement-treasury` —
+`micro-billing`'s `feeRecyclePostings` — has always credited it in `settlementAsset`, which is
+EMBER. Version 13 (`engagement-in-ember-wei`, micro-org#226) renamed `transfer_cap_shards` and
+`amount_shards` to `transfer_cap_wei` and `amount_wei`, converted both at the frozen rate
+1 Shard = 4e16 wei (1 Shard = 1 US cent; 1 EMBER = the administered 0.25 USD), and widened them to
+`numeric(78,0)` because the converted ceiling, 4e25, does not fit in a `bigint`. Both tables were
+empty on mainnet when it was written, which is what makes a rename legitimate; the conversion is
+replayed against a scratch schema in `src/engagement.test.ts` for every database that was not.
+
+What migration 8 (`src/migrations.ts`, version 8), as amended by version 13, makes unrepresentable
+rather than merely checked:
 
 | Claim (21 §7) | The line that enforces it |
 | --- | --- |
-| A transfer above the policy cap is refused **even for a caller holding a connection** | trigger `engagement_transfers_within_cap` — raises on `amount_shards > transfer_cap_shards`, and on a service with **no policy row at all** |
+| A transfer above the policy cap is refused **even for a caller holding a connection** | trigger `engagement_transfers_within_cap` — raises on `amount_wei > transfer_cap_wei`, and on a service with **no policy row at all** |
 | A transfer not backed by an approved `engagement.transfer` approval cannot be recorded | same trigger — the approval row must exist, be `approved`, and name that action |
 | Every transfer resolves to a ledger entry; a `posted` row with no entry cannot exist | CHECK `engagement_transfers_posted_names_entry` — `posted` ⇔ `ledger_entry_id` ⇔ `posted_at` |
 | One approval is one transfer, for ever | `engagement_transfers_one_per_approval` unique on `approval_id` — the same key the ledger idempotency key is derived from |
 | The fee-recycle percentage cannot exceed its ceiling | CHECK `engagement_fee_recycle_within_ceiling` (0–2500 bps) |
 | Raising any cap without an approval is refused; lowering succeeds | trigger `engagement_raise_needs_approval` — a raise must name a **fresh** approved `engagement.policy.set` approval; a lower needs nothing |
-| Every ceiling is finite | CHECKs `engagement_policies_cap_within_ceiling` (10⁹ Shards), `engagement_policies_seed_within_ceiling` (10²¹/10²² wei) — the same numbers `micro-foresight` pins in its own schema |
+| Every ceiling is finite | CHECKs `engagement_policies_cap_within_ceiling` (4·10²⁵ wei = 40M EMBER = the USD 10M per transfer the 10⁹ Shards it replaced meant), `engagement_policies_seed_within_ceiling` (10²¹/10²² wei) — the same numbers `micro-foresight` pins in its own schema |
 
 Every row of that table is fire-tested with raw SQL in `src/engagement.test.ts`, connection in
 hand, routes bypassed.

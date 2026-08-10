@@ -30,8 +30,17 @@
     "sources. On publish their publishConfig points at dist/, tsx moves to devDependencies, and the",
     "image runs 'node dist/index.js'."
   ],
+  "_contractsChain": [
+    "A DIRECT dependency, and the ONLY thing this service imports from it is a type. That is the",
+    "point: ENGAGEMENT_ASSET in src/engagement.ts is declared IssuableAssetCode —",
+    "Exclude<AssetCode, 'SHARD'> — so a build that tried to route the engagement treasury back",
+    "through a retired asset would not compile, which is a different thing from a comment asking",
+    "it not to. micro-billing types its settlementAsset the same way for the same reason",
+    "(micro-org#226)."
+  ],
   "dependencies": {
     "@cloudsforge/auth": "link:../runtime/packages/auth",
+    "@cloudsforge/contracts-chain": "link:../contracts/packages/chain",
     "@cloudsforge/contracts-events": "link:../contracts/packages/events",
     "@cloudsforge/db": "link:../runtime/packages/db",
     "@cloudsforge/http": "link:../runtime/packages/http",
