@@ -11,14 +11,23 @@
 
 import { test, before, beforeEach, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { DELIVERY_TOLERANCE_MS, EVENT_ID_HEADER, signDelivery, verifyDelivery } from '@cloudsforge/contracts-events'
+import {
+  DELIVERY_TOLERANCE_MS,
+  EVENT_ID_HEADER,
+  classifyEnvelope,
+  signDelivery,
+  verifyDelivery,
+  type EventVersion,
+} from '@cloudsforge/contracts-events'
 import {
   EVENT_ID_HEADER as EXPORTED_EVENT_ID_HEADER,
   SIGNATURE_HEADER as EXPORTED_SIGNATURE_HEADER,
+  buildEnvelope,
   createRelay,
   emitOn,
   withInbox,
   type Db,
+  type OutboxRow,
 } from './outbox.ts'
 import {
   IdempotencyInFlightError,
@@ -200,6 +209,18 @@ test('the relay delivers to every active subscription and signs the body', { ski
   // in `outbox.ts`: if `HttpClient` ever stringifies differently from the relay, this goes red.
   assert.match(signature, /^t=\d+,v1=[0-9a-f]+$/, 'the estate scheme, not a local one')
   assert.equal(verifyDelivery(JSON.stringify(seen[0]!.body), signature, SECRET).ok, true)
+
+  // ── AND WHAT IS INSIDE THOSE BYTES. The signature above was right for months while the envelope
+  // was not, so verifying the delivery proves only that the wrapper is intact.
+  //
+  // MUTATION THIS KILLS, confirmed red: `createRelay` assembling an envelope literal of its own
+  // again instead of calling `buildEnvelope`. The unit tests at the foot of this file cannot see
+  // that one — they call `buildEnvelope` directly — so it is asserted here, on the body the fake
+  // client actually received, which is the only statement about what a subscriber gets.
+  const body = seen[0]!.body as Record<string, unknown>
+  assert.equal(body['version'], '1.0', 'the contract"s "major.minor", never the stored integer')
+  assert.equal(classifyEnvelope(body).defects.length, 0, `${JSON.stringify(classifyEnvelope(body))}`)
+
   assert.equal((await sql!`select id from outbox where published_at is not null`).length, 1)
 })
 
@@ -493,4 +514,91 @@ test('the reaper keeps everything inside the TTL', { skip }, async () => {
   // Expiring a key EARLY means the next replay of it raises a second approval request.
   await sql!`insert into idempotency_keys (key, route, request_hash) values ('fresh', '/v1/approvals', 'h')`
   assert.equal(await reapIdempotencyKeys(db(sql!), 14), 0)
+})
+
+/* ------------------------------------------------------------------ what goes on the wire */
+
+/**
+ * An INVENTED row, and it says so — micro-org#366.
+ *
+ * Measured on the mainnet estate on 2026-08-11: this service's outbox is empty, so there is no
+ * real row to read. `admin.flag.changed` is a real emit site (`flags.ts`) and its shape is the
+ * shape a flag change will have; none of this service's three topics is registered yet, so this
+ * is the latent half of the defect — it typechecks, it is green, and it surfaces on the day the
+ * topics are registered, which is the day nobody is looking for it.
+ */
+const STORED_ROW: OutboxRow = {
+  id: '4c1a9f7e-5d38-4b21-8e0c-7a2f9d6b3c15',
+  topic: 'admin.flag.changed',
+  key: 'faucet-enabled',
+  occurred_at: new Date('2026-08-11T00:00:00.000Z'),
+  producer: 'admin-api',
+  version: 1,
+  actor: null,
+  correlation_id: null,
+  payload: { flag: 'faucet-enabled', value: true },
+}
+
+/**
+ * **THE SIGNATURE WAS RIGHT AND THE ENVELOPE WAS NOT.**
+ *
+ * `@cloudsforge/contracts-events` types the wire version as "major.minor" — a STRING — and this
+ * relay stamped the stored INTEGER. A delivery that verified was still discarded at the envelope
+ * before any consumer read a payload. Eight relays did this at once and every suite in the estate
+ * stayed green, because each one declared its OWN `EventEnvelope` and no compiler ever compared
+ * the two.
+ *
+ * Measured with the contract's own `classifyEnvelope` against `STORED_ROW` on 2026-08-11:
+ *
+ *      as shipped -> malformed: version: missing, actor: missing, correlationId: missing
+ *     fixed      -> well-formed; only the registration is outstanding
+ *
+ * The verdict is taken from the CONTRACT'S OWN classifier, never from a shape restated here. A
+ * local copy of the rule agrees with a wrong implementation instead of catching it, which is the
+ * mistake that produced the defect in the first place.
+ *
+ * MUTATIONS THIS KILLS — each one applied to `buildEnvelope` and each one confirmed red:
+ *   - `version: row.version`, the stored integer, which is what shipped: `classifyEnvelope`
+ *     answers `version: missing` and the defect assertion fails.
+ *   - `version: String(row.version)` — a string, but "1" rather than "1.0": the shape assertion
+ *     fails, so widening the fix to "any string" does not survive either.
+ *   - `actor: row.actor` / `correlationId: row.correlation_id`, the nullable columns passed
+ *     straight through, which is the other half of what the estate measured above.
+ */
+test('the envelope this relay puts on the wire is one the contract accepts', () => {
+  const envelope = buildEnvelope(STORED_ROW)
+
+  assert.equal(typeof envelope.version, 'string', 'an integer version is refused as "version: missing"')
+  assert.match(envelope.version, /^\d+\.\d+$/, 'the contract types the wire version as "major.minor"')
+  assert.equal(envelope.version, '1.0', 'major 1 as stored, minor 0 — storage records the major')
+  // The nullable columns never reach the wire. `system` is the contract's own value for "no
+  // principal did this"; the correlation id falls back to the event id so it is never absent.
+  // This row has actor and correlationId null in storage, which is two of the defects measured above.
+  assert.equal(envelope.actor, 'system')
+  assert.equal(envelope.correlationId, STORED_ROW.id)
+
+  // The topic is not in the contract's registry yet, so the honest verdict is `unregistered_topic`
+  // and NOT `valid` — a different fact with a different remedy. What matters here is `defects`:
+  // once the registration lands, an EMPTY defect list is the difference between this event being
+  // read and being discarded, and `version: missing` is what used to be in it.
+  const verdict = classifyEnvelope(envelope)
+  assert.equal(verdict.reason, 'unregistered_topic', `got: ${JSON.stringify(verdict)}`)
+  assert.deepEqual(verdict.defects, [], 'well-formed: the ONLY thing outstanding is the registration')
+})
+
+/**
+ * The teeth of the test above. Without this, every assertion there would still pass against a
+ * classifier that accepted anything at all, and "the contract accepts it" would be a claim about
+ * this file rather than about the estate.
+ */
+test('the shape this relay used to send is REFUSED by the same classifier', () => {
+  const asShipped = { ...buildEnvelope(STORED_ROW), version: STORED_ROW.version as unknown as EventVersion }
+
+  const verdict = classifyEnvelope(asShipped)
+  assert.equal(verdict.ok, false, 'an integer version must be refused at the envelope')
+  assert.equal(verdict.reason, 'malformed', 'refused as malformed, not merely shelved as unregistered')
+  assert.ok(
+    verdict.defects.some((d) => d.startsWith('version')),
+    `refused FOR THE VERSION, not incidentally: ${JSON.stringify(verdict)}`,
+  )
 })
