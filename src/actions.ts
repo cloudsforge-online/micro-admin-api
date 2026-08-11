@@ -183,6 +183,7 @@ import {
   ENGAGEMENT_SERVICES,
   ENGAGEMENT_TREASURY_SUBJECT,
   ENGAGEMENT_ASSET,
+  ENGAGEMENT_TRANSFER_KIND,
   markTransferPosted,
   parseCapWei,
   parseTransferWei,
@@ -614,7 +615,7 @@ export const EXECUTORS: Readonly<Record<string, Executor>> = Object.freeze({
     }
 
     const entry = await ctx.ledger.postEntry({
-      kind: 'transfer',
+      kind: ENGAGEMENT_TRANSFER_KIND,
       idempotencyKey: `admin-api:approval:${ctx.approval.id}`,
       description: `engagement transfer: treasury → engagement:${service} (${ctx.approval.reasonCode})`,
       correlationId: ctx.correlationId,
