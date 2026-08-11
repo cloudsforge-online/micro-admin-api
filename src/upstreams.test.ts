@@ -35,6 +35,8 @@ import {
   probeReadiness,
   type ClientConfig,
 } from './upstreams.ts'
+import { ENTRY_KINDS, isEntryKind } from '@cloudsforge/contracts-money'
+import { ENGAGEMENT_TRANSFER_KIND } from './engagement.ts'
 import { fakeTarget, type FakeTarget } from './testsupport.ts'
 
 let target: FakeTarget
@@ -210,6 +212,28 @@ test('the trial balance reads the cited route with the read credential', async (
   assert.equal(result.balanced, true)
   assert.equal(target.hits[0]?.path, '/trial-balance')
   assert.equal(target.hits[0]?.headers['authorization'], `Bearer ${SERVICE_TOKEN}`)
+})
+
+test('every kind this service posts is one the LEDGER will actually accept', () => {
+  // ═══════════════════════════════════════════════════════════════════════════════════════════
+  // micro-org#424. The ledger's kind vocabulary is closed, and a kind outside it is not recorded
+  // and then flagged — `validateEntryRequest` answers `400 invalid_entry` before it opens a
+  // transaction, so the entry simply never exists. That is why the two services this has already
+  // happened to noticed nothing: `micro-foresight` posted `foresight.settlement_fee` for months
+  // and no settlement fee was ever booked, and `micro-tessera` posted `item_issue` while the set
+  // did not yet contain it, so no object ever entered the ledger (micro-org#407 §3).
+  //
+  // MEMBERSHIP is the assertion, not spelling, and the value under test is the one the executor
+  // actually sends — `ENGAGEMENT_TRANSFER_KIND` is imported here and imported by `actions.ts`.
+  // A test that re-spelled the literal would agree with itself and prove nothing about the entry.
+  // `PostEntryRequest.kind` is `EntryKind`, so a new call site inventing one is now a compile
+  // error; this is the belt to that brace, and the thing that keeps working if the type is ever
+  // widened back.
+  // ═══════════════════════════════════════════════════════════════════════════════════════════
+  for (const kind of [ENGAGEMENT_TRANSFER_KIND]) {
+    assert.ok(isEntryKind(kind), `${kind} is not in the ledger's closed set`)
+    assert.ok(ENTRY_KINDS.includes(kind), `${kind} is not in ENTRY_KINDS`)
+  }
 })
 
 /* ------------------------------------------------------------------ market */

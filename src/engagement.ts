@@ -36,6 +36,7 @@
 
 import type { Sql, TransactionSql } from 'postgres'
 import type { IssuableAssetCode } from '@cloudsforge/contracts-chain'
+import type { EntryKind } from '@cloudsforge/contracts-money'
 import { appendAudit } from './audit.ts'
 
 export type Db = Sql
@@ -53,6 +54,22 @@ export type Tx = TransactionSql
  * would not compile.
  */
 export const ENGAGEMENT_ASSET: IssuableAssetCode = 'EMBER'
+
+/**
+ * The ledger kind every engagement transfer is posted under, spelled once — micro-org#424.
+ *
+ * `transfer` because that is what the movement is: value going from one treasury account to
+ * another, both `equity` under purpose `treasury`, neither of them a spend of the programme's
+ * money on anything yet. `treasury_spend` is what a service posts when it later pays a grant OUT
+ * of the account this funds (`ENGAGEMENT_GRANT_KIND` in contracts-money), and using it here would
+ * count the same EMBER as spent twice.
+ *
+ * `EntryKind` and not a string, for the same reason `ENGAGEMENT_ASSET` is `IssuableAssetCode`: the
+ * ledger's vocabulary is closed and refuses an unknown kind before it opens a transaction, so a
+ * kind invented at this call site would move nothing and say nothing. Named here rather than
+ * written at the call site so that the executor and the test that checks it are the same value.
+ */
+export const ENGAGEMENT_TRANSFER_KIND: EntryKind = 'transfer'
 
 /** The services 21 §1 names. The schema pins the same list; this is the route's copy. */
 export const ENGAGEMENT_SERVICES: readonly string[] = Object.freeze([

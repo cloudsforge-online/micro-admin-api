@@ -27,6 +27,7 @@ import { migrate, type Sql as DbSql } from '@cloudsforge/db'
 import { Logger, Metrics } from '@cloudsforge/telemetry'
 import { Lifecycle } from '@cloudsforge/lifecycle'
 import type { Principal } from '@cloudsforge/auth'
+import type { EntryKind } from '@cloudsforge/contracts-money'
 import { MIGRATIONS, SEQUENCES, TABLES } from './migrations.ts'
 import { registerServiceMetrics } from './server.ts'
 import type { Db } from './outbox.ts'
@@ -171,8 +172,14 @@ export function fakeVerifier(entries: Record<string, Principal> = {}): FakeVerif
 
 export interface FakeLedger extends LedgerClient {
   readonly reversals: Array<{ entryId: string; idempotencyKey: string; operator: string; approvalId: string }>
-  /** Entries posted through `postEntry`, in order, with the postings the caller built. */
-  readonly entries: Array<{ kind: string; idempotencyKey: string; approvalId: string; postings: readonly EntryPosting[] }>
+  /**
+   * Entries posted through `postEntry`, in order, with the postings the caller built.
+   *
+   * `kind` is `EntryKind` rather than `string` for the reason `PostEntryRequest.kind` is: a fake
+   * that could record a kind the real ledger would refuse is a fake that reports success for a
+   * posting which, against the ledger, never happens at all.
+   */
+  readonly entries: Array<{ kind: EntryKind; idempotencyKey: string; approvalId: string; postings: readonly EntryPosting[] }>
   /** Replays on a repeated key, exactly as the real ledger does. */
   readonly postedCount: number
   failWith(err: Error | null): void

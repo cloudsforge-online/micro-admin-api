@@ -83,6 +83,7 @@ import {
   ServiceTokenUnavailableError,
   type ProviderEvent,
 } from '@cloudsforge/auth'
+import type { EntryKind } from '@cloudsforge/contracts-money'
 // TYPE-ONLY, and that matters. `./env.ts` validates the process environment at import and calls
 // `process.exit(1)` when it is incomplete, so a value import here would make this module — and
 // therefore every test of the wiring in it — impossible to load without a full environment. That
@@ -316,8 +317,18 @@ export interface EntryPosting {
 }
 
 export interface PostEntryRequest {
-  /** One of the ledger's closed `journal_entries_kind_chk` list — ledger/src/migrations.ts. */
-  readonly kind: string
+  /**
+   * `EntryKind` — `ENTRY_KINDS` in `@cloudsforge/contracts-money` — and not `string`, because the
+   * ledger's vocabulary is closed and a kind outside it is refused rather than recorded:
+   * `validateEntryRequest` answers `400 invalid_entry` before it opens a transaction, and
+   * `journal_entries_kind_chk` refuses it again behind that. Two services shipped an invented kind
+   * and the symptom each time was nothing happening — `micro-foresight` posted
+   * `foresight.settlement_fee` for months and no settlement fee was ever booked, and
+   * `micro-tessera` posted `item_issue` while the set did not yet contain it, so no object ever
+   * entered the ledger (micro-org#407 §3). Neither is a mistake a `string` here can catch, and an
+   * absence is the one failure nobody goes looking for; typed, an invented kind does not compile.
+   */
+  readonly kind: EntryKind
   readonly idempotencyKey: string
   readonly description: string
   readonly correlationId: string
