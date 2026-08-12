@@ -631,6 +631,93 @@ export function httpIdentityClient(config: ClientConfig): IdentityClient {
   }
 }
 
+/* ------------------------------------------------------------------------ notify */
+
+export interface MailDelivery {
+  readonly id: string
+  readonly userId: string
+  readonly channel: string
+  readonly state: string
+  readonly outcome: string
+  readonly reason: string | null
+  readonly attempts: number
+  readonly maxAttempts: number
+  readonly lastError: string | null
+  readonly category: string
+  readonly templateId: string
+  readonly createdAt: string
+  readonly sentAt: string | null
+}
+
+export interface NotifyClient {
+  /** `GET /admin/deliveries` — notify/src/server.ts. Admin principal, not a service one. */
+  mailFor(request: {
+    readonly userId?: string
+    readonly address?: string
+    readonly limit?: number
+    readonly bearer: string
+    readonly correlationId?: string
+  }): Promise<{ deliveries: readonly MailDelivery[]; nextCursor: string | null }>
+  /** `POST /admin/deliveries/:id/resend`. 202 with the NEW delivery's id. */
+  resend(request: {
+    readonly deliveryId: string
+    readonly bearer: string
+    readonly correlationId?: string
+  }): Promise<{ deliveryId: string }>
+}
+
+/**
+ * Notify's operator surface.
+ *
+ * **The OPERATOR's bearer is forwarded, not a service token**, and that is the whole design
+ * decision here. Both routes are `requireAdmin` in notify — a service principal is refused
+ * outright — so a service token would not work without widening that gate. More importantly it
+ * should not: resending somebody's mail is an act by a named human, and forwarding the token they
+ * already presented keeps the authorisation decision in notify, against the real person, instead
+ * of turning every action into "admin-api did it".
+ *
+ * It also means no new credential to mint, store or rotate, which is the cheapest kind of secret
+ * to get right.
+ */
+export function httpNotifyClient(config: ClientConfig): NotifyClient {
+  const client = clientFor('notify', config)
+  return {
+    async mailFor(request) {
+      try {
+        const query = new URLSearchParams()
+        if (request.userId !== undefined) query.set('user', request.userId)
+        if (request.address !== undefined) query.set('address', request.address)
+        query.set('limit', String(request.limit ?? 50))
+        return await client.get<{ deliveries: readonly MailDelivery[]; nextCursor: string | null }>(
+          `/admin/deliveries?${query.toString()}`,
+          {
+            ...(request.correlationId ? { requestId: request.correlationId } : {}),
+            headers: await authHeader(config, { kind: 'operator', bearer: request.bearer }),
+          },
+        )
+      } catch (err) {
+        throw wrap('notify', err)
+      }
+    },
+    async resend(request) {
+      try {
+        // 202, and the body names the NEW delivery. Notify queues a second delivery beside the
+        // original rather than resetting it, so the failure being repeated stays readable.
+        return await client.post<{ deliveryId: string }>(
+          `/admin/deliveries/${encodeURIComponent(request.deliveryId)}/resend`,
+          {},
+          {
+            ...(request.correlationId ? { requestId: request.correlationId } : {}),
+            headers: await authHeader(config, { kind: 'operator', bearer: request.bearer }),
+          },
+        )
+      } catch (err) {
+        throw wrap('notify', err)
+      }
+    },
+  }
+}
+
 /* ------------------------------------------------------------------------ the wiring */
 
 /**
@@ -684,6 +771,7 @@ export interface Upstreams {
   readonly market: MarketClient
   readonly billing: BillingClient
   readonly identity: IdentityClient
+  readonly notify: NotifyClient
   /** The shared config, so `probeReadiness` can be called for a peer with the same transport. */
   readonly clientConfig: Omit<ClientConfig, 'baseUrl'>
 }
@@ -695,6 +783,7 @@ export type UpstreamEnv = Pick<
   | 'identityCredential'
   | 'serviceToken'
   | 'ledgerUrl'
+  | 'notifyUrl'
   | 'marketUrl'
   | 'billingUrl'
   | 'upstreamDeadlineMs'
@@ -766,6 +855,7 @@ export function buildUpstreams(env: UpstreamEnv, options: UpstreamOptions = {}):
     identityTokens,
     clientConfig,
     ledger: httpLedgerClient({ baseUrl: env.ledgerUrl, ...clientConfig }),
+    notify: httpNotifyClient({ baseUrl: env.notifyUrl, ...clientConfig }),
     market: httpMarketClient({ baseUrl: env.marketUrl, ...clientConfig }),
     billing: httpBillingClient({ baseUrl: env.billingUrl, ...clientConfig }),
     // The role-grant upstream. Presents this service's own bearer, never an operator's — identity's

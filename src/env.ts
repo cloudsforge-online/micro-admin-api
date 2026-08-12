@@ -247,6 +247,8 @@ export interface Env {
   readonly identityUrl: string
   /** Soft. Ledger reversals are an approval action; the trial-balance tile degrades without it. */
   readonly ledgerUrl: string
+  /** notify, for the operator mail view. Its admin routes take the OPERATOR's bearer. */
+  readonly notifyUrl: string
   /** Soft. Moderation resolution is an approval action; the open-cases tile degrades without it. */
   readonly marketUrl: string
   /** Soft. Entitlement revocation is an approval action. */
@@ -384,6 +386,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
 
     identityUrl: required(source, 'IDENTITY_URL'),
     ledgerUrl: required(source, 'LEDGER_URL'),
+    notifyUrl: required(source, 'NOTIFY_URL'),
     marketUrl: required(source, 'MARKET_URL'),
     billingUrl: required(source, 'BILLING_URL'),
     // The credential that is EXCHANGED, and the token that is not. Both face the same assertion,
