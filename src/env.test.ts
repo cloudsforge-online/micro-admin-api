@@ -43,6 +43,7 @@ const REQUIRED: Record<string, string> = {
   OUTBOX_SIGNING_SECRET: randomBytes(48).toString('base64'),
   IDENTITY_URL: 'http://127.0.0.1:4001',
   LEDGER_URL: 'http://127.0.0.1:4007',
+  NOTIFY_URL: 'http://127.0.0.1:4011',
   MARKET_URL: 'http://127.0.0.1:4013',
   BILLING_URL: 'http://127.0.0.1:4009',
   // Required with NO default, deliberately — a default answer to "which estate am I?" is how a

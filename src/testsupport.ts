@@ -37,7 +37,9 @@ import type {
   IdentityClient,
   EntryPosting,
   LedgerClient,
+  MailDelivery,
   MarketClient,
+  NotifyClient,
   ModerationCase,
   PostedEntry,
   ReversedEntry,
@@ -203,6 +205,47 @@ export interface FakeLedger extends LedgerClient {
  * approval id precisely so a retried execution cannot post a second reversal, and a fake that
  * posted twice would let that bug pass every test here and fail against the real thing.
  */
+export interface FakeNotify extends NotifyClient {
+  /** Every bearer the routes forwarded, so a test can prove it is the OPERATOR's and not a service token. */
+  readonly bearers: string[]
+  readonly resent: string[]
+  seed(deliveries: readonly MailDelivery[]): void
+}
+
+/**
+ * The fake notify.
+ *
+ * It records the **bearer** it was handed, which is the one thing about this seam worth asserting:
+ * these routes forward the operator's own token rather than minting a service one, because
+ * notify's admin routes refuse a service principal and because resending somebody's mail is an
+ * act by a named human. A fake that ignored the bearer would let a switch to a service token pass
+ * every test and then 403 against the real service.
+ */
+export function fakeNotify(): FakeNotify {
+  const bearers: string[] = []
+  const resent: string[] = []
+  let rows: readonly MailDelivery[] = []
+  return {
+    bearers,
+    resent,
+    seed(deliveries) {
+      rows = deliveries
+    },
+    async mailFor(request) {
+      bearers.push(request.bearer)
+      const matched = rows.filter(
+        (r) => request.userId === undefined || r.userId === request.userId,
+      )
+      return { deliveries: matched, nextCursor: null }
+    },
+    async resend(request) {
+      bearers.push(request.bearer)
+      resent.push(request.deliveryId)
+      return { deliveryId: `resent-${request.deliveryId}` }
+    },
+  }
+}
+
 export function fakeLedger(): FakeLedger {
   const reversals: FakeLedger['reversals'] = []
   const entries: FakeLedger['entries'] = []
@@ -524,6 +567,7 @@ export async function fakeTarget(): Promise<FakeTarget> {
 /* ------------------------------------------------------------------ a running server */
 
 export interface Harness {
+  readonly notify: FakeNotify
   readonly baseUrl: string
   readonly metrics: Metrics
   readonly ledger: FakeLedger
@@ -542,6 +586,7 @@ export interface Harness {
 }
 
 export interface HarnessOptions {
+  readonly notify?: FakeNotify
   /**
    * The secrets the inbound event route will ACCEPT, newest first — a list, not a value, so a test
    * can stage the overlap window a rolling rotation of `OUTBOX_SIGNING_SECRET` depends on.
@@ -563,6 +608,7 @@ export async function startHarness(
   const { registerHttpMetrics } = await import('@cloudsforge/telemetry')
   registerHttpMetrics(metrics)
   const ledger = fakeLedger()
+  const notify = options.notify ?? fakeNotify()
   const market = fakeMarket()
   const billing = fakeBilling()
   const identity = fakeIdentity()
@@ -580,6 +626,7 @@ export async function startHarness(
     market,
     billing,
     identity,
+    notify,
     readiness: options.readiness ?? fakeReadiness({ ledger: { ready: true, state: 'ready' } }),
     estateEnvironment: TEST_ENVIRONMENT,
     composeProject: 'cf-testnet',
@@ -596,6 +643,7 @@ export async function startHarness(
     baseUrl,
     metrics,
     ledger,
+    notify,
     market,
     billing,
     identity,

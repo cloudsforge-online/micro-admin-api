@@ -153,7 +153,7 @@ import { eraseSubject } from './erasure.ts'
 // The registry, and the one place that decides which topics the operator audit log carries.
 // Read rather than restated: a decision copied into a consumer is a decision that drifts.
 import { auditRowFor, isRegisteredTopic, validateEnvelope, verifyDelivery } from '@cloudsforge/contracts-events'
-import { UpstreamError, type BillingClient, type IdentityClient, type LedgerClient, type MarketClient } from './upstreams.ts'
+import { UpstreamError, type BillingClient, type IdentityClient, type LedgerClient, type MarketClient, type NotifyClient } from './upstreams.ts'
 
 /** The verifier as this file needs it. An interface, so a test does not need a JWKS. */
 export interface PrincipalVerifier {
@@ -197,6 +197,7 @@ export interface ServerDeps {
   /** Only `identity.role.grant` uses it, and it is the only call that presents the service token
    *  because identity's role gate refuses an operator bearer outright. See `upstreams.ts`. */
   readonly identity: IdentityClient
+  readonly notify: NotifyClient
   readonly readiness: EstateDeps['readiness']
   /**
    * The secrets `POST /v1/events` will accept, newest first — a list so that rotating the estate's
@@ -876,6 +877,88 @@ function buildRoutes(): Route[] {
     }),
 
     /* ---------------------------------------------------------------- audit reads */
+
+    /* ---------------------------------------------------------------- mail history */
+
+    /**
+     * What was sent to this person, and did it arrive.
+     *
+     * A read, so `requireReader` — support answering "I never got the email" should not need the
+     * same authority as reversing a ledger entry. Notify's own route is `requireAdmin` and refuses
+     * a service principal outright, which is why the OPERATOR's bearer is forwarded rather than
+     * this service's token: the authorisation decision stays with notify, against the real human.
+     *
+     * One of `user` or `address` is required. Unscoped, notify's route is the estate-wide
+     * dead-letter view and answers a different question; serving that here under a name promising
+     * one person's mail would be the sort of quiet mismatch an operator acts on without noticing.
+     */
+    define('GET', '/v1/mail', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      requireReader(principal)
+      const params = ctx.url.searchParams
+      const user = params.get('user')
+      const address = params.get('address')
+      if (!user && !address) {
+        throw new BadRequestError('one of user or address is required')
+      }
+      const limit = Number(params.get('limit') ?? '50')
+      const page = await deps.notify.mailFor({
+        ...(user ? { userId: user } : {}),
+        ...(address ? { address } : {}),
+        limit: Number.isFinite(limit) && limit > 0 && limit <= 200 ? limit : 50,
+        bearer: operatorBearer(ctx),
+        correlationId: ctx.requestId,
+      })
+      return { status: 200, body: page }
+    }),
+
+    /**
+     * Send it again.
+     *
+     * `requireOperator`, not `requireReader`: this puts a message in front of a person, and a
+     * read-scoped service token must not be able to. Notify answers 202 and queues a NEW delivery
+     * beside the original, so the failure being repeated stays readable afterwards — that status
+     * is passed straight through rather than flattened to 200, because nothing has been sent when
+     * this returns.
+     */
+    define('POST', '/v1/mail/:id/resend', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      const operator = requireOperator(principal)
+      const id = ctx.params['id'] ?? ''
+
+      // ── WRAPPED, BECAUSE A RETRY HERE SENDS A SECOND EMAIL ────────────────────────────────
+      //
+      // Notify refuses to resend a delivery that is already `pending`, which stops a double
+      // click on the SAME row. It does not stop this: a retried HTTP request resends the
+      // original — still `dead`, still eligible — and queues a second delivery. Two messages to
+      // one person for one operator action, which is exactly the durable artefact per retry that
+      // `routeidempotency.test.ts` exists to catch. It caught this one.
+      return withIdempotentRoute(ctx, '/v1/mail/:id/resend', async () => {
+        const outcome = await withIdempotency(deps.sql, {
+          principal: operator,
+          route: '/v1/mail/:id/resend',
+          clientKey: idempotencyKeyOf(ctx),
+          // The delivery id IS the request: there is no body. Two operators resending the same
+          // failed message are asking for one thing, and the fingerprint says so.
+          requestHash: requestFingerprint({ deliveryId: id }),
+          run: async () => {
+            const answer = await deps.notify.resend({
+              deliveryId: id,
+              bearer: operatorBearer(ctx),
+              correlationId: ctx.requestId,
+            })
+            return { response: answer, artefactId: answer.deliveryId }
+          },
+        })
+        ctx.log.info('operator resent a delivery', {
+          operator,
+          deliveryId: id,
+          created: outcome.result.deliveryId,
+          replayed: outcome.replayed,
+        })
+        return { status: 202, body: outcome.result }
+      })
+    }),
 
     define('GET', '/v1/audit', async (ctx, deps) => {
       const principal = await authenticate(ctx, deps)

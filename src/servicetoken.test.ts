@@ -279,6 +279,7 @@ function upstreamsFor(w: World, credential: string | null, staticToken: string |
     identityCredential: credential,
     serviceToken: staticToken,
     ledgerUrl: LEDGER,
+    notifyUrl: 'http://notify.test',
     marketUrl: MARKET,
     billingUrl: BILLING,
     upstreamDeadlineMs: 4_000,

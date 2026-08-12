@@ -138,7 +138,7 @@ const upstreams = buildUpstreams(env, {
     }
   },
 })
-const { ledger, market, billing, identity, clientConfig } = upstreams
+const { ledger, market, billing, identity, notify, clientConfig } = upstreams
 
 // ────────────────────────────────────────────────────────────────────────────────────────────────
 // Said at boot, at the level its consequence deserves, because the alternative is what actually
@@ -240,6 +240,7 @@ const server = createServer({
   sql: db,
   producer: SERVICE,
   ledger,
+  notify,
   market,
   billing,
   identity,
