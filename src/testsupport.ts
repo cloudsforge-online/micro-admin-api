@@ -39,12 +39,14 @@ import type {
   LedgerClient,
   MailDelivery,
   MarketClient,
+  NdaClient,
   NotifyClient,
   ModerationCase,
   PostedEntry,
   ReversedEntry,
   RevokeResult,
   TrialBalance,
+  WorldSummary,
 } from './upstreams.ts'
 import { UpstreamError } from './upstreams.ts'
 import type { EstateDeps } from './estate.ts'
@@ -568,6 +570,7 @@ export async function fakeTarget(): Promise<FakeTarget> {
 
 export interface Harness {
   readonly notify: FakeNotify
+  readonly nda: FakeNda
   readonly baseUrl: string
   readonly metrics: Metrics
   readonly ledger: FakeLedger
@@ -587,6 +590,7 @@ export interface Harness {
 
 export interface HarnessOptions {
   readonly notify?: FakeNotify
+  readonly nda?: FakeNda
   /**
    * The secrets the inbound event route will ACCEPT, newest first — a list, not a value, so a test
    * can stage the overlap window a rolling rotation of `OUTBOX_SIGNING_SECRET` depends on.
@@ -595,6 +599,103 @@ export interface HarnessOptions {
   readonly approvalTtlMinutes?: number
   readonly readiness?: EstateDeps['readiness']
   readonly now?: () => Date
+}
+
+/**
+ * `nda`, recording every world call and the bearer it carried.
+ *
+ * The BEARER is captured on purpose. Forge Worlds' mutations forward the OPERATOR's own token so
+ * that nda's outbox events name the administrator who generated the world; a regression to this
+ * service's own bearer would still work, still return 200, and quietly relabel every world in the
+ * game as having been made by `service:admin-api`. `worlds.test.ts` asserts on this array.
+ */
+export interface FakeNda extends NdaClient {
+  readonly calls: Array<{ method: string; worldId?: string; bearer: string; key?: string }>
+  setWorlds(worlds: readonly WorldSummary[]): void
+  failWith(err: Error | null): void
+  reset(): void
+}
+
+export function fakeNda(): FakeNda {
+  const calls: FakeNda['calls'] = []
+  let worlds: readonly WorldSummary[] = []
+  let failure: Error | null = null
+  const world = (over: Partial<WorldSummary> = {}): WorldSummary => ({
+    id: '11111111-2222-4333-8444-555555555555',
+    name: 'Test world',
+    seed: 'seed-1',
+    status: 'lobby',
+    day: 0,
+    seasonLength: 90,
+    width: 24,
+    height: 24,
+    tickIntervalMinutes: 1440,
+    humans: 0,
+    bots: 0,
+    ...over,
+  })
+
+  return {
+    calls,
+    setWorlds(next) {
+      worlds = next
+    },
+    failWith(err) {
+      failure = err
+    },
+    reset() {
+      calls.length = 0
+      worlds = []
+      failure = null
+    },
+    async listWorlds(request) {
+      calls.push({ method: 'list', bearer: request.operatorBearer })
+      if (failure) throw failure
+      return worlds
+    },
+    async createWorld(request) {
+      calls.push({ method: 'create', bearer: request.operatorBearer, key: request.idempotencyKey })
+      if (failure) throw failure
+      return {
+        world: world({
+          name: request.name,
+          ...(request.width === undefined ? {} : { width: request.width }),
+          ...(request.seed === undefined ? {} : { seed: request.seed }),
+        }),
+        replayed: false,
+      }
+    },
+    async startWorld(request) {
+      calls.push({
+        method: 'start',
+        worldId: request.worldId,
+        bearer: request.operatorBearer,
+        key: request.idempotencyKey,
+      })
+      if (failure) throw failure
+      return { world: world({ id: request.worldId, status: 'active' }), replayed: false }
+    },
+    async setBots(request) {
+      calls.push({
+        method: 'bots',
+        worldId: request.worldId,
+        bearer: request.operatorBearer,
+        key: request.idempotencyKey,
+      })
+      if (failure) throw failure
+      return { bots: request.enabled ? request.count : 0, replayed: false }
+    },
+    async tickWorld(request) {
+      calls.push({
+        method: 'tick',
+        worldId: request.worldId,
+        bearer: request.operatorBearer,
+        key: request.idempotencyKey,
+      })
+      if (failure) throw failure
+      return { queued: true, replayed: false }
+    },
+  }
 }
 
 /** Boot the real server over a real socket, with fake upstreams and a real database. */
@@ -612,6 +713,7 @@ export async function startHarness(
   const market = fakeMarket()
   const billing = fakeBilling()
   const identity = fakeIdentity()
+  const nda = options.nda ?? fakeNda()
   const lifecycle = new Lifecycle({ drainDelayMs: 0, drainTimeoutMs: 100 })
   lifecycle.markReady()
 
@@ -627,6 +729,7 @@ export async function startHarness(
     billing,
     identity,
     notify,
+    nda,
     readiness: options.readiness ?? fakeReadiness({ ledger: { ready: true, state: 'ready' } }),
     estateEnvironment: TEST_ENVIRONMENT,
     composeProject: 'cf-testnet',
@@ -644,6 +747,7 @@ export async function startHarness(
     metrics,
     ledger,
     notify,
+    nda,
     market,
     billing,
     identity,
@@ -683,6 +787,7 @@ export async function startHarness(
       market.reset()
       billing.reset()
       identity.reset()
+      nda.reset()
     },
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   }

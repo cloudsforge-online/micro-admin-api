@@ -138,7 +138,7 @@ const upstreams = buildUpstreams(env, {
     }
   },
 })
-const { ledger, market, billing, identity, notify, clientConfig } = upstreams
+const { ledger, market, billing, identity, notify, nda, clientConfig } = upstreams
 
 // ────────────────────────────────────────────────────────────────────────────────────────────────
 // Said at boot, at the level its consequence deserves, because the alternative is what actually
@@ -244,6 +244,7 @@ const server = createServer({
   market,
   billing,
   identity,
+  nda,
   readiness,
   // Signing stays singular (see the relay below); ACCEPTING is a list, so the estate's shared
   // secret can be rotated with an overlap window instead of a flag day. Unset, the list is exactly

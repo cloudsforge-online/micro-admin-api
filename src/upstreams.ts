@@ -557,6 +557,203 @@ export function httpBillingClient(config: ClientConfig): BillingClient {
   }
 }
 
+/* ------------------------------------------------------------------------ nda */
+
+/**
+ * Ninety Days After — the game service behind Forge Worlds.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **WHY THIS IS A PROXY AND NOT A DIRECT CALL FROM THE CONSOLE.**
+ *
+ * The Foresight panel in `admin-web` calls Foresight DIRECTLY on `foresight.<apex>`, because that
+ * surface has a hostname: a Cloudflare DNS record, a tunnel ingress rule, an Access policy and a
+ * pair of Traefik routers. `nda` has none of those. `cloudsforge-estate-nda-1` has been healthy for
+ * weeks and is unreachable from any browser on earth, which is the whole reason the title has never
+ * left `draft` — not a missing feature, a missing door.
+ *
+ * Publishing `nda.<apex>` would mean creating that DNS record and its Access policy by hand in
+ * Cloudflare, which no repository can do and no test can check. Proxying costs one env var and
+ * reaches the same service over the compose network today. See `deploy/cloudflared/config.*.yml`
+ * for the enumeration this deliberately does not have to join.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * **THE OPERATOR'S OWN BEARER, LIKE MARKET AND BILLING.** `nda/src/server.ts` guards every mutation
+ * below with `requireAdminPrincipal`, which admits EITHER a service holding `nda:write` OR a user
+ * with `role:admin` — so forwarding the human's token makes nda's own outbox events name the
+ * administrator who generated the world rather than this service. That is SD-11, and it is also why
+ * `NDA_SCOPES` is empty: minting `nda:write` onto this service's token would be a live capability
+ * that nothing here consults.
+ *
+ *   nda  GET  /v1/worlds              nda/src/server.ts:543   guard: requirePrincipal (any user)
+ *   nda  POST /v1/worlds              nda/src/server.ts:709   guard: requireAdminPrincipal
+ *   nda  POST /v1/worlds/:id/start    nda/src/server.ts:731   guard: requireAdminPrincipal
+ *   nda  PUT  /v1/worlds/:id/bots     nda/src/server.ts:744   guard: requireAdminPrincipal
+ *   nda  POST /v1/worlds/:id/tick     nda/src/server.ts:768   guard: requireAdminPrincipal
+ *
+ * **EVERY MUTATION CARRIES AN `Idempotency-Key`, AND IT IS A PARAMETER RATHER THAN A DEFAULT.**
+ * `defineMutation(..., 'header', ...)` in nda means the header is REQUIRED — a call without one is
+ * refused, not accepted unsafely. Defaulting it to this request's id here would satisfy nda and
+ * defeat it: generating a fresh world map is expensive and a double-submit would build two. The
+ * console mints one key per submission attempt and resends it on retry, so nda answers the second
+ * attempt with `replayed: true` and the same world.
+ */
+
+/** `lobby` before it starts, `active` while days resolve, `archived` when the season ends. */
+export type WorldStatus = 'lobby' | 'active' | 'archived'
+
+/** `WorldSnapshot` from nda/src/engine/state.ts, plus the counts nda's list route folds in. */
+export interface WorldSummary {
+  readonly id: string
+  readonly name: string
+  readonly seed: string
+  readonly status: WorldStatus
+  /** The day already resolved. Resolution produces `day + 1`. */
+  readonly day: number
+  readonly seasonLength: number
+  readonly width: number
+  readonly height: number
+  readonly tickIntervalMinutes: number
+  readonly humans: number
+  readonly bots: number
+}
+
+export interface CreateWorldRequest {
+  readonly name: string
+  /** Omitted fields take nda's own defaults (`WORLD_DEFAULTS`), which is why they are optional. */
+  readonly width?: number | undefined
+  readonly height?: number | undefined
+  readonly seasonLength?: number | undefined
+  readonly tickIntervalMinutes?: number | undefined
+  /** Omitted means nda seeds the map from the new world's id, as the frozen ancestor did. */
+  readonly seed?: string | undefined
+  readonly idempotencyKey: string
+  readonly correlationId: string
+  readonly operatorBearer: string
+}
+
+export interface WorldMutationRequest {
+  readonly worldId: string
+  readonly idempotencyKey: string
+  readonly correlationId: string
+  readonly operatorBearer: string
+}
+
+export interface SetBotsRequest extends WorldMutationRequest {
+  readonly enabled: boolean
+  /** Ignored by nda when `enabled` is false — it syncs to zero. 0..200. */
+  readonly count: number
+}
+
+export interface NdaClient {
+  /** `GET /v1/worlds?status=…` — nda/src/server.ts:543. */
+  listWorlds(request: {
+    readonly statuses: readonly WorldStatus[]
+    readonly correlationId: string
+    readonly operatorBearer: string
+  }): Promise<readonly WorldSummary[]>
+  /** `POST /v1/worlds` — nda/src/server.ts:709. 201 fresh, 200 replayed. */
+  createWorld(request: CreateWorldRequest): Promise<{ world: WorldSummary; replayed: boolean }>
+  /** `POST /v1/worlds/:id/start` — nda/src/server.ts:731. */
+  startWorld(request: WorldMutationRequest): Promise<{ world: WorldSummary; replayed: boolean }>
+  /** `PUT /v1/worlds/:id/bots` — nda/src/server.ts:744. */
+  setBots(request: SetBotsRequest): Promise<{ bots: number; replayed: boolean }>
+  /** `POST /v1/worlds/:id/tick` — nda/src/server.ts:768. 202: it ENQUEUES, it does not resolve. */
+  tickWorld(request: WorldMutationRequest): Promise<{ queued: boolean; replayed: boolean }>
+}
+
+/** Nothing: every method presents the OPERATOR's bearer, which `requireAdminPrincipal` admits. */
+export const NDA_SCOPES: readonly string[] = Object.freeze([])
+
+export function httpNdaClient(config: ClientConfig): NdaClient {
+  const client = clientFor('nda', config)
+  /** The operator's own token plus the key nda's `defineMutation` requires. */
+  const mutationHeaders = async (request: {
+    readonly idempotencyKey: string
+    readonly operatorBearer: string
+  }): Promise<Record<string, string>> => ({
+    ...(await authHeader(config, { kind: 'operator', bearer: request.operatorBearer })),
+    'idempotency-key': request.idempotencyKey,
+  })
+
+  return {
+    async listWorlds(request) {
+      try {
+        // nda defaults an ABSENT `status` to `lobby,active` — archived seasons are excluded. The
+        // console asks for all three by name, because an operator's question here is "what have we
+        // ever generated", and a world that has finished its season is the interesting one.
+        const query =
+          request.statuses.length > 0
+            ? `?status=${encodeURIComponent(request.statuses.join(','))}`
+            : ''
+        const answer = await client.get<{ worlds: readonly WorldSummary[] }>(`/v1/worlds${query}`, {
+          requestId: request.correlationId,
+          headers: await authHeader(config, { kind: 'operator', bearer: request.operatorBearer }),
+        })
+        return answer.worlds ?? []
+      } catch (err) {
+        throw wrap('nda', err)
+      }
+    },
+    async createWorld(request) {
+      try {
+        // Body fields read from nda/src/server.ts:709. `name` is required; the four numbers and
+        // `seed` are OMITTED rather than sent as null when absent, because nda's `optionalInt`
+        // spreads a present key and a null would fail its integer bound rather than take the
+        // default.
+        return await client.post<{ world: WorldSummary; replayed: boolean }>(
+          '/v1/worlds',
+          {
+            name: request.name,
+            ...(request.width === undefined ? {} : { width: request.width }),
+            ...(request.height === undefined ? {} : { height: request.height }),
+            ...(request.seasonLength === undefined ? {} : { seasonLength: request.seasonLength }),
+            ...(request.tickIntervalMinutes === undefined
+              ? {}
+              : { tickIntervalMinutes: request.tickIntervalMinutes }),
+            ...(request.seed === undefined ? {} : { seed: request.seed }),
+          },
+          { requestId: request.correlationId, headers: await mutationHeaders(request) },
+        )
+      } catch (err) {
+        throw wrap('nda', err)
+      }
+    },
+    async startWorld(request) {
+      try {
+        return await client.post<{ world: WorldSummary; replayed: boolean }>(
+          `/v1/worlds/${encodeURIComponent(request.worldId)}/start`,
+          {},
+          { requestId: request.correlationId, headers: await mutationHeaders(request) },
+        )
+      } catch (err) {
+        throw wrap('nda', err)
+      }
+    },
+    async setBots(request) {
+      try {
+        return await client.put<{ bots: number; replayed: boolean }>(
+          `/v1/worlds/${encodeURIComponent(request.worldId)}/bots`,
+          { enabled: request.enabled, count: request.count },
+          { requestId: request.correlationId, headers: await mutationHeaders(request) },
+        )
+      } catch (err) {
+        throw wrap('nda', err)
+      }
+    },
+    async tickWorld(request) {
+      try {
+        return await client.post<{ queued: boolean; replayed: boolean }>(
+          `/v1/worlds/${encodeURIComponent(request.worldId)}/tick`,
+          {},
+          { requestId: request.correlationId, headers: await mutationHeaders(request) },
+        )
+      } catch (err) {
+        throw wrap('nda', err)
+      }
+    },
+  }
+}
+
 /* ------------------------------------------------------------------------ identity */
 
 export interface SetRolesRequest {
@@ -772,6 +969,8 @@ export interface Upstreams {
   readonly billing: BillingClient
   readonly identity: IdentityClient
   readonly notify: NotifyClient
+  /** Forge Worlds' game service. Reachable only from inside the estate — see `httpNdaClient`. */
+  readonly nda: NdaClient
   /** The shared config, so `probeReadiness` can be called for a peer with the same transport. */
   readonly clientConfig: Omit<ClientConfig, 'baseUrl'>
 }
@@ -786,6 +985,7 @@ export type UpstreamEnv = Pick<
   | 'notifyUrl'
   | 'marketUrl'
   | 'billingUrl'
+  | 'ndaUrl'
   | 'upstreamDeadlineMs'
 >
 
@@ -858,6 +1058,7 @@ export function buildUpstreams(env: UpstreamEnv, options: UpstreamOptions = {}):
     notify: httpNotifyClient({ baseUrl: env.notifyUrl, ...clientConfig }),
     market: httpMarketClient({ baseUrl: env.marketUrl, ...clientConfig }),
     billing: httpBillingClient({ baseUrl: env.billingUrl, ...clientConfig }),
+    nda: httpNdaClient({ baseUrl: env.ndaUrl, ...clientConfig }),
     // The role-grant upstream. Presents this service's own bearer, never an operator's — identity's
     // `identity:admin` gate refuses a user principal outright (identity/src/server.ts).
     identity: httpIdentityClient({ baseUrl: env.identityUrl, ...clientConfig }),

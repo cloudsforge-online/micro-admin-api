@@ -282,6 +282,7 @@ function upstreamsFor(w: World, credential: string | null, staticToken: string |
     notifyUrl: 'http://notify.test',
     marketUrl: MARKET,
     billingUrl: BILLING,
+    ndaUrl: 'http://nda.test',
     upstreamDeadlineMs: 4_000,
   }
   return buildUpstreams(env, { fetch: w.fetch })

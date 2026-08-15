@@ -153,7 +153,7 @@ import { eraseSubject } from './erasure.ts'
 // The registry, and the one place that decides which topics the operator audit log carries.
 // Read rather than restated: a decision copied into a consumer is a decision that drifts.
 import { auditRowFor, isRegisteredTopic, validateEnvelope, verifyDelivery } from '@cloudsforge/contracts-events'
-import { UpstreamError, type BillingClient, type IdentityClient, type LedgerClient, type MarketClient, type NotifyClient } from './upstreams.ts'
+import { UpstreamError, type BillingClient, type IdentityClient, type LedgerClient, type MarketClient, type NdaClient, type NotifyClient, type WorldStatus } from './upstreams.ts'
 
 /** The verifier as this file needs it. An interface, so a test does not need a JWKS. */
 export interface PrincipalVerifier {
@@ -198,6 +198,8 @@ export interface ServerDeps {
    *  because identity's role gate refuses an operator bearer outright. See `upstreams.ts`. */
   readonly identity: IdentityClient
   readonly notify: NotifyClient
+  /** Forge Worlds' game service. The Worlds screen is a proxy onto it — see `upstreams.ts`. */
+  readonly nda: NdaClient
   readonly readiness: EstateDeps['readiness']
   /**
    * The secrets `POST /v1/events` will accept, newest first — a list so that rotating the estate's
@@ -1811,7 +1813,240 @@ function buildRoutes(): Route[] {
         return { status: outcome.replayed ? 200 : 201, body: outcome.result }
       })
     }),
+
+    /* ---------------------------------------------------------------- forge worlds */
+
+    /**
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * **THE FIVE ROUTES THAT TAKE *NINETY DAYS AFTER* OUT OF `draft`.**
+     *
+     * `nda` — the whole game: worlds, tiles, homesteads, the day-resolution engine, communes and
+     * reports — has been running and healthy in the estate for weeks with no way to reach it. It
+     * has no hostname, so it has no Cloudflare DNS record, no tunnel ingress rule, no Access
+     * policy and no Traefik router; and it has no operator screen anywhere. A title nobody can
+     * generate a world for is a title nobody can play, which is what `draft` has been recording.
+     *
+     * These are a PROXY, not a reimplementation. Every one forwards to the route named beside it
+     * and adds exactly two things nda cannot do for itself: this console's authentication, and
+     * this console's hash-chained audit row naming the operator who acted. The world's own
+     * outbox events are still nda's, and they still name the human, because the operator's own
+     * bearer is what goes upstream. See the `nda` section of `upstreams.ts`.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+
+    define('GET', '/v1/worlds', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      requireReader(principal)
+      // ALL THREE statuses, where nda's own default is `lobby,active`. An operator's question on
+      // this screen is "what has this estate ever generated", and a finished season is the one
+      // worth reading — it is the only evidence the engine ran ninety days without stalling.
+      const statuses: readonly WorldStatus[] = ['lobby', 'active', 'archived']
+      const worlds = await deps.nda.listWorlds({
+        statuses,
+        correlationId: ctx.requestId,
+        operatorBearer: operatorBearer(ctx),
+      })
+      return { status: 200, body: { worlds } }
+    }),
+
+    define('POST', '/v1/worlds', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      const operator = requireOperator(principal)
+      const body = await readJson(ctx.req)
+      const key = idempotencyKeyOf(ctx)
+      // REQUIRED, and refused here rather than upstream. Generating a world builds a whole map;
+      // a double-submitted form without a key would build two worlds and neither would be wrong
+      // enough for anything to notice. nda answers a repeat of the same key with the first
+      // world and `replayed: true`.
+      if (!key) throw new BadRequestError('an Idempotency-Key header is required to create a world')
+
+      const answer = await deps.nda.createWorld({
+        name: requireString(body, 'name'),
+        ...optionalWholeNumber(body, 'width'),
+        ...optionalWholeNumber(body, 'height'),
+        ...optionalWholeNumber(body, 'seasonLength'),
+        ...optionalWholeNumber(body, 'tickIntervalMinutes'),
+        ...(typeof body['seed'] === 'string' && body['seed'].length > 0
+          ? { seed: body['seed'] }
+          : {}),
+        idempotencyKey: key,
+        correlationId: ctx.requestId,
+        operatorBearer: operatorBearer(ctx),
+      })
+
+      await deps.sql.begin((tx) =>
+        appendAudit(
+          tx,
+          {
+            actor: operator,
+            action: 'admin.world.created',
+            subjectKind: 'world',
+            subjectId: answer.world.id,
+            outcome: 'allowed',
+            correlationId: ctx.requestId,
+            // The SEED is recorded, because it is what makes a world reproducible: the same seed
+            // and the same inputs resolve byte-identically (`nda/src/engine/state.ts`), so this
+            // row is enough to rebuild the map somebody is asking about.
+            payload: {
+              name: answer.world.name,
+              seed: answer.world.seed,
+              width: answer.world.width,
+              height: answer.world.height,
+              seasonLength: answer.world.seasonLength,
+              tickIntervalMinutes: answer.world.tickIntervalMinutes,
+              replayed: answer.replayed,
+            },
+          },
+          deps.now,
+        ),
+      )
+      deps.metrics.increment('admin_operator_actions_total', {
+        action: 'world.created',
+        outcome: 'allowed',
+      })
+      return { status: answer.replayed ? 200 : 201, body: answer }
+    }),
+
+    define('POST', '/v1/worlds/:id/start', async (ctx, deps) => {
+      const operator = requireOperator(await authenticate(ctx, deps))
+      return worldMutation(ctx, deps, operator, 'admin.world.started', 'world.started', async (request) => {
+        const answer = await deps.nda.startWorld(request)
+        return { body: answer, payload: { status: answer.world.status, replayed: answer.replayed } }
+      })
+    }),
+
+    define('POST', '/v1/worlds/:id/tick', async (ctx, deps) => {
+      const operator = requireOperator(await authenticate(ctx, deps))
+      return worldMutation(ctx, deps, operator, 'admin.world.ticked', 'world.ticked', async (request) => {
+        const answer = await deps.nda.tickWorld(request)
+        // 202, matching nda: the tick is ENQUEUED behind the world's lease, not resolved inline,
+        // so an operator's force-tick and the scheduler's sweep cannot both advance the same day.
+        return { status: 202, body: answer, payload: { replayed: answer.replayed } }
+      })
+    }),
+
+    define('PUT', '/v1/worlds/:id/bots', async (ctx, deps) => {
+      const operator = requireOperator(await authenticate(ctx, deps))
+      const body = await readJson(ctx.req)
+      const enabled = body['enabled']
+      if (typeof enabled !== 'boolean') throw new BadRequestError('enabled must be true or false')
+      const rawCount = body['count']
+      const count = enabled ? rawCount : 0
+      if (typeof count !== 'number' || !Number.isInteger(count) || count < 0) {
+        throw new BadRequestError('count must be a whole number of bots, zero or more')
+      }
+      return worldMutation(ctx, deps, operator, 'admin.world.bots.changed', 'world.bots.changed', async (request) => {
+        const answer = await deps.nda.setBots({ ...request, enabled, count })
+        return { body: answer, payload: { enabled, count, bots: answer.bots, replayed: answer.replayed } }
+      })
+    }),
   ]
+}
+
+/**
+ * A whole number from a JSON body, or nothing — spread into a request rather than defaulted.
+ *
+ * `{}` for an absent field, so the upstream applies its OWN default. A `null` or a restated
+ * default here would be this service having an opinion about how big a world should be, which is
+ * `nda/src/worlds.ts`'s to hold: it bounds width and height to 12..64, the season to 5..365 days
+ * and the tick to 1..1440 minutes, and it is the file that changes when those move.
+ */
+function optionalWholeNumber(
+  body: Record<string, unknown>,
+  field: string,
+): Record<string, number> {
+  const value = body[field]
+  if (value === undefined || value === null || value === '') return {}
+  if (typeof value !== 'number' || !Number.isInteger(value)) {
+    throw new BadRequestError(`${field} must be a whole number`)
+  }
+  return { [field]: value }
+}
+
+/**
+ * A world id in the shape nda actually stores them.
+ *
+ * NOT a uuid, which is what this gate said for one commit. `nda/src/migrations.ts` declares
+ * `id text primary key` and `mustFindWorld` looks it up as text — `randomUUID()` is only what a
+ * world created THROUGH THE API happens to get. The live estate holds `drill-world`, seeded on
+ * 2026-08-05 before there was a create route, and a uuid gate answered 400 for it: the operator's
+ * very first screen would have listed a world in `lobby` and then refused to start it.
+ *
+ * So this is the gate it was always meant to be — one that keeps a path segment a path segment.
+ * The client `encodeURIComponent`s it regardless; this refuses the shapes that are a mistake
+ * rather than a world, and leaves "does it exist" to nda's own 404, which is the only place that
+ * can answer it.
+ */
+const WORLD_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
+
+/**
+ * The three world mutations, which differ only in what they call and what they record.
+ *
+ * Shared because the parts that are easy to get wrong are the parts that are identical: the
+ * operator's bearer forwarded rather than the service's, the `Idempotency-Key` refused when
+ * absent rather than invented, and an audit row written whether or not the upstream replayed.
+ *
+ * ── THE AUTHENTICATION IS NOT IN HERE, AND THAT IS THE POINT ──────────────────────────────────
+ *
+ * It was, for one commit. `bootstrap.test.ts` refused it: that test reads the source of each route
+ * block and requires `await authenticate(ctx, deps)` in the block itself, and a helper is exactly
+ * the shape it cannot see through — `POST /v1/worlds/:id/start` and `.../tick` came out of it
+ * reading as unauthenticated routes that were not on the pinned list of four.
+ *
+ * The guard is right and the helper was wrong. A reviewer reading a route has to be able to see
+ * that it authenticates without following a call, and a future route that hid its auth behind a
+ * DIFFERENT helper would pass a test that had been taught to follow this one. So the caller
+ * authenticates in the open and hands the result down.
+ */
+async function worldMutation(
+  ctx: RequestContext,
+  deps: ServerDeps,
+  operator: string,
+  action: string,
+  metricAction: string,
+  run: (request: {
+    readonly worldId: string
+    readonly idempotencyKey: string
+    readonly correlationId: string
+    readonly operatorBearer: string
+  }) => Promise<{
+    readonly status?: number
+    readonly body: unknown
+    readonly payload: Record<string, unknown>
+  }>,
+): Promise<Reply> {
+  const worldId = ctx.params['id'] ?? ''
+  if (!WORLD_ID.test(worldId)) throw new BadRequestError('that is not the shape of a world id')
+  const key = idempotencyKeyOf(ctx)
+  if (!key) throw new BadRequestError('an Idempotency-Key header is required')
+
+  const outcome = await run({
+    worldId,
+    idempotencyKey: key,
+    correlationId: ctx.requestId,
+    operatorBearer: operatorBearer(ctx),
+  })
+
+  await deps.sql.begin((tx) =>
+    appendAudit(
+      tx,
+      {
+        actor: operator,
+        action,
+        subjectKind: 'world',
+        subjectId: worldId,
+        outcome: 'allowed',
+        correlationId: ctx.requestId,
+        payload: outcome.payload,
+      },
+      deps.now,
+    ),
+  )
+  deps.metrics.increment('admin_operator_actions_total', {
+    action: metricAction,
+    outcome: 'allowed',
+  })
+  return { status: outcome.status ?? 200, body: outcome.body }
 }
 
 /* ------------------------------------------------------------------------ execution */

@@ -40,6 +40,12 @@ const EXEMPT: Readonly<Record<string, string>> = {
     'an upsert keyed on the service, exactly like PUT /v1/flags/:key: a retry writes the same row, the audit payload carries before and after, and the lowering it performs is idempotent by value — the raise path travels through POST /v1/approvals, which IS wrapped',
   'PUT /v1/backups/settings':
     'an UPDATE of one singleton row whose every column is last-write-wins. A retry writes the same eight values and produces no second artefact — no backup is taken, no restore is queued, nothing is created. The two routes here that DO create durable artefacts, POST /v1/backups and POST /v1/restores, are both wrapped',
+  'POST /v1/worlds':
+    "the world is nda's artefact, not this service's, and the key that guards it is the caller's own: the route REFUSES the request with a 400 when no Idempotency-Key header is present rather than inventing one, forwards it verbatim, and nda's `idempotently` replays the first world it built under that key — a retry answers 200 with replayed:true instead of 201, and generates no second map. Wrapping here would answer the retry out of this service's store and never ask nda, which is how the two records drift: this one would keep replaying a 201 for a world nda had since refused or archived",
+  'POST /v1/worlds/:id/start':
+    'a lobby→active transition claimed by nda under the forwarded key, which this route demands rather than defaults. A retry re-reads the same world and the audit payload records replayed, so a replayed no-op is visible as one — the same standard PUT /v1/flags/:key is held to',
+  'POST /v1/worlds/:id/tick':
+    "enqueues one day behind the world's lease. The lease is the real guard — the scheduler's sweep and an operator's force-tick cannot both advance the same day, whatever the key says — and the forwarded Idempotency-Key makes the retry itself a replay on top of that. A second 202 does not resolve a second day",
 }
 
 function mutatingRoutes(): Array<{ key: string; wrapped: boolean }> {

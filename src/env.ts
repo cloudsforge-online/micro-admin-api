@@ -254,6 +254,14 @@ export interface Env {
   /** Soft. Entitlement revocation is an approval action. */
   readonly billingUrl: string
   /**
+   * Soft. Forge Worlds' game service, which the Worlds screen generates and runs worlds through.
+   *
+   * REQUIRED rather than defaulted, like every other upstream here: `http://nda:4110` is right on
+   * the estate and wrong everywhere else, and a default would let a deployment that cannot reach
+   * the service start up and fail one screen at a time instead of at boot.
+   */
+  readonly ndaUrl: string
+  /**
    * The long-lived, revocable `cfsc_` credential this process EXCHANGES for a service token.
    *
    * ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -389,6 +397,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     notifyUrl: required(source, 'NOTIFY_URL'),
     marketUrl: required(source, 'MARKET_URL'),
     billingUrl: required(source, 'BILLING_URL'),
+    ndaUrl: required(source, 'NDA_URL'),
     // The credential that is EXCHANGED, and the token that is not. Both face the same assertion,
     // because the class of a value is a property of the value and never of the variable holding
     // it: the live `ADMIN_API_SERVICE_TOKEN` is an expired JWT and this refuses it, which is #222
