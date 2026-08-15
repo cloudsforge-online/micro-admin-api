@@ -83,6 +83,9 @@ jobs:
         LEDGER_URL=http://127.0.0.1:4007
         MARKET_URL=http://127.0.0.1:4013
         BILLING_URL=http://127.0.0.1:4009
+        # nda, for the Worlds screen. Parsed at boot like the four above; nothing
+        # listens on 4110 during the smoke test and no route dialling it is called.
+        NDA_URL=http://127.0.0.1:4110
         # notify, for the operator mail view. Required with no default like the four above, so
         # the image cannot answer /livez without it — which is how this line came to exist.
         # Nothing listens on 4011 during the smoke test and nothing needs to: the boot only

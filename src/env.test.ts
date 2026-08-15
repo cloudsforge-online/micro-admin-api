@@ -46,6 +46,7 @@ const REQUIRED: Record<string, string> = {
   NOTIFY_URL: 'http://127.0.0.1:4011',
   MARKET_URL: 'http://127.0.0.1:4013',
   BILLING_URL: 'http://127.0.0.1:4009',
+  NDA_URL: 'http://127.0.0.1:4110',
   // Required with NO default, deliberately — a default answer to "which estate am I?" is how a
   // testnet backup gets restored over mainnet balances. `testnet` here, never `mainnet`, so a
   // fixture can never stand in for the environment where the refusal actually matters.
