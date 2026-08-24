@@ -77,7 +77,7 @@
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 
-import { HttpClient, HttpError, type ResultEvent } from '@cloudsforge/http'
+import { HttpClient, HttpError, NETWORK_HEADER, type Network, type ResultEvent } from '@cloudsforge/http'
 import {
   ServiceTokenProvider,
   ServiceTokenUnavailableError,
@@ -119,6 +119,14 @@ export interface ClientConfig {
   readonly baseUrl: string
   readonly deadlineMs: number
   /**
+   * The estate every call from this client belongs to, sent as `CF-Network`.
+   *
+   * Undefined in a single-network deployment, and then no header is sent at all — which is what
+   * makes this change invisible until the consolidation reaches the peer. See micro-deploy
+   * `docs/network-consolidation.md`.
+   */
+  readonly network?: Network
+  /**
    * This service's own scoped service bearer, MINTED per call. Used only where a user token is
    * refused.
    *
@@ -136,6 +144,18 @@ function clientFor(name: string, config: ClientConfig): HttpClient {
     baseUrl: config.baseUrl,
     name,
     defaultDeadlineMs: config.deadlineMs,
+    // ── THE ESTATE THIS CLIENT SPEAKS FOR ────────────────────────────────────────────────────
+    //
+    // A client-wide header rather than a per-call argument, because admin-api's peer interfaces
+    // are domain methods (`trialBalance()`, `reverseEntry(request)`) with nowhere to put one, and
+    // threading an options bag through twenty of them would leave nineteen right and one wrong.
+    //
+    // One client set per network is built at boot instead. There is no circuit state on these
+    // clients to split, and `RequestOptions.network` still beats this bag if a call ever needs to
+    // override it — the precedence `@cloudsforge/http` documents.
+    //
+    // Omitted when unset, which is what keeps a single-network deployment byte-identical.
+    ...(config.network ? { headers: { [NETWORK_HEADER]: config.network } } : {}),
     ...(config.fetch ? { fetch: config.fetch } : {}),
     ...(config.onResult ? { onResult: config.onResult } : {}),
   })
@@ -973,6 +993,15 @@ export interface Upstreams {
   readonly nda: NdaClient
   /** The shared config, so `probeReadiness` can be called for a peer with the same transport. */
   readonly clientConfig: Omit<ClientConfig, 'baseUrl'>
+  /**
+   * The same six peers, narrowed to ONE estate: every call they make carries that estate's
+   * `CF-Network`, so a consolidated peer answers from the right side.
+   *
+   * `forRequest` in `server.ts` swaps them in per request. The six fields above stay as the
+   * boot-time set — they send no `CF-Network` at all, which is what a peer that has not been
+   * consolidated yet still expects.
+   */
+  for(network: Network): Pick<Upstreams, 'ledger' | 'market' | 'billing' | 'identity' | 'notify' | 'nda'>
 }
 
 /** The subset of `Env` this needs. Named so a test does not have to build a whole environment. */
@@ -1050,17 +1079,40 @@ export function buildUpstreams(env: UpstreamEnv, options: UpstreamOptions = {}):
     ...(options.onResult ? { onResult: options.onResult } : {}),
   }
 
+  /**
+   * The six peers, as seen from ONE estate.
+   *
+   * Built per network at boot rather than per request: there is no circuit state on these clients
+   * to split between two sets, and a set built per request would allocate six `HttpClient`s to
+   * serve one call.
+   */
+  const peersFor = (network?: Network) => {
+    const config = { ...clientConfig, ...(network ? { network } : {}) }
+    return {
+      ledger: httpLedgerClient({ baseUrl: env.ledgerUrl, ...config }),
+      notify: httpNotifyClient({ baseUrl: env.notifyUrl, ...config }),
+      market: httpMarketClient({ baseUrl: env.marketUrl, ...config }),
+      billing: httpBillingClient({ baseUrl: env.billingUrl, ...config }),
+      nda: httpNdaClient({ baseUrl: env.ndaUrl, ...config }),
+      // The role-grant upstream. Presents this service's own bearer, never an operator's —
+      // identity's `identity:admin` gate refuses a user principal outright (identity/src/server.ts).
+      identity: httpIdentityClient({ baseUrl: env.identityUrl, ...config }),
+    }
+  }
+
+  const byNetwork: Record<Network, ReturnType<typeof peersFor>> = {
+    mainnet: peersFor('mainnet'),
+    testnet: peersFor('testnet'),
+  }
+
   return {
     mode,
     identityTokens,
     clientConfig,
-    ledger: httpLedgerClient({ baseUrl: env.ledgerUrl, ...clientConfig }),
-    notify: httpNotifyClient({ baseUrl: env.notifyUrl, ...clientConfig }),
-    market: httpMarketClient({ baseUrl: env.marketUrl, ...clientConfig }),
-    billing: httpBillingClient({ baseUrl: env.billingUrl, ...clientConfig }),
-    nda: httpNdaClient({ baseUrl: env.ndaUrl, ...clientConfig }),
-    // The role-grant upstream. Presents this service's own bearer, never an operator's — identity's
-    // `identity:admin` gate refuses a user principal outright (identity/src/server.ts).
-    identity: httpIdentityClient({ baseUrl: env.identityUrl, ...clientConfig }),
+    /** The peers for one estate. Every call they make carries that estate's `CF-Network`. */
+    for: (network: Network) => byNetwork[network],
+    // The boot-time set, for the composition root and for anything that runs off the request path.
+    // No `CF-Network` at all, which is what a single-network peer still expects.
+    ...peersFor(),
   }
 }
