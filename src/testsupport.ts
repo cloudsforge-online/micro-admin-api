@@ -20,6 +20,7 @@
  * Not a test file itself: it is excluded from the build and contains no `test()` call.
  */
 
+import { networkSql, type NetworkSql, type Sql as RuntimeSql } from '@cloudsforge/db'
 import { createServer as createHttpServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import postgres from 'postgres'
@@ -722,8 +723,12 @@ export async function startHarness(
     logger: quietLogger(),
     metrics,
     verifier,
-    sql: db(sql),
+    sql: singleNetworkSql(db(sql)),
+    singleNetwork: 'mainnet' as const,
     producer: 'admin-api',
+    // One set of fakes, presented as the selector. The suites run against a single estate, so both
+    // networks resolve to the same peers — what is under test is that a route asks for a network.
+    upstreamsFor: { for: () => ({ ledger, market, billing, identity, notify, nda }) },
     ledger,
     market,
     billing,
@@ -798,4 +803,16 @@ let keyCounter = 0
 export function freshKey(prefix = 'test'): string {
   keyCounter += 1
   return `${prefix}-idempotency-key-${keyCounter}`
+}
+
+/**
+ * One handle, presented as the per-network selector `createServer` now takes.
+ *
+ * The suites run against a single test database, so mainnet is the only configured network — which
+ * exercises the REFUSAL path for free: anything asking this for testnet throws
+ * `NetworkNotConfiguredError` rather than quietly reusing the handle it does have. That refusal is
+ * the property the consolidation rests on; see micro-deploy `docs/network-consolidation.md`.
+ */
+export function singleNetworkSql(handle: unknown): NetworkSql {
+  return networkSql({ mainnet: handle as RuntimeSql })
 }

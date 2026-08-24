@@ -15,6 +15,7 @@
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 
+import { networkSql, type Sql as RuntimeSql } from '@cloudsforge/db'
 import { test, before, beforeEach, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHmac } from 'node:crypto'
@@ -1638,3 +1639,12 @@ test('even an ADMIN cannot request a live restore directly; the queue is the onl
   assert.match(res.body.error.message, /estate\.restore approval/)
   assert.match(res.body.error.message, /second operator/)
 })
+
+/**
+ * One handle, presented as the per-network selector the server now takes. The fixture runs against
+ * a single test database, so mainnet is the only configured network — which exercises the REFUSAL
+ * path for free: anything reaching for testnet throws rather than reusing this handle.
+ */
+function singleNetworkSql(db: unknown) {
+  return networkSql({ mainnet: db as RuntimeSql })
+}

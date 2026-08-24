@@ -61,6 +61,8 @@ import {
   type Principal,
 } from '@cloudsforge/auth'
 import type { Lifecycle } from '@cloudsforge/lifecycle'
+import { NetworkUnknownError, requestNetwork, type Network } from '@cloudsforge/http'
+import type { NetworkSql } from '@cloudsforge/db'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import { READ_SCOPE, requireExactScope } from './scopes.ts'
 import {
@@ -153,7 +155,7 @@ import { eraseSubject } from './erasure.ts'
 // The registry, and the one place that decides which topics the operator audit log carries.
 // Read rather than restated: a decision copied into a consumer is a decision that drifts.
 import { auditRowFor, isRegisteredTopic, validateEnvelope, verifyDelivery } from '@cloudsforge/contracts-events'
-import { UpstreamError, type BillingClient, type IdentityClient, type LedgerClient, type MarketClient, type NdaClient, type NotifyClient, type WorldStatus } from './upstreams.ts'
+import { UpstreamError, type BillingClient, type Upstreams, type IdentityClient, type LedgerClient, type MarketClient, type NdaClient, type NotifyClient, type WorldStatus } from './upstreams.ts'
 
 /** The verifier as this file needs it. An interface, so a test does not need a JWKS. */
 export interface PrincipalVerifier {
@@ -189,8 +191,26 @@ export interface ServerDeps {
   readonly logger: Logger
   readonly metrics: Metrics
   readonly verifier: PrincipalVerifier
-  readonly sql: Db
+  /**
+   * The per-network SELECTOR, not a handle. Routes use `ctx.sql`; `NetworkSql` has no query
+   * methods, so reaching for the process-wide handle does not compile.
+   */
+  readonly sql: NetworkSql
+  /**
+   * The network to assume when no `CF-Network` arrives, or `undefined` to refuse. `CF_NETWORK_SINGLE`,
+   * for `pnpm dev`, which has no gateway in front of it. Never set in production.
+   */
+  readonly singleNetwork?: Network
   readonly producer: string
+  /**
+   * The six peers, as a per-network SELECTOR. `forRequest` spreads this estate's set over the six
+   * fields below before any route runs.
+   *
+   * admin-api reverses ledger entries, grants roles and delists listings — every one of those is a
+   * WRITE to a peer, so a peer narrowed to the wrong estate carries it out there and reports
+   * success. The database handle is only half of this service's isolation.
+   */
+  readonly upstreamsFor: Pick<Upstreams, 'for'>
   readonly ledger: LedgerClient
   readonly market: MarketClient
   readonly billing: BillingClient
@@ -323,7 +343,34 @@ interface RequestContext {
   readonly requestId: string
   readonly log: Logger
   readonly params: Readonly<Record<string, string>>
+  /**
+   * The network THIS REQUEST belongs to, from the `CF-Network` header the gateway stamped.
+   *
+   * Not a property of the process: one pod serves both estates since the network consolidation
+   * (micro-deploy `docs/network-consolidation.md`), so "which network am I" has no answer.
+   */
+  readonly network: Network
+  /**
+   * The database handle for `network`, resolved ONCE, at the edge of the request.
+   *
+   * Every route uses this rather than reaching for the process-wide handle, because a wrong handle
+   * is not an error — it is a query that SUCCEEDS against the other estate's rows and says nothing.
+   * `deps.sql` is a `NetworkSql` with no query methods, so the mistake does not compile.
+   */
+  readonly sql: Db
 }
+
+/**
+ * Routes that answer without belonging to a network.
+ *
+ * Kubelet probes the first two and Prometheus scrapes the third; none arrives through the gateway,
+ * so none carries `CF-Network`. Refusing them turns a data-isolation rule into a CrashLoopBackOff —
+ * which is exactly what agora's first build did: 500 on every probe, container never ready.
+ *
+ * A literal SET rather than a prefix, because this is an exemption from a data boundary and
+ * widening it should be a deliberate edit. Every member must answer without touching the database.
+ */
+const OPERATIONAL_ROUTES: ReadonlySet<string> = new Set(['/livez', '/readyz', '/metrics'])
 
 interface Route {
   readonly method: string
@@ -435,7 +482,7 @@ export function createServer(deps: ServerDeps): Server {
     inFlight += 1
     deps.metrics.set('http_requests_in_flight', inFlight)
 
-    const finish = (status: number) => {
+    const finish = (status: number, metricNetwork: string) => {
       inFlight -= 1
       deps.metrics.set('http_requests_in_flight', inFlight)
       const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6
@@ -444,18 +491,49 @@ export function createServer(deps: ServerDeps): Server {
         route: routeLabel,
         status: String(status),
       })
-      deps.metrics.observe('http_request_duration_ms', durationMs, { method, route: routeLabel })
+      deps.metrics.observe('http_request_duration_ms', durationMs, {
+        method,
+        route: routeLabel,
+        network: metricNetwork,
+      })
     }
 
-    void handle(matched, { req, url, requestId, log, params }, deps)
+    // ── THE NETWORK, THEN THE HANDLE, BEFORE ANY ROUTE RUNS ──────────────────────────────────
+    //
+    // `requestNetwork` REFUSES an unstamped request rather than assuming mainnet: a 500 is a
+    // routing fault made loud, where a default is a cross-network write nothing would ever flag.
+    //
+    // The operational endpoints are exempt because kubelet and Prometheus do not come through the
+    // gateway and never send the header. Refusing them makes the pod never become ready.
+    const networkless = matched !== undefined && OPERATIONAL_ROUTES.has(matched.path)
+    let network: Network
+    try {
+      network = networkless
+        ? (deps.singleNetwork ?? deps.sql.networks[0] ?? 'mainnet')
+        : requestNetwork(req.headers, deps.singleNetwork ? { fallback: deps.singleNetwork } : {})
+    } catch (err) {
+      log.error('request carries no usable network', {
+        err: err instanceof NetworkUnknownError ? err.message : err,
+      })
+      send(
+        res,
+        errorReply(500, 'network_unknown', 'this request could not be attributed to a network', requestId),
+        requestId,
+      )
+      finish(500, 'unknown')
+      return
+    }
+
+    const sql = deps.sql.for(network) as unknown as Db
+    void handle(matched, { req, url, requestId, log, params, network, sql }, forRequest(deps, network))
       .then((reply) => {
         send(res, reply, requestId)
-        finish(reply.status)
+        finish(reply.status, network)
       })
       .catch((err: unknown) => {
         log.error('request handler threw after mapping', { err })
         send(res, errorReply(500, 'internal', 'the request could not be completed', requestId), requestId)
-        finish(500)
+        finish(500, network)
       })
   })
 }
@@ -475,6 +553,17 @@ export function createServer(deps: ServerDeps): Server {
  *   * **502** — an upstream refused an execution the operators had authorised.
  *   * **503** — an upstream is unreachable, or an idempotent request is still in flight.
  */
+/**
+ * The deps a REQUEST sees: this estate's handle, and this estate's peers.
+ *
+ * Both halves matter and the second is the easier one to forget. admin-api reverses ledger
+ * entries, grants roles and delists listings — every one of those is a WRITE to a peer, and a
+ * peer narrowed to the wrong estate carries it out there. The operator sees a success.
+ */
+function forRequest(deps: ServerDeps, network: Network): ServerDeps {
+  return { ...deps, ...deps.upstreamsFor.for(network) }
+}
+
 async function handle(route: Route | undefined, ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
   if (!route) {
     return errorReply(404, 'not_found', `no route for ${ctx.req.method} ${ctx.url.pathname}`, ctx.requestId)
@@ -794,7 +883,7 @@ function buildRoutes(): Route[] {
         return { status: 202, body: { status: 'ignored', topic } }
       }
 
-      const outcome = await withInbox(deps.sql, topic, eventId, async (tx) => {
+      const outcome = await withInbox(ctx.sql, topic, eventId, async (tx) => {
         const appended = await appendAudit(
           tx,
           {
@@ -936,7 +1025,7 @@ function buildRoutes(): Route[] {
       // one person for one operator action, which is exactly the durable artefact per retry that
       // `routeidempotency.test.ts` exists to catch. It caught this one.
       return withIdempotentRoute(ctx, '/v1/mail/:id/resend', async () => {
-        const outcome = await withIdempotency(deps.sql, {
+        const outcome = await withIdempotency(ctx.sql, {
           principal: operator,
           route: '/v1/mail/:id/resend',
           clientKey: idempotencyKeyOf(ctx),
@@ -967,7 +1056,7 @@ function buildRoutes(): Route[] {
       const reader = requireReader(principal)
       const params = ctx.url.searchParams
       const before = params.get('before')
-      const page = await readAudit(deps.sql, {
+      const page = await readAudit(ctx.sql, {
         ...(params.get('actor') ? { actor: params.get('actor')! } : {}),
         ...(params.get('action') ? { action: params.get('action')! } : {}),
         ...(params.get('subjectKind') ? { subjectKind: params.get('subjectKind')! } : {}),
@@ -991,7 +1080,7 @@ function buildRoutes(): Route[] {
       // thing an operator investigating a suspected tamper needs, and the reason it is a parameter
       // rather than the default is cost: the nightly job resumes, a human asks for everything.
       const from = ctx.url.searchParams.get('from')
-      const result = await verifyChain(deps.sql, {
+      const result = await verifyChain(ctx.sql, {
         ...(from !== null ? { from: parseCursor(from) } : {}),
         limit: parseLimit(ctx.url.searchParams.get('limit'), 10_000, 200_000),
       })
@@ -1033,7 +1122,7 @@ function buildRoutes(): Route[] {
       requireReader(principal)
       const params = ctx.url.searchParams
       const state = params.get('state')
-      const approvals = await listApprovals(deps.sql, {
+      const approvals = await listApprovals(ctx.sql, {
         ...(state ? { state: parseState(state) } : {}),
         ...(params.get('action') ? { action: params.get('action')! } : {}),
         ...(params.get('requestedBy') ? { requestedBy: params.get('requestedBy')! } : {}),
@@ -1045,7 +1134,7 @@ function buildRoutes(): Route[] {
     define('GET', '/v1/approvals/:id', async (ctx, deps) => {
       const principal = await authenticate(ctx, deps)
       requireReader(principal)
-      const approval = await findApproval(deps.sql, itemIdOf(ctx))
+      const approval = await findApproval(ctx.sql, itemIdOf(ctx))
       if (!approval) throw new NotFoundError(`no approval request ${ctx.params['id']}`)
       return { status: 200, body: { approval } }
     }),
@@ -1098,7 +1187,7 @@ function buildRoutes(): Route[] {
           throw new BadRequestError(`params.service must be one of ${ENGAGEMENT_SERVICES.join(', ')}`)
         }
         const amount = parseTransferWei(String(params['amountWei']))
-        const policy = await findPolicy(deps.sql, service)
+        const policy = await findPolicy(ctx.sql, service)
         if (!policy) {
           throw new BadRequestError(
             `no engagement policy exists for ${service} — the caps must exist before anything moves (21 §8); ` +
@@ -1142,7 +1231,7 @@ function buildRoutes(): Route[] {
       }
 
       return withIdempotentRoute(ctx, '/v1/approvals', async () => {
-        const outcome = await withIdempotency(deps.sql, {
+        const outcome = await withIdempotency(ctx.sql, {
           principal: operator,
           route: '/v1/approvals',
           clientKey: idempotencyKeyOf(ctx),
@@ -1185,7 +1274,7 @@ function buildRoutes(): Route[] {
       const id = itemIdOf(ctx)
 
       return withIdempotentRoute(ctx, '/v1/approvals/:id/decision', async () => {
-        const outcome = await withIdempotency(deps.sql, {
+        const outcome = await withIdempotency(ctx.sql, {
           principal: operator,
           route: '/v1/approvals/:id/decision',
           clientKey: idempotencyKeyOf(ctx),
@@ -1272,7 +1361,7 @@ function buildRoutes(): Route[] {
     define('GET', '/v1/flags', async (ctx, deps) => {
       const principal = await authenticate(ctx, deps)
       requireReader(principal)
-      return { status: 200, body: { flags: await listFlags(deps.sql) } }
+      return { status: 200, body: { flags: await listFlags(ctx.sql) } }
     }),
 
     define('PUT', '/v1/flags/:key', async (ctx, deps) => {
@@ -1282,7 +1371,7 @@ function buildRoutes(): Route[] {
       const enabled = body['enabled']
       if (typeof enabled !== 'boolean') throw new BadRequestError('enabled must be true or false')
 
-      const result = await deps.sql.begin(async (tx) => ({
+      const result = await ctx.sql.begin(async (tx) => ({
         value: await setFlag(
           tx,
           {
@@ -1314,7 +1403,7 @@ function buildRoutes(): Route[] {
       return {
         status: 200,
         body: {
-          broadcasts: await listBroadcasts(deps.sql, {
+          broadcasts: await listBroadcasts(ctx.sql, {
             ...(live ? { liveAt: now } : {}),
             limit: parseLimit(ctx.url.searchParams.get('limit')),
           }),
@@ -1328,7 +1417,7 @@ function buildRoutes(): Route[] {
       const body = await readJson(ctx.req)
 
       return withIdempotentRoute(ctx, '/v1/broadcasts', async () => {
-        const outcome = await withIdempotency(deps.sql, {
+        const outcome = await withIdempotency(ctx.sql, {
           principal: operator,
           route: '/v1/broadcasts',
           clientKey: idempotencyKeyOf(ctx),
@@ -1362,7 +1451,7 @@ function buildRoutes(): Route[] {
     define('DELETE', '/v1/broadcasts/:id', async (ctx, deps) => {
       const principal = await authenticate(ctx, deps)
       const operator = requireOperator(principal)
-      const result = await deps.sql.begin(async (tx) => ({
+      const result = await ctx.sql.begin(async (tx) => ({
         value: await retractBroadcast(tx, itemIdOf(ctx), operator, ctx.requestId, deps.producer, deps.now),
       }))
       deps.metrics.increment('admin_operator_actions_total', {
@@ -1380,8 +1469,8 @@ function buildRoutes(): Route[] {
       return {
         status: 200,
         body: {
-          policies: await listPolicies(deps.sql),
-          feeRecycle: await readFeeRecycle(deps.sql),
+          policies: await listPolicies(ctx.sql),
+          feeRecycle: await readFeeRecycle(ctx.sql),
           // The schema ceilings, served so a console can render the bounds an operator is
           // choosing inside — the same numbers migrations.ts version 8 CHECKs.
           ceilings: {
@@ -1411,7 +1500,7 @@ function buildRoutes(): Route[] {
       if (service === 'platform') {
         const bps = requireString(body, 'recycleBps')
         if (!/^\d{1,4}$/.test(bps)) throw new BadRequestError('recycleBps must be a decimal string of basis points')
-        const result = await deps.sql.begin(async (tx) => ({
+        const result = await ctx.sql.begin(async (tx) => ({
           value: await setFeeRecycle(
             tx,
             { recycleBps: Number(bps), operator, approvalId: null, correlationId: ctx.requestId },
@@ -1443,7 +1532,7 @@ function buildRoutes(): Route[] {
           'nothing to change — send transferCapWei, or seedPerMarketWei and seedPerDayWei (null clears the pair)',
         )
       }
-      const result = await deps.sql.begin(async (tx) => ({
+      const result = await ctx.sql.begin(async (tx) => ({
         value: await setPolicy(
           tx,
           { service, change, operator, approvalId: null, correlationId: ctx.requestId },
@@ -1467,7 +1556,7 @@ function buildRoutes(): Route[] {
     define('GET', '/v1/engagement/report', async (ctx, deps) => {
       const principal = await authenticate(ctx, deps)
       const reader = requireReader(principal)
-      const policies = await listPolicies(deps.sql)
+      const policies = await listPolicies(ctx.sql)
       const treasury = await deps.ledger.balancesForSubject(ENGAGEMENT_TREASURY_SUBJECT)
       const services = []
       for (const policy of policies) {
@@ -1483,10 +1572,10 @@ function buildRoutes(): Route[] {
         body: {
           treasury: { subject: ENGAGEMENT_TREASURY_SUBJECT, balances: treasury },
           services,
-          spendWeiByService: await transferTotals(deps.sql),
-          transfers: await listTransfers(deps.sql),
+          spendWeiByService: await transferTotals(ctx.sql),
+          transfers: await listTransfers(ctx.sql),
           policies,
-          feeRecycle: await readFeeRecycle(deps.sql),
+          feeRecycle: await readFeeRecycle(ctx.sql),
         },
       }
     }),
@@ -1497,7 +1586,7 @@ function buildRoutes(): Route[] {
       const principal = await authenticate(ctx, deps)
       const operator = requireOperator(principal)
       const view = await composeEstate({
-        sql: deps.sql,
+        sql: ctx.sql,
         ledger: deps.ledger,
         market: deps.market,
         readiness: deps.readiness,
@@ -1536,12 +1625,12 @@ function buildRoutes(): Route[] {
       requireOperator(principal)
       const params = ctx.url.searchParams
       const state = params.get('state')
-      const settings = await readSettings(deps.sql)
-      const backups = await listBackups(deps.sql, {
+      const settings = await readSettings(ctx.sql)
+      const backups = await listBackups(ctx.sql, {
         ...(state ? { state: parseBackupState(state) } : {}),
         limit: parseLimit(params.get('limit')),
       })
-      const identity = await readEstateIdentity(deps.sql)
+      const identity = await readEstateIdentity(ctx.sql)
       return {
         status: 200,
         body: {
@@ -1561,7 +1650,7 @@ function buildRoutes(): Route[] {
     define('GET', '/v1/backups/settings', async (ctx, deps) => {
       const principal = await authenticate(ctx, deps)
       requireOperator(principal)
-      const settings = await readSettings(deps.sql)
+      const settings = await readSettings(ctx.sql)
       return {
         status: 200,
         body: {
@@ -1617,7 +1706,7 @@ function buildRoutes(): Route[] {
         throw new BadRequestError('nothing to change')
       }
 
-      const result = await deps.sql.begin(async (tx) => {
+      const result = await ctx.sql.begin(async (tx) => {
         const settings = await updateSettings(tx, change, operator)
         // Changing where the estate's backups are written is an operator action on the estate's
         // recoverability, so it takes an audit row like any other. The row names the new root and
@@ -1647,7 +1736,7 @@ function buildRoutes(): Route[] {
     define('GET', '/v1/backups/:id', async (ctx, deps) => {
       const principal = await authenticate(ctx, deps)
       requireOperator(principal)
-      const backup = await findBackup(deps.sql, itemIdOf(ctx))
+      const backup = await findBackup(ctx.sql, itemIdOf(ctx))
       if (!backup) throw new NotFoundError(`no backup run ${ctx.params['id']}`)
       return {
         status: 200,
@@ -1655,8 +1744,8 @@ function buildRoutes(): Route[] {
           backup: backupToJson(backup),
           // Names and checksums. NEVER contents — see the header of `backups.ts`: the console must
           // be able to show that a custody backup exists without showing what is in it.
-          artefacts: (await listArtefacts(deps.sql, backup.id)).map(artefactToJson),
-          restores: (await listRestoresFor(deps.sql, backup.id)).map(restoreToJson),
+          artefacts: (await listArtefacts(ctx.sql, backup.id)).map(artefactToJson),
+          restores: (await listRestoresFor(ctx.sql, backup.id)).map(restoreToJson),
           // Rendered so the operator can read the phrase before they are asked to type it, and so
           // the second approver sees exactly the string the first one agreed to.
           liveConfirmationPhrase: expectedConfirmation(backup),
@@ -1679,7 +1768,7 @@ function buildRoutes(): Route[] {
       const kind = typeof body['kind'] === 'string' ? parseBackupKind(body['kind']) : 'full'
 
       return withIdempotentRoute(ctx, '/v1/backups', async () => {
-        const outcome = await withIdempotency(deps.sql, {
+        const outcome = await withIdempotency(ctx.sql, {
           principal: operator,
           route: '/v1/backups',
           clientKey: idempotencyKeyOf(ctx),
@@ -1722,7 +1811,7 @@ function buildRoutes(): Route[] {
     define('GET', '/v1/restores', async (ctx, deps) => {
       const principal = await authenticate(ctx, deps)
       requireOperator(principal)
-      const restores = await listRestores(deps.sql, parseLimit(ctx.url.searchParams.get('limit')))
+      const restores = await listRestores(ctx.sql, parseLimit(ctx.url.searchParams.get('limit')))
       return { status: 200, body: { restores: restores.map(restoreToJson) } }
     }),
 
@@ -1768,7 +1857,7 @@ function buildRoutes(): Route[] {
         : []
 
       return withIdempotentRoute(ctx, '/v1/restores', async () => {
-        const outcome = await withIdempotency(deps.sql, {
+        const outcome = await withIdempotency(ctx.sql, {
           principal: operator,
           route: '/v1/restores',
           clientKey: idempotencyKeyOf(ctx),
@@ -1874,7 +1963,7 @@ function buildRoutes(): Route[] {
         operatorBearer: operatorBearer(ctx),
       })
 
-      await deps.sql.begin((tx) =>
+      await ctx.sql.begin((tx) =>
         appendAudit(
           tx,
           {
@@ -2027,7 +2116,7 @@ async function worldMutation(
     operatorBearer: operatorBearer(ctx),
   })
 
-  await deps.sql.begin((tx) =>
+  await ctx.sql.begin((tx) =>
     appendAudit(
       tx,
       {
@@ -2087,7 +2176,7 @@ async function execute(
     market: deps.market,
     billing: deps.billing,
     identity: deps.identity,
-    sql: deps.sql,
+    sql: ctx.sql,
   }
 
   let detail: Record<string, unknown>
@@ -2105,7 +2194,7 @@ async function execute(
     ctx.log.error('an authorised action failed to execute', { approvalId: approval.id, err })
   }
 
-  const recorded = await deps.sql.begin(async (tx) => ({
+  const recorded = await ctx.sql.begin(async (tx) => ({
     value: await recordExecution(
       tx,
       { id: approval.id, outcome, detail, actor: operator, correlationId: ctx.requestId },
