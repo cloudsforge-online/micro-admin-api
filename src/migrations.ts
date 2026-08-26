@@ -1493,6 +1493,62 @@ export const MIGRATIONS: readonly Migration[] = [
         for each row execute function engagement_transfer_within_cap();
     `,
   },
+  {
+    version: 14,
+    name: 'backup-floor-fits-the-host',
+    up: `
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+      -- THE SEEDED DISK GUARDS WERE SIZED FOR A HOST THAT NO LONGER EXISTS. micro-org#511.
+      --
+      -- Version 10 seeded 'min_free_bytes' at 107374182400 (100 GiB) and 'ceiling_bytes' at
+      -- 214748364800 (200 GiB). Both were chosen when the estate ran under compose on the
+      -- Windows app host, whose backup destination shared a disk with the chain data — hence
+      -- the refusal message's "this disk also holds the chain".
+      --
+      -- The estate now runs on a k3s VM whose root filesystem is 194 GB. A floor of 100 GiB
+      -- demands that more than half the disk stay free AFTER every run, and a 200 GiB ceiling
+      -- is larger than the disk it is meant to bound, so it bounds nothing. The floor is the
+      -- one that bites: 'free - projection >= min_free' could not hold at any occupancy, and
+      -- the runner refused every full backup for six days:
+      --
+      --     refusing to start: 95827013632 bytes free, this run projects 15254441761,
+      --     and min_free_bytes requires 107374182400 to remain.
+      --
+      -- That is a guard that cannot pass rather than a disk that is too full, and it is worth
+      -- being precise about the difference: no amount of pruning fixes it, which is exactly
+      -- what the message advised.
+      --
+      -- ── WHY THE 'updated_by' GUARD, AND NOT A PLAIN UPDATE ────────────────────────────────
+      --
+      -- These are OPERATOR SETTINGS with a UI behind them (admin-web's backup-settings). A
+      -- migration that overwrites them unconditionally would silently undo a deliberate choice
+      -- on any estate where someone had already tuned them — including the live one, where
+      -- these were corrected by hand on 2026-08-26 before this migration existed. Restricting
+      -- the update to rows still carrying the seed's own 'updated_by' makes this a correction
+      -- of a default and nothing else: it moves estates nobody has touched, and leaves every
+      -- estate that has an opinion alone.
+      --
+      -- ── THE NUMBERS, AND WHY THEY ARE STILL ABSOLUTE ──────────────────────────────────────
+      --
+      -- 30 GiB free and a 60 GiB ceiling, against a 194 GB disk carrying ~85 GB of k3s images,
+      -- volumes and Postgres. A full set measured 2.9 GB on 2026-08-26 (55 databases including
+      -- the 22 adopted '*_testnet' ones), so 14 retained copies fit inside the ceiling with
+      -- room, and the floor still refuses long before the disk is in danger.
+      --
+      -- An absolute byte count is admittedly the wrong SHAPE for a portable default — a
+      -- fraction of the filesystem would survive a host change without a migration. It stays
+      -- absolute here because the runner compares it against statfs output and changing that
+      -- contract is a bigger change than this issue justifies; a host move now needs one
+      -- settings edit, which is at least a thing an operator can see and do.
+      update backup_settings
+         set min_free_bytes = 32212254720,
+             ceiling_bytes  = 64424509440,
+             updated_at     = now(),
+             updated_by     = 'migration:14'
+       where singleton
+         and updated_by = 'migration:10';
+    `,
+  },
 ]
 
 /**
